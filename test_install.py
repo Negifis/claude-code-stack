@@ -79,7 +79,13 @@ def test_windows_quoting():
             Path("C:/Users/a b/.claude"), "C:/Program Files/Python/python.exe",
         )
         check("windows: spaces are quoted", out.count('"') == 4, out)
-        for hostile, why in ((Path("C:/%USERNAME%/.claude"), "percent"), (Path('C:/a"b/.claude'), "quote")):
+        # Every one of these is legal in a Windows filename and syntax to cmd.exe.
+        for special in "&()[]{}^=;+,`~<>|'":
+            quoted = install.shell_quote(f"C:/cfg{special}1/.claude")
+            check(f"windows: {special!r} forces quoting", quoted.startswith('"'), quoted)
+        for hostile, why in ((Path("C:/%USERNAME%/.claude"), "percent"),
+                             (Path('C:/a"b/.claude'), "quote"),
+                             (Path("C:/a!b!/.claude"), "delayed-expansion bang")):
             try:
                 install.resolve_command("__PYTHON__ __CLAUDE_DIR__/x.py", hostile, "python.exe")
                 check(f"windows: {why} path rejected", False, "no error raised")
@@ -104,12 +110,13 @@ def test_powershell_hook_is_windows_only():
 # --- merge behavior -----------------------------------------------------------------------
 
 def test_merge_is_idempotent_across_interpreters():
-    stack_a = install.resolve_settings(Path("/tmp/cfg"), "/usr/bin/python3.11")
-    stack_b = install.resolve_settings(Path("/tmp/cfg"), "/usr/bin/python3.12")
-    owned = install.hook_scripts()
+    target = Path("/tmp/cfg")
+    stack_a = install.resolve_settings(target, "/usr/bin/python3.11")
+    stack_b = install.resolve_settings(target, "/usr/bin/python3.12")
+    owned = install.stack_script_paths(target, stack_a)
     once = install.merge_settings({}, stack_a, owned)
     twice = install.merge_settings(once, stack_a, owned)
-    switched = install.merge_settings(once, stack_b, owned)
+    switched = install.merge_settings(once, stack_b, install.stack_script_paths(target, stack_b))
     check("merge: second identical run adds nothing",
           len(hook_commands(twice)) == len(hook_commands(once)), hook_commands(twice))
     check("merge: switching interpreter does not double-register",
@@ -119,18 +126,45 @@ def test_merge_is_idempotent_across_interpreters():
 
 
 def test_merge_preserves_user_content():
+    target = Path("/tmp/cfg")
+    stack = install.resolve_settings(target, "python3")
+    # Every one of these is somebody else's hook, including two that name a script whose
+    # basename this stack also uses — from a directory this installer never wrote to.
+    outsiders = [
+        "my-own-script --flag",
+        "python /opt/company-hooks/code_work_gate_stop.py",
+        "python /home/me/tools/test_gate.py",
+        "python /tmp/cfg-backup/hooks/continuity_stop.py",
+    ]
     live = {
         "myOwnKey": {"keep": 1},
         "permissions": {"allow": ["Bash(ls:*)"]},
-        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-own-script --flag"}]}]},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": c} for c in outsiders]}]},
     }
-    merged = install.merge_settings(live, install.resolve_settings(Path("/tmp/cfg"), "python3"),
-                                    install.hook_scripts())
+    merged = install.merge_settings(live, stack, install.stack_script_paths(target, stack))
     check("merge: unrelated top-level key survives", merged.get("myOwnKey") == {"keep": 1}, merged.keys())
     check("merge: unrelated permissions survive",
           merged["permissions"]["allow"] == ["Bash(ls:*)"], merged.get("permissions"))
-    check("merge: unrelated user hook survives",
-          "my-own-script --flag" in hook_commands(merged), hook_commands(merged))
+    for command in outsiders:
+        check(f"merge: outside hook survives — {command.split('/')[-1]}",
+              command in hook_commands(merged), hook_commands(merged))
+
+
+def test_merge_replaces_only_its_own_installed_hooks():
+    target = Path("/tmp/cfg")
+    stack = install.resolve_settings(target, "python3")
+    owned = install.stack_script_paths(target, stack)
+    check("ownership: identity is a full path, not a basename",
+          all("/" in path for path in owned), owned)
+    check("ownership: only template scripts count",
+          not any("test_gate" in path for path in owned), owned)
+    # A stale registration of ours: same installed script, different interpreter and flags.
+    stale = {"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": f"old-python {target.as_posix()}/hooks/code_work_gate_stop.py"}
+    ]}]}}
+    merged = install.merge_settings(stale, stack, owned)
+    check("ownership: a stale registration of our own script is replaced",
+          not any("old-python" in c for c in hook_commands(merged)), hook_commands(merged))
 
 
 # --- filesystem safety --------------------------------------------------------------------
@@ -145,16 +179,32 @@ def test_backup_dirs_are_unique():
 
 
 def test_preflight_blocks_before_writing():
+    conflicts = [
+        ("payload dir is a file", lambda t: (t / "agents").write_text("x", encoding="utf-8")),
+        ("settings.stack.json is a directory", lambda t: (t / "settings.stack.json").mkdir()),
+        ("settings.json is a directory", lambda t: (t / "settings.json").mkdir()),
+        ("backups is a file", lambda t: (t / "backups").write_text("x", encoding="utf-8")),
+        ("CLAUDE.md is a directory", lambda t: (t / "CLAUDE.md").mkdir()),
+    ]
+    for name, make in conflicts:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            make(target)
+            result = run_installer(target)
+            check(f"preflight: real run refuses — {name}", result.returncode == 1, result.stderr)
+            check(f"preflight: nothing installed — {name}", not (target / "skills").exists(),
+                  sorted(p.name for p in target.iterdir()))
+            check(f"preflight: no traceback — {name}", "Traceback" not in result.stderr, result.stderr)
+            dry = run_installer(target, "--dry-run")
+            check(f"preflight: dry run agrees — {name}", dry.returncode == 1, dry.stdout)
+
     with tempfile.TemporaryDirectory() as tmp:
-        target = Path(tmp)
-        (target / "agents").write_text("not a directory", encoding="utf-8")
-        result = run_installer(target)
-        check("preflight: real run refuses a type conflict", result.returncode == 1, result.stderr)
-        check("preflight: nothing was installed alongside it",
-              not (target / "skills").exists(), sorted(p.name for p in target.iterdir()))
-        check("preflight: no traceback", "Traceback" not in result.stderr, result.stderr)
-        dry = run_installer(target, "--dry-run")
-        check("preflight: dry run reports the same conflict", dry.returncode == 1, dry.stdout)
+        as_file = Path(tmp) / "config"
+        as_file.write_text("the config dir is a file", encoding="utf-8")
+        result = run_installer(as_file)
+        check("preflight: target itself is a file", result.returncode == 1, result.stderr)
+        dry = run_installer(as_file, "--dry-run")
+        check("preflight: dry run agrees the target is a file", dry.returncode == 1, dry.stdout)
 
 
 def test_stack_file_is_backed_up_before_overwrite():
@@ -211,6 +261,7 @@ for test in [
     test_powershell_hook_is_windows_only,
     test_merge_is_idempotent_across_interpreters,
     test_merge_preserves_user_content,
+    test_merge_replaces_only_its_own_installed_hooks,
     test_backup_dirs_are_unique,
     test_preflight_blocks_before_writing,
     test_stack_file_is_backed_up_before_overwrite,

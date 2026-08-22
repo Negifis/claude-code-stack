@@ -37,9 +37,29 @@ def claude_dir() -> Path:
     return Path(env).expanduser() if env else Path.home() / ".claude"
 
 
-def hook_scripts() -> set[str]:
-    """Filenames of the hooks this repo owns — the identity a merge replaces rather than appends."""
-    return {p.name for p in (REPO / "hooks").iterdir() if p.is_file()}
+def normalize_path(text: str) -> str:
+    """One spelling for a path, so two ways of writing the same file compare equal."""
+    unified = text.replace("\\", "/")
+    return unified.lower() if WINDOWS else unified
+
+
+def stack_script_paths(target: Path, stack: dict) -> set[str]:
+    """Full paths of the hook scripts this stack registers — the identity a merge replaces.
+
+    Full paths, not basenames: a user who runs their own `code_work_gate_stop.py` out of some
+    other directory keeps it, because only a command naming the copy inside this target's
+    `hooks/` is one this installer put there.
+    """
+    prefix = normalize_path((target / "hooks").as_posix()) + "/"
+    found = set()
+    for groups in stack.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                for token in hook.get("command", "").replace('"', " ").split():
+                    candidate = normalize_path(token)
+                    if candidate.startswith(prefix):
+                        found.add(candidate)
+    return found
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -71,8 +91,17 @@ def preflight(target: Path) -> None:
     """Reject a destination whose shape would abort the copy halfway through.
 
     Checked before the first write and identically in dry runs, so a dry run that reports
-    success means the real run will not stop with half the payload installed.
+    success means the real run will not stop with half the payload installed. Every path the
+    installer later reads or writes is covered, not only the payload tree.
     """
+    if target.exists() and not target.is_dir():
+        raise InstallError(f"{target} is a file, but the config directory has to be a directory")
+    for path in (target / "backups", target / "CLAUDE.md",
+                 target / "settings.stack.json", target / "settings.json"):
+        if path.exists() and path.is_dir() != (path.name == "backups"):
+            shape = "a directory" if path.is_dir() else "a file"
+            needed = "a file" if path.name != "backups" else "a directory"
+            raise InstallError(f"{path} is {shape}, but the installer needs {needed} there")
     for name in PAYLOAD:
         src = REPO / name
         if not src.is_dir():
@@ -121,16 +150,23 @@ def copy_tree(src: Path, dst: Path, root: Path, backup: Path, dry: bool) -> tupl
     return new, replaced
 
 
+# cmd.exe treats all of these as syntax, and every one of them is legal in a Windows filename.
+CMD_SPECIAL = set(" \t&()[]{}^=;+,`~<>|'")
+# Quoting does not neutralize these: %NAME% expands inside double quotes, !NAME! expands too
+# wherever delayed expansion is enabled, and a literal quote cannot be represented at all.
+CMD_REJECT = {'"': "a quote", "%": "a % that cmd.exe would expand",
+              "!": "a ! that delayed expansion would eat"}
+
+
 def shell_quote(argument: str) -> str:
     """Quote one argument for the shell Claude Code launches hook commands through."""
     if not WINDOWS:
         return shlex.quote(argument)
-    if '"' in argument:
-        raise InstallError(f'cmd.exe cannot carry a path containing a quote: {argument}')
-    if "%" in argument:
-        # cmd.exe expands %NAME% even inside double quotes, so quoting cannot make this safe.
-        raise InstallError(f"cmd.exe would expand the % in this path: {argument}")
-    return f'"{argument}"' if any(c in argument for c in ' \t&|<>^') else argument
+    for character, why in CMD_REJECT.items():
+        if character in argument:
+            raise InstallError(f"this path carries {why}, which cmd.exe cannot be made to "
+                               f"take literally: {argument}")
+    return f'"{argument}"' if any(c in argument for c in CMD_SPECIAL) else argument
 
 
 def resolve_command(command: str, target: Path, python: str) -> str:
@@ -185,16 +221,18 @@ def load_live_settings(path: Path) -> dict:
         ) from exc
 
 
-def merge_settings(live: dict, stack: dict, owned: set[str]) -> dict:
+def merge_settings(live: dict, stack: dict, owned_paths: set[str]) -> dict:
     """Overlay the stack's settings on the live ones without dropping unrelated keys.
 
     Keys only the user has survive untouched, and `env`-style dicts are merged key by key. A
     key both sides define with a non-dict value — `availableModels`, `outputStyle` — takes the
     stack's value wholesale, so a customized one is worth re-applying after an install.
 
-    Hooks are matched by the payload script a command runs, not by the command text. That is
-    what makes a second install idempotent even when the interpreter path changed: the stale
-    registration is replaced rather than joined by a second one that fires the same hook twice.
+    Hooks are matched by the full path of the payload script a command runs, not by the command
+    text. That is what makes a second install idempotent even when the interpreter path changed:
+    the stale registration is replaced rather than joined by a second one that fires the same
+    hook twice. A hook of the user's own is only ever touched if it runs a script out of this
+    target's own `hooks/` directory, which is to say a script this installer put there.
     """
     merged = dict(live)
     for key, value in stack.items():
@@ -211,7 +249,8 @@ def merge_settings(live: dict, stack: dict, owned: set[str]) -> dict:
         for group in groups:
             survivors = [
                 hook for hook in group.get("hooks", [])
-                if not any(script in hook.get("command", "") for script in owned)
+                if not any(path in normalize_path(hook.get("command", ""))
+                           for path in owned_paths)
             ]
             if survivors:
                 kept.append({**{k: v for k, v in group.items() if k != "hooks"}, "hooks": survivors})
@@ -269,7 +308,8 @@ def main() -> int:
 
     live_path = target / "settings.json"
     if args.merge_settings:
-        merged = merge_settings(load_live_settings(live_path), stack, hook_scripts())
+        merged = merge_settings(load_live_settings(live_path), stack,
+                                stack_script_paths(target, stack))
         if dry:
             print("  would merge into settings.json")
         else:

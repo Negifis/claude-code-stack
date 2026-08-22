@@ -163,8 +163,11 @@ python test_install.py
 
 ## Configuration
 
-`settings.example.json` uses two placeholders the installer substitutes: `__CLAUDE_DIR__`
-and `__PYTHON__`. If you wire it up by hand, replace both with absolute paths.
+`settings.example.json` uses two placeholders: `__CLAUDE_DIR__` and `__PYTHON__`. They are
+deliberately unquoted, because the installer tokenizes each command and adds the quoting
+the launching shell needs. Wiring it up by hand means doing that yourself — quote any path
+containing a space, and escape backslashes for JSON — so prefer `install.py` and read the
+`settings.stack.json` it produces if you want to see the result before merging it.
 
 Worth knowing before you turn it on:
 
