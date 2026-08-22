@@ -113,10 +113,10 @@ def test_merge_is_idempotent_across_interpreters():
     target = Path("/tmp/cfg")
     stack_a = install.resolve_settings(target, "/usr/bin/python3.11")
     stack_b = install.resolve_settings(target, "/usr/bin/python3.12")
-    owned = install.stack_script_paths(target, stack_a)
+    owned = install.template_script_paths(target)
     once = install.merge_settings({}, stack_a, owned)
     twice = install.merge_settings(once, stack_a, owned)
-    switched = install.merge_settings(once, stack_b, install.stack_script_paths(target, stack_b))
+    switched = install.merge_settings(once, stack_b, owned)
     check("merge: second identical run adds nothing",
           len(hook_commands(twice)) == len(hook_commands(once)), hook_commands(twice))
     check("merge: switching interpreter does not double-register",
@@ -141,7 +141,7 @@ def test_merge_preserves_user_content():
         "permissions": {"allow": ["Bash(ls:*)"]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": c} for c in outsiders]}]},
     }
-    merged = install.merge_settings(live, stack, install.stack_script_paths(target, stack))
+    merged = install.merge_settings(live, stack, install.template_script_paths(target))
     check("merge: unrelated top-level key survives", merged.get("myOwnKey") == {"keep": 1}, merged.keys())
     check("merge: unrelated permissions survive",
           merged["permissions"]["allow"] == ["Bash(ls:*)"], merged.get("permissions"))
@@ -153,7 +153,7 @@ def test_merge_preserves_user_content():
 def test_merge_replaces_only_its_own_installed_hooks():
     target = Path("/tmp/cfg")
     stack = install.resolve_settings(target, "python3")
-    owned = install.stack_script_paths(target, stack)
+    owned = install.template_script_paths(target)
     check("ownership: identity is a full path, not a basename",
           all("/" in path for path in owned), owned)
     check("ownership: only template scripts count",
@@ -165,6 +165,37 @@ def test_merge_replaces_only_its_own_installed_hooks():
     merged = install.merge_settings(stale, stack, owned)
     check("ownership: a stale registration of our own script is replaced",
           not any("old-python" in c for c in hook_commands(merged)), hook_commands(merged))
+    # An owned path is a prefix of this one, but it runs a different file.
+    disabled = f"python {target.as_posix()}/hooks/code_work_gate_stop.py.disabled"
+    kept = install.merge_settings(
+        {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": disabled}]}]}}, stack, owned)
+    check("ownership: a path that merely starts with an owned one survives",
+          disabled in hook_commands(kept), hook_commands(kept))
+
+
+def test_ownership_survives_a_target_path_with_spaces():
+    """The round-3 counterexample: a quoted target defeated whitespace-based parsing."""
+    for windows, target in ((True, Path("C:/Users/Jane Doe/.claude")),
+                            (False, Path("/home/jane doe/.claude"))):
+        was = install.WINDOWS
+        install.WINDOWS = windows
+        try:
+            stack = install.resolve_settings(target, "python3")
+            owned = install.template_script_paths(target)
+            check(f"spaces: owned paths found (windows={windows})", len(owned) >= 6, owned)
+            once = install.merge_settings({}, stack, owned)
+            twice = install.merge_settings(once, stack, owned)
+            check(f"spaces: second merge does not double-register (windows={windows})",
+                  len(hook_commands(twice)) == len(hook_commands(once)),
+                  f"{len(hook_commands(once))} -> {len(hook_commands(twice))}")
+            other = install.merge_settings(once, install.resolve_settings(target, "other-python"),
+                                           owned)
+            check(f"spaces: a changed interpreter still replaces (windows={windows})",
+                  len(hook_commands(other)) == len(hook_commands(once))
+                  and not any("python3" in c for c in hook_commands(other)),
+                  hook_commands(other))
+        finally:
+            install.WINDOWS = was
 
 
 # --- filesystem safety --------------------------------------------------------------------
@@ -205,6 +236,22 @@ def test_preflight_blocks_before_writing():
         check("preflight: target itself is a file", result.returncode == 1, result.stderr)
         dry = run_installer(as_file, "--dry-run")
         check("preflight: dry run agrees the target is a file", dry.returncode == 1, dry.stdout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        try:
+            # A dangling link answers False to exists() while still holding the name.
+            (target / "agents").symlink_to(target / "nowhere", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            print("SKIP preflight: this platform will not let the suite create a symlink")
+        else:
+            result = run_installer(target)
+            check("preflight: dangling symlink refused", result.returncode == 1, result.stderr)
+            check("preflight: nothing installed past the dangling symlink",
+                  not (target / "skills").exists(), sorted(p.name for p in target.iterdir()))
+            dry = run_installer(target, "--dry-run")
+            check("preflight: dry run agrees about the dangling symlink", dry.returncode == 1,
+                  dry.stdout)
 
 
 def test_stack_file_is_backed_up_before_overwrite():
@@ -262,6 +309,7 @@ for test in [
     test_merge_is_idempotent_across_interpreters,
     test_merge_preserves_user_content,
     test_merge_replaces_only_its_own_installed_hooks,
+    test_ownership_survives_a_target_path_with_spaces,
     test_backup_dirs_are_unique,
     test_preflight_blocks_before_writing,
     test_stack_file_is_backed_up_before_overwrite,

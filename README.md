@@ -163,11 +163,15 @@ python test_install.py
 
 ## Configuration
 
-`settings.example.json` uses two placeholders: `__CLAUDE_DIR__` and `__PYTHON__`. They are
-deliberately unquoted, because the installer tokenizes each command and adds the quoting
-the launching shell needs. Wiring it up by hand means doing that yourself — quote any path
-containing a space, and escape backslashes for JSON — so prefer `install.py` and read the
-`settings.stack.json` it produces if you want to see the result before merging it.
+`settings.example.json` is a template, not a file to edit. Its `__CLAUDE_DIR__` and
+`__PYTHON__` placeholders are deliberately unquoted: the installer splits each command into
+arguments and adds the quoting the launching shell actually needs, which is more than
+quoting spaces — on Windows a path containing `&`, `(`, `^` or a dozen other legal filename
+characters is shell syntax too.
+
+So don't substitute by hand. Run `install.py` without `--merge-settings` and read
+`~/.claude/settings.stack.json`: it holds the finished, correctly quoted hooks block, ready
+to copy into your own `settings.json` if you would rather merge it yourself.
 
 Worth knowing before you turn it on:
 
@@ -179,8 +183,10 @@ Worth knowing before you turn it on:
   borrowed one is a security hole.
 - The plugin-updater hook is PowerShell, so it is registered on Windows only. Everything
   else in the payload is Python and runs anywhere.
-- The installer refuses a config path it cannot quote safely for the launching shell —
-  on Windows that means no `%` and no `"` anywhere in the path.
+- The installer refuses a config path it cannot quote safely for the launching shell. On
+  Windows that means no `"`, no `%` and no `!` anywhere in the path: quoting does not stop
+  `cmd.exe` expanding `%NAME%`, delayed expansion eats `!NAME!`, and a literal quote cannot
+  be represented at all.
 
 ---
 

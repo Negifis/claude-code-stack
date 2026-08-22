@@ -43,23 +43,39 @@ def normalize_path(text: str) -> str:
     return unified.lower() if WINDOWS else unified
 
 
-def stack_script_paths(target: Path, stack: dict) -> set[str]:
+def template_script_paths(target: Path) -> set[str]:
     """Full paths of the hook scripts this stack registers — the identity a merge replaces.
+
+    Read from the template, where every token is still unquoted, rather than from a rendered
+    command: a config directory whose name contains a space renders as a quoted path, and
+    re-splitting that on whitespace would tear one script into fragments that match nothing.
 
     Full paths, not basenames: a user who runs their own `code_work_gate_stop.py` out of some
     other directory keeps it, because only a command naming the copy inside this target's
     `hooks/` is one this installer put there.
     """
-    prefix = normalize_path((target / "hooks").as_posix()) + "/"
+    settings = json.loads((REPO / "settings.example.json").read_text(encoding="utf-8"))
     found = set()
-    for groups in stack.get("hooks", {}).values():
+    for groups in settings.get("hooks", {}).values():
         for group in groups:
             for hook in group.get("hooks", []):
-                for token in hook.get("command", "").replace('"', " ").split():
-                    candidate = normalize_path(token)
-                    if candidate.startswith(prefix):
-                        found.add(candidate)
+                for token in shlex.split(hook.get("command", ""), posix=True):
+                    if "__CLAUDE_DIR__" in token:
+                        found.add(normalize_path(token.replace("__CLAUDE_DIR__", target.as_posix())))
     return found
+
+
+def command_arguments(command: str) -> set[str]:
+    """The arguments of one live hook command, normalized for comparison.
+
+    Split with the grammar of the shell that will run it, so a Windows path keeps its
+    backslashes instead of having them eaten as escapes.
+    """
+    try:
+        tokens = shlex.split(command, posix=not WINDOWS)
+    except ValueError:
+        tokens = command.split()
+    return {normalize_path(token.strip('"')) for token in tokens}
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -94,10 +110,18 @@ def preflight(target: Path) -> None:
     success means the real run will not stop with half the payload installed. Every path the
     installer later reads or writes is covered, not only the payload tree.
     """
+    def reject_broken_link(path: Path) -> None:
+        # A dangling symlink answers False to exists() while still occupying the name, so a
+        # shape check built on exists() alone would wave it through and fail mid-copy.
+        if path.is_symlink() and not path.exists():
+            raise InstallError(f"{path} is a symlink pointing nowhere; remove it first")
+
+    reject_broken_link(target)
     if target.exists() and not target.is_dir():
         raise InstallError(f"{target} is a file, but the config directory has to be a directory")
     for path in (target / "backups", target / "CLAUDE.md",
                  target / "settings.stack.json", target / "settings.json"):
+        reject_broken_link(path)
         if path.exists() and path.is_dir() != (path.name == "backups"):
             shape = "a directory" if path.is_dir() else "a file"
             needed = "a file" if path.name != "backups" else "a directory"
@@ -110,10 +134,12 @@ def preflight(target: Path) -> None:
             if any(part in SKIP for part in path.relative_to(src).parts):
                 continue
             dest = target / name / path.relative_to(src)
+            reject_broken_link(dest)
             if path.is_dir() and dest.exists() and not dest.is_dir():
                 raise InstallError(f"{dest} is a file, but the payload needs a directory there")
             if path.is_file() and dest.is_dir():
                 raise InstallError(f"{dest} is a directory, but the payload needs a file there")
+        reject_broken_link(target / name)
         if (target / name).exists() and not (target / name).is_dir():
             raise InstallError(f"{target / name} is a file, but the payload needs a directory there")
 
@@ -249,8 +275,9 @@ def merge_settings(live: dict, stack: dict, owned_paths: set[str]) -> dict:
         for group in groups:
             survivors = [
                 hook for hook in group.get("hooks", [])
-                if not any(path in normalize_path(hook.get("command", ""))
-                           for path in owned_paths)
+                # Exact argument equality, not a substring: `…/stop.py.disabled` contains an
+                # owned path but runs a different file, and is somebody else's business.
+                if not command_arguments(hook.get("command", "")) & owned_paths
             ]
             if survivors:
                 kept.append({**{k: v for k, v in group.items() if k != "hooks"}, "hooks": survivors})
@@ -309,7 +336,7 @@ def main() -> int:
     live_path = target / "settings.json"
     if args.merge_settings:
         merged = merge_settings(load_live_settings(live_path), stack,
-                                stack_script_paths(target, stack))
+                                template_script_paths(target))
         if dry:
             print("  would merge into settings.json")
         else:
