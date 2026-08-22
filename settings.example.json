@@ -1,0 +1,164 @@
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "0",
+    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "0",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"
+  },
+  "availableModels": [
+    "opus",
+    "opusplan",
+    "sonnet",
+    "haiku",
+    "fable"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File __CLAUDE_DIR__/hooks/plugin_autoupdate.ps1",
+            "timeout": 15,
+            "statusMessage": "Checking plugin updates..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_session_start.py",
+            "timeout": 10,
+            "statusMessage": "Continuity: restoring task checkpoint..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_prompt.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_subagent.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_progress.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_stop.py",
+            "timeout": 10,
+            "statusMessage": "Code Work Gate check"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_stop.py",
+            "timeout": 10,
+            "statusMessage": "Final output lint"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(?:Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ -S __CLAUDE_DIR__/hooks/comment_density_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(?:Read|Grep|Glob|Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_loop_guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "codex@openai-codex": true
+  },
+  "outputStyle": "dense",
+  "effortLevel": "high",
+  "autoMemoryEnabled": false,
+  "minimumVersion": "2.1.117"
+}

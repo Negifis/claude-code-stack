@@ -1,0 +1,5 @@
+# The hooks are executed by Python and by git-bash on every platform, and a CRLF shebang
+# breaks the shell ones outright — keep the whole payload LF in the working tree too.
+* text=auto eol=lf
+*.png binary
+*.gz binary

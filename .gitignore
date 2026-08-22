@@ -1,0 +1,27 @@
+# Runtime droppings from the hooks — never part of the payload.
+__pycache__/
+*.pyc
+*.log
+.plugin_autoupdate.stamp
+
+# Anything the installer resolves for one machine.
+settings.stack.json
+settings.local.json
+
+# Credentials, transcripts, telemetry — these live in ~/.claude and must never be committed.
+.credentials.json
+.mcp.json
+history.jsonl
+usage.jsonl
+/projects/
+/telemetry/
+/sessions/
+/session-env/
+/shell-snapshots/
+/state/
+/backups/
+/plans/
+/tasks/
+
+# Local tool caches that appear inside a checkout.
+.rxa/
