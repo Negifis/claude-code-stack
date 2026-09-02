@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
-PAYLOAD = ("skills", "agents", "commands", "hooks", "reference", "rules", "output-styles")
+PAYLOAD = ("skills", "agents", "commands", "hooks", "tools", "reference", "rules", "output-styles")
 # Hook logs, caches and stamps are runtime droppings, not payload.
 SKIP = {"__pycache__", ".git", ".pytest_cache"}
 WINDOWS = os.name == "nt"
@@ -221,7 +221,8 @@ def resolve_settings(target: Path, python: str) -> dict:
             for hook in group.get("hooks", []):
                 command = hook.get("command", "")
                 # The plugin updater is a PowerShell script; nothing else in the payload is
-                # platform-bound, and a POSIX box has no powershell.exe to run it with.
+                # platform-bound, and a POSIX box has no powershell.exe to run it with. The
+                # worktree audit runs under node, which every platform can supply.
                 if ".ps1" in command and not WINDOWS:
                     continue
                 kept.append({**hook, "command": resolve_command(command, target, python)})

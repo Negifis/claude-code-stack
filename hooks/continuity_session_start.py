@@ -43,6 +43,13 @@ LEAD = (
     "as an unverified lead, not as current state: check it against the working tree and against "
     "what the user is actually asking for before resuming from it.\n\n{body}"
 )
+# A fresh start in a directory that holds a checkpoint is, more often than not, a different
+# task: 68 of the 134 sessions of July-September 2026 started this way and got the whole
+# previous checkpoint injected, about 3,700 characters each, for a task that then rarely
+# resumed it. The head is enough to recognise one's own task; the file is there for the rest.
+LEAD_HEAD_NOTE = (
+    "\n\nOnly GOAL, STATUS and NEXT ACTION are shown; read the file if this is the same task."
+)
 COMPLETED = (
     "[Continuity] The checkpoint at {path} is marked done (updated {age}). It is history, not "
     "current state — start from the user's request. If this task turns out to continue, rewrite the "
@@ -74,6 +81,23 @@ def describe_age(days):
     if days < 2:
         return "yesterday"
     return "{} days ago".format(int(days))
+
+
+# Per-section and whole-file character caps for the head of a checkpoint shown on a fresh start.
+LEAD_SECTION_CHARS = 400
+LEAD_FALLBACK_CHARS = 600
+
+
+def lead_head(text):
+    """GOAL, STATUS and NEXT ACTION of a checkpoint, each capped at LEAD_SECTION_CHARS
+    characters; a checkpoint without those headings contributes its first LEAD_FALLBACK_CHARS."""
+    sections = cc.parse_sections(text)
+    parts = []
+    for name in ("GOAL", "STATUS", "NEXT ACTION"):
+        body = sections.get(name, "").strip()
+        if body:
+            parts.append("{}\n{}".format(name, body[:LEAD_SECTION_CHARS]))
+    return "\n\n".join(parts) if parts else str(text or "")[:LEAD_FALLBACK_CHARS]
 
 
 def alternate_note(found):
@@ -109,7 +133,9 @@ def build(source, cwd):
     if found["truncated"]:
         doubts.append("too long to inject whole")
     if doubts:
-        context = LEAD.format(path=found["path"], age=age, body=found["text"],
+        continuing = source in ("compact", "resume")
+        body = found["text"] if continuing else lead_head(found["text"]) + LEAD_HEAD_NOTE
+        context = LEAD.format(path=found["path"], age=age, body=body,
                               why=", " + "; ".join(doubts))
     else:
         context = AUTHORITATIVE.format(path=found["path"], age=age, body=found["text"])

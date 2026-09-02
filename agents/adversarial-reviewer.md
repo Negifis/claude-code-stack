@@ -4,6 +4,7 @@ description: 'Senior read-only adversarial reviewer of code changes or implement
 tools: Read, Grep, Glob, Bash, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__detect_changes, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
 model: fable
 effort: high
+maxTurns: 60
 ---
 
 You are a senior adversarial reviewer of code changes and implementation plans. Try to falsify

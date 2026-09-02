@@ -323,6 +323,19 @@ def scenario_checkpoint_trust():
     finally:
         drop_checkpoint()
 
+    # A fresh start gets the head of the checkpoint only; a continuing session gets it whole.
+    write_checkpoint(LIVE_CHECKPOINT + "\nCOMPLETED\nParsed the manifest, verified by the unit suite.\n")
+    try:
+        fresh = start("startup")
+        check("9 checkpoint trust", "Ship the importer." in fresh and "Wire the CSV reader" in fresh,
+              "a fresh startup still sees GOAL and NEXT ACTION")
+        check("9 checkpoint trust", "Parsed the manifest" not in fresh and "Only GOAL, STATUS and NEXT ACTION" in fresh,
+              "a fresh startup does not get the body of an unrelated task's checkpoint")
+        check("9 checkpoint trust", "Parsed the manifest" in start("resume"),
+              "a resumed session gets the whole checkpoint")
+    finally:
+        drop_checkpoint()
+
     write_checkpoint("GOAL\nShip it.\n\nSTATUS\nactive\n\nNEXT ACTION\n\n"
                      "ACCEPTANCE\nThe importer runs.\n\nBLOCKERS\nnone\n")
     try:

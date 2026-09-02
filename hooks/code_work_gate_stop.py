@@ -7,7 +7,7 @@ the candidate produced — a lasting artifact, or an effect on a live system:
 
 * development-verification was actually invoked;
 * an operational candidate ends with a receipt naming its pre-execution check and its effect;
-* non-trivial/high-risk simplify used its three named foreground lenses;
+* a HIGH candidate has one foreground simplify-reviewer result (the legacy trio still counts);
 * HIGH completion has an adversarial APPROVED result — from either review engine — newer than
   the final edit;
 * post-ESCALATE publication has a bounded closure-validation result.
@@ -17,6 +17,7 @@ cycle is retired as unverified, preventing an infinite Stop loop.
 """
 import datetime
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -33,7 +34,14 @@ MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
 RISK_ORDER = cwg.RISK_ORDER
+# One lane is the whole simplify pass: `simplify-reviewer` covers reuse, quality and efficiency
+# in one report. The three legacy lens names still count, so an older transcript, or a project
+# that kept the trio, closes under the same rule. The August 2026 transcripts are why: 456 trio
+# waves, 205 of them single-lens re-runs forced by the old three-lens requirement, ~9 minutes
+# of wall time and three Sonnet contexts each, for findings the parent applied in 56% of waves.
+SIMPLIFY_LANE = "simplify-reviewer"
 SIMPLIFY_REVIEWERS = {
+    SIMPLIFY_LANE,
     "simplify-reuse-reviewer",
     "simplify-quality-reviewer",
     "simplify-efficiency-reviewer",
@@ -613,23 +621,46 @@ def transcript_evidence(path, since, skill_since=None):
     return evidence
 
 
-def marker_paths(entry):
-    paths = [
-        cwg.normalize_path(path)
-        for path in (entry.get("paths") or [])
-        if path
-    ]
-    fallback = cwg.normalize_path(entry.get("last_path"))
-    if fallback and fallback not in paths:
-        paths.append(fallback)
-    return paths
+marker_paths = cwg.marker_paths
 
 
 minimum_risk = cwg.minimum_risk
 
 
+def candidate_key(entry):
+    """What the finite block budget is spent against: the candidate's content, not its clock.
+
+    The budget used to be keyed to the marker's `last_ts`, which every mark moves — including
+    the marks the blocked turn itself produces while running the checks the block asked for,
+    and, before attribution became session-owned, marks caused by a second session writing in
+    the same tree. Each of those reset the counter to zero, so `MAX_BLOCKS_PER_CANDIDATE` was
+    not a cap at all and enforcement could block without end.
+
+    The fingerprint moves only when the candidate does: a new cycle (`first_ts`), a path that
+    was not in it before, a higher risk grade, the diagnostic path cap being crossed, or the
+    first unattributable durable change - which is its own input because a purely test-path
+    one flips the flag without moving the grade. Running
+    a test, re-editing a file already in the set, or a throwaway script leaves it alone, which
+    is exactly the "unchanged candidate" the cap is documented to bound.
+    """
+    payload = json.dumps(
+        [
+            float(entry.get("first_ts") or 0.0),
+            sorted(set(marker_paths(entry))),
+            entry.get("minimum_risk_seen"),
+            bool(entry.get("path_overflow")),
+            bool(entry.get("unattributed_durable")),
+        ],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def unfenced_nonempty_lines(message):
+    """Non-empty lines outside fenced blocks, the ones inside them, and whether every fence
+    closed. A caller that only wants the visible text ignores the fenced half."""
     result = []
+    fenced = []
     fence = None
     backticks = chr(96) * 3
     tildes = "~" * 3
@@ -641,9 +672,9 @@ def unfenced_nonempty_lines(message):
         if token is not None:
             fence = None if fence == token else token
             continue
-        if fence is None and line.strip():
-            result.append(line.strip())
-    return result, fence is None
+        if line.strip():
+            (result if fence is None else fenced).append(line.strip())
+    return result, fenced, fence is None
 
 
 HARNESS_TRAILERS = (
@@ -675,30 +706,49 @@ def strip_harness_trailer(message):
 
 
 def final_line_outside_fence(message):
-    lines, closed = unfenced_nonempty_lines(message)
+    lines, _, closed = unfenced_nonempty_lines(message)
     return lines[-1] if lines and closed else ""
 
 
+def stated_control(line):
+    """The control one line states, or malformed for a control-shaped line stating none."""
+    verdict = VERDICT_LINE_RE.match(line)
+    if verdict:
+        return "ordinary", verdict.group(1).upper()
+    closure = CLOSURE_LINE_RE.match(line)
+    if closure:
+        return "closure", closure.group(1).upper()
+    return "malformed", None
+
+
 def reviewer_control(message):
-    """Exactly one unfenced control line, and it must terminate the reviewer result."""
+    """One unfenced control value, however often stated, ending the reviewer result."""
     # No control line can exist without the word appearing somewhere, and the Codex lane routes
     # CLI output of any size through here on every Stop invocation — so rule that out in one
     # scan before the trailer loop and the line split copy a multi-megabyte payload.
     if not CONTROL_TOKEN_RE.search(str(message or "")):
         return "malformed", None
-    lines, closed = unfenced_nonempty_lines(strip_harness_trailer(message))
+    lines, fenced, closed = unfenced_nonempty_lines(strip_harness_trailer(message))
     if not closed or not lines:
         return "malformed", None
-    controls = [line for line in lines if CONTROL_PREFIX_RE.match(line)]
-    if len(controls) != 1 or controls[0] != lines[-1]:
+    # A control line inside a fence is never the reviewer stating its verdict: either it is an
+    # example being quoted, or the doubling below has made fence state meaningless — an
+    # unmatched fence in the message hides one copy's control line and exposes the other's,
+    # which is how an unbalanced result would otherwise read as a well-formed approval.
+    if any(CONTROL_PREFIX_RE.match(line) for line in fenced):
         return "malformed", None
-    verdict = VERDICT_LINE_RE.match(controls[0])
-    if verdict:
-        return "ordinary", verdict.group(1).upper()
-    closure = CLOSURE_LINE_RE.match(controls[0])
-    if closure:
-        return "closure", closure.group(1).upper()
-    return "malformed", None
+    # COMPAT: `codex exec` prints the reviewer's final message twice — once as it streams, then
+    # again as the run's last message, with the CLI's own footer between them — so one verdict
+    # reaches the transcript as two identical control lines. Counting occurrences rejected every
+    # real Codex verdict as malformed and left the native subagent as the only lane that could
+    # satisfy a HIGH candidate. What the rule is actually for is a result that states more than
+    # one thing, so it is the stated controls that must agree: a repeated verdict is still one
+    # verdict, while two different control lines stay malformed, as does a result whose last
+    # line is not a control line.
+    controls = {stated_control(line) for line in lines if CONTROL_PREFIX_RE.match(line)}
+    if len(controls) != 1 or not CONTROL_PREFIX_RE.match(lines[-1]):
+        return "malformed", None
+    return controls.pop()
 
 
 def receipt_of(message):
@@ -732,7 +782,11 @@ def candidate_class(entry):
     the candidate persistent. Downgrading on a truncated path list would let a long cycle end
     under the operational contract it never qualified for.
     """
-    if entry.get("path_overflow"):
+    # A lasting change seen during this candidate that no session could be shown to own is
+    # recorded as a grade without a path. It keeps the candidate persistent for the same reason
+    # overflow does: the marker's path list is no longer the whole story, and the operational
+    # contract answers for commands, not for a file that may have been written here.
+    if entry.get("path_overflow") or entry.get("unattributed_durable"):
         return cwg.WORK_PERSISTENT
     seen = entry.get("minimum_risk_seen")
     if seen in RISK_ORDER and RISK_ORDER[seen] > RISK_ORDER["LOW"]:
@@ -846,40 +900,44 @@ def evaluate_receipt(receipt, entry, evidence):
 
     effective_risk = risk or "HIGH"
 
-    path_count = len(set(cwg.durable_paths(paths)))
-    requires_simplify = effective_risk == "HIGH" or (
-        effective_risk == "STANDARD" and path_count >= 3
-    )
+    # Simplify evidence is one foreground lane result for this candidate, required for HIGH
+    # only. STANDARD work decides for itself: the mandatory trio on three-file STANDARD
+    # candidates bought three lanes plus forced single-lens re-runs for a polish pass the
+    # parent could run locally. Keying the pass on a preceding Skill call, and counting only
+    # lane results that followed it, enforced an order rather than the work; the lane results
+    # themselves are the evidence, in whatever order they ran. The per-lane pass cap is checked
+    # for every lane regardless of risk, so a ritual repeat is caught even where no pass was
+    # required.
+    requires_simplify = effective_risk == "HIGH"
     simplify_unavailable = False
-    # The evidence a simplify pass leaves is three named lenses returning in the foreground for
-    # this candidate. Keying that on a preceding Skill call, and counting only lens results that
-    # followed it, enforced an order rather than the work: a candidate whose lenses ran first
-    # had to re-invoke the skill and then re-run all three over already-simplified code — a
-    # second pass the skill itself forbids as ritual.
-    missing = []
-    exhausted = []
+    current_lane = False
+    exhausted_lane = False
+    attempted = False
     for reviewer in sorted(SIMPLIFY_REVIEWERS):
         # Both lists are already candidate-bound by transcript_evidence.
         successes = evidence["simplify_successes"].get(reviewer, [])
         failures = sorted(evidence["simplify_failures"].get(reviewer, []))
         if len(successes) > MAX_SIMPLIFY_PASSES:
-            return False, "simplify exceeded the absolute {}-pass cap".format(
-                MAX_SIMPLIFY_PASSES
+            return False, "simplify exceeded the absolute {}-pass cap for {}".format(
+                MAX_SIMPLIFY_PASSES, reviewer
             )
+        if successes or failures:
+            attempted = True
         latest_success = max(successes, default=0.0)
         if latest_success and latest_success > (failures[-1] if failures else 0.0):
+            current_lane = True
             continue
-        missing.append(reviewer)
         retries = [stamp for stamp in failures if stamp > latest_success]
         if len(retries) >= 2 and retries[-1] >= durable_ts:
-            exhausted.append(reviewer)
-    if requires_simplify and missing:
-        if kind == "draft-blocked" and set(exhausted) == set(missing):
+            exhausted_lane = True
+    if requires_simplify and not current_lane:
+        if kind == "draft-blocked" and exhausted_lane:
             simplify_unavailable = True
         else:
-            return False, "simplify lenses have no foreground result: {}".format(
-                ", ".join(missing)
-            )
+            return False, (
+                "simplify lenses have no foreground result: a HIGH candidate needs one {} "
+                "result for this candidate{}"
+            ).format(SIMPLIFY_LANE, " (the last attempt failed)" if attempted else "")
 
     ordinary_ts, ordinary_verdict = latest(ordinary_reviews)
     closure_ts, closure_verdict = latest(evidence["closure_reviews"])
@@ -994,7 +1052,7 @@ def evaluate_receipt(receipt, entry, evidence):
     return True, "draft-blocked"
 
 
-def close_cycle(marker, state_file, state, candidate_ts, receipt):
+def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     now = time.time()
     state.update({
         "candidate_ts": candidate_ts,
@@ -1004,6 +1062,10 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt):
     })
     if not cwg.write_json(state_file, state):
         return False
+
+    # The attribution registry outlives no candidate: what this session announced is only ever
+    # read by a command running at the same time, and the cycle it belonged to is over.
+    cwg.retire_claims(session_key_)
 
     current = cwg.read_json(marker)
     if current is None or current.get("last_ts") == candidate_ts:
@@ -1028,14 +1090,14 @@ def reminder(reason, block_number, operational):
     else:
         contract = (
             "Satisfy the observable evidence contract. development-verification must have been "
-            "invoked once in this session, plus honest candidate-bound checks. A HIGH or "
-            "three-plus-file STANDARD candidate also needs the three named simplify lenses to "
-            "have returned foreground results for this candidate — the lenses are the evidence, "
-            "in whatever order they ran, so do not re-run a completed pass to satisfy this; two "
-            "failed attempts for a required lens end draft-blocked. HIGH completion requires one "
-            "adversarial APPROVED result newer than the final edit to a lasting artifact, from "
-            "the foreground Codex lane (/adversarial-review) or, when Codex is unavailable, the "
-            "native reviewer (/adversarial-review-internal). "
+            "invoked once in this session, plus honest candidate-bound checks. A HIGH "
+            "candidate also needs one foreground simplify-reviewer result for this candidate — "
+            "the lane result is the evidence, in whatever order it ran, so do not re-run a "
+            "completed pass to satisfy this; two failed attempts end draft-blocked. HIGH "
+            "completion requires one adversarial APPROVED result newer than the final edit to a "
+            "lasting artifact, from the foreground Codex lane (/adversarial-review; run "
+            "`codex_lane.py check` first and skip straight to the native lane on a recorded "
+            "outage) or the native reviewer (/adversarial-review-internal). "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
         )
@@ -1066,9 +1128,11 @@ def main():
         candidate_ts = entry.get("last_ts")
         first_ts = float(entry.get("first_ts") or candidate_ts or 0.0)
         state = cwg.read_json(state_file) or {}
-        if state.get("candidate_ts") != candidate_ts:
-            state["candidate_ts"] = candidate_ts
+        key_now = candidate_key(entry)
+        if state.get("candidate_key") != key_now:
+            state["candidate_key"] = key_now
             state["blocks"] = 0
+        state["candidate_ts"] = candidate_ts
 
         receipt = receipt_of(data.get("last_assistant_message"))
         preflight_ok, reason = receipt_preflight(receipt, entry)
@@ -1080,7 +1144,7 @@ def main():
         else:
             valid = False
         if valid:
-            if close_cycle(marker, state_file, state, candidate_ts, receipt):
+            if close_cycle(marker, state_file, state, candidate_ts, receipt, key):
                 allow("Code Work Gate recorded terminal state: {}".format(receipt[0]))
             else:
                 allow("Code Work Gate could not retire its state and is failing open.")
@@ -1093,7 +1157,7 @@ def main():
                 "Code Work Gate exhausted its finite block budget for this unchanged candidate. "
                 "The task is ending UNVERIFIED: {}."
             ).format(reason)
-            if not close_cycle(marker, state_file, state, candidate_ts, exhausted):
+            if not close_cycle(marker, state_file, state, candidate_ts, exhausted, key):
                 note += " Gate state could not be retired."
             allow(note)
             return

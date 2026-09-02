@@ -1,5 +1,7 @@
 """Regression tests for the strict finite Code Work Gate."""
+import atexit
 import datetime
+import io
 import json
 import os
 import shutil
@@ -11,15 +13,55 @@ import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STOP_HOOK = os.path.join(HERE, "code_work_gate_stop.py")
+# Every throwaway home below is named after this process. The suite tears these trees down and
+# rebuilds them between cases, so two runs sharing one name delete each other's fixtures
+# mid-scenario: that is what made the Codex-evidence cases fail intermittently whenever a second
+# run - a mutation sweep, a second terminal - happened to overlap this one.
+RUN = "gate_{}".format(os.getpid())
 # The hook reads the Codex CLI's rollout logs as proof a review actually ran; point both the
 # suite and the hook subprocesses at a throwaway home so the developer's real one is untouched.
-CODEX_HOME = os.path.join(tempfile.gettempdir(), "gate_codex_home")
+CODEX_HOME = os.path.join(tempfile.gettempdir(), RUN + "_codex_home")
 os.environ["CODEX_HOME"] = CODEX_HOME
+# The marker snapshots the agent-configuration homes on every shell call, so a suite left
+# pointing at the developer's real one fails whenever anything else writes there while a
+# scenario is resolving - another session, an editor, the plugin autoupdater. Redirect it the
+# same way, and restore this value rather than unsetting it where a case overrides it.
+CLAUDE_CONFIG_DIR = os.path.join(tempfile.gettempdir(), RUN + "_claude_home")
+os.environ["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+# The third watched home has no environment override of its own: the marker resolves it from
+# the user profile. `~/.agents/skills` is a tree the agent tooling re-syncs while other sessions
+# run, so pointing the profile at a throwaway is the only way a scenario's empty delta means
+# what the assertion says it means.
+REAL_CONFIG_HOME = os.path.dirname(HERE)
+AGENT_HOME = os.path.join(tempfile.gettempdir(), RUN + "_agent_home")
+os.makedirs(AGENT_HOME, exist_ok=True)
+os.environ["USERPROFILE"] = AGENT_HOME
+os.environ["HOME"] = AGENT_HOME
 MARK_HOOK = os.path.join(HERE, "code_work_gate_mark.py")
+def _discard_fixtures():
+    """Leave nothing of this run behind.
+
+    The claim files matter as much as the trees: a leftover one keeps an open shell window
+    naming a temp directory, and a real session resolving a path under that directory would
+    read a finished test as a live competing writer.
+    """
+    for tree in (CODEX_HOME, CLAUDE_CONFIG_DIR, AGENT_HOME):
+        shutil.rmtree(tree, ignore_errors=True)
+    try:
+        registry = cwg.claims_root()
+        for name in os.listdir(registry):
+            if name.startswith(RUN + "_test_"):
+                cwg.remove(os.path.join(registry, name))
+    except OSError:
+        pass
+
+
+atexit.register(_discard_fixtures)
 
 sys.path.insert(0, HERE)
 import code_work_gate_common as cwg  # noqa: E402
 import code_work_gate_mark as marker_hook  # noqa: E402
+mark = marker_hook
 import code_work_gate_stop as gate  # noqa: E402
 
 PASSED = 0
@@ -33,7 +75,47 @@ def check(name, condition, detail=None):
 
 
 def session():
-    return "gate_test_{}".format(uuid.uuid4().hex)
+    # Carries this run's own prefix: the fixture cleanup below deletes claim files by name, and
+    # a shared prefix would let a finishing run delete a concurrent one's live scenario state.
+    return "{}_test_{}".format(RUN, uuid.uuid4().hex)
+
+
+def _registry_at(path):
+    """What one scan reports when the registry is the given path."""
+    real = cwg.claims_root
+    cwg.claims_root = lambda: path
+    try:
+        return cwg.foreign_activity("reader", time.time() - 1)
+    finally:
+        cwg.claims_root = real
+
+
+def _crowded_registry_reports_overflow():
+    """A directory full of files this scan ignores is still a directory it had to walk."""
+    crowded = tempfile.mkdtemp(prefix="cwg_crowded_registry_")
+    for index in range(cwg.SCAN_LIMIT + 1):
+        with open(os.path.join(crowded, "noise{}.txt".format(index)), "w") as stream:
+            stream.write("x")
+    try:
+        return _registry_at(crowded)[3] is True
+    finally:
+        shutil.rmtree(crowded, ignore_errors=True)
+
+
+def _registry_states():
+    """Overflow for a registry that does not exist yet, and for one that cannot be listed.
+
+    They are not the same answer: nothing published yet is a complete scan of an empty world,
+    while a directory that is there and unreadable leaves a hole the caller has to be told about.
+    """
+    missing = os.path.join(tempfile.gettempdir(), "cwg_no_such_registry_dir")
+    blocked = os.path.join(tempfile.gettempdir(), "cwg_registry_not_a_directory")
+    with open(blocked, "w", encoding="utf-8") as stream:
+        stream.write("not a directory")
+    try:
+        return _registry_at(missing)[3], _registry_at(blocked)[3]
+    finally:
+        cwg.remove(blocked)
 
 
 def gate_paths(sid):
@@ -44,6 +126,9 @@ def gate_paths(sid):
 def cleanup(sid, transcript=None):
     for path in gate_paths(sid):
         cwg.remove(path)
+    # A claim file outlives its marker by design, so a leftover one would make the next test's
+    # session look like a concurrent writer and silently suppress its attribution.
+    cwg.remove(cwg.claim_path(cwg.session_key(sid)))
     if transcript:
         cwg.remove(transcript)
     # Rollout logs are evidence: one left behind would prove a Codex run for the next test.
@@ -135,7 +220,10 @@ def write_transcript(events):
     return path
 
 
-SIMPLIFY_LENSES = sorted(gate.SIMPLIFY_REVIEWERS)
+SIMPLIFY_LENSES = [gate.SIMPLIFY_LANE]
+LEGACY_LENSES = sorted(gate.SIMPLIFY_REVIEWERS - {gate.SIMPLIFY_LANE})
+PROMPT_HOOK = os.path.join(HERE, "code_work_gate_prompt.py")
+import codex_lane  # noqa: E402
 
 
 def simplify_wave(events, stamp, prefix, subtypes):
@@ -192,6 +280,24 @@ def review_text(verdict, subject="the auth session candidate"):
         "the fixtures that pin it. No open blocker remains beyond the notes above.\n\n"
         "VERDICT: {}"
     ).format(subject, verdict)
+
+
+def closure_text(state, subject="the auth session candidate"):
+    """A closure-validation result, as distinctive as the review it follows."""
+    return review_text("APPROVED", subject).replace(
+        "VERDICT: APPROVED", "CLOSURE_VALIDATION: {}".format(state)
+    )
+
+
+def codex_cli_output(text):
+    """One reviewer message as `codex exec` puts it on the terminal.
+
+    The CLI prints the final message while it streams, then its own footer, then the same
+    message again as the run's last message — so a real verdict reaches the transcript twice.
+    """
+    return "{}\nhook: Stop\nhook: Stop Failed\ntokens used\n75\u00a0824\n{}".format(
+        text, text
+    )
 
 
 def reviewer_role_text():
@@ -533,7 +639,11 @@ try:
         "transcript_path": transcript,
         "last_assistant_message": "[gate] verified: STANDARD; targeted tests passed",
     })
-    check("three-file standard requires simplify trio", result.get("decision") == "block", result)
+    check(
+        "three-file standard passes without a simplify lane",
+        result.get("continue") is True and "decision" not in result,
+        result,
+    )
 finally:
     cleanup(sid, locals().get("transcript"))
 
@@ -541,15 +651,15 @@ sid = session()
 try:
     seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"])
     events = base_events(include_simplify=True)
-    simplify_wave(events, 128, "confirm", ["simplify-reuse-reviewer"])
-    simplify_wave(events, 132, "third", ["simplify-reuse-reviewer"])
+    simplify_wave(events, 128, "confirm", SIMPLIFY_LENSES)
+    simplify_wave(events, 132, "third", SIMPLIFY_LENSES)
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
         "last_assistant_message": "[gate] verified: STANDARD; checks passed",
     })
-    check("a third pass of one lens is rejected", result.get("decision") == "block", result)
+    check("a third pass of the simplify lane is rejected", result.get("decision") == "block", result)
     check(
         "the exhausted pass budget is explained",
         "pass cap" in result.get("reason", ""),
@@ -587,18 +697,19 @@ for paths, receipt, label in (
 
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"])
+    seed(sid, ["C:/repo/src/auth/session.ts"])
     events = [skill_use(120, "development-verification", "skill-dev")]
     simplify_wave(events, 121, "lenses-first", SIMPLIFY_LENSES)
     events.append(skill_use(130, "simplify", "skill-after-lenses"))
+    add_review(events, 131, "review-lane-first", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: STANDARD; checks passed",
+        "last_assistant_message": "[gate] verified: HIGH; checks and review passed",
     })
     check(
-        "lenses that ran before the skill call still count",
+        "a lane that ran before the skill call still counts",
         result.get("continue") is True and "decision" not in result,
         result,
     )
@@ -607,19 +718,19 @@ finally:
 
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"])
+    seed(sid, ["C:/repo/src/auth/session.ts"])
     events = base_events(include_simplify=True)
-    simplify_wave(events, 128, "second", ["simplify-reuse-reviewer"])
-    events.append(agent_use(132, "simplify-reuse-reviewer", "reuse-fail"))
-    events.append(tool_result(132.5, "reuse-fail", "unavailable", is_error=True))
+    events.append(agent_use(132, gate.SIMPLIFY_LANE, "lane-fail"))
+    events.append(tool_result(132.5, "lane-fail", "unavailable", is_error=True))
+    add_review(events, 134, "review-after-lane-fail", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: STANDARD; checks passed",
+        "last_assistant_message": "[gate] verified: HIGH; checks and review passed",
     })
     check(
-        "a lens that failed after its budget cannot be closed as verified",
+        "a lane whose latest attempt failed cannot close a HIGH candidate as verified",
         result.get("decision") == "block"
         and "no foreground result" in result.get("reason", ""),
         result,
@@ -648,17 +759,18 @@ finally:
 
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"], first_ts=200.0, last_ts=210.0)
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=200.0, last_ts=210.0)
     events = [skill_use(20.0, "development-verification", "skill-earlier")]
     simplify_wave(events, 21, "earlier-candidate", SIMPLIFY_LENSES)
+    add_review(events, 211, "review-current", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: STANDARD; checks passed",
+        "last_assistant_message": "[gate] verified: HIGH; checks and review passed",
     })
     check(
-        "lenses from an earlier candidate do not carry over",
+        "a lane from an earlier candidate does not carry over",
         result.get("decision") == "block"
         and "no foreground result" in result.get("reason", ""),
         result,
@@ -668,7 +780,7 @@ finally:
 
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"])
+    seed(sid, ["C:/repo/src/auth/session.ts"])
     events = [skill_use(120, "development-verification", "skill-dev")]
     events.append(skill_use(121, "simplify", "skill-first"))
     for index, subtype in enumerate((
@@ -684,14 +796,15 @@ try:
     events.append(tool_result(
         129.5, "late-third-lens", "Third lens result."
     ))
+    add_review(events, 131, "review-legacy-trio", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: STANDARD; checks passed",
+        "last_assistant_message": "[gate] verified: HIGH; checks and review passed",
     })
     check(
-        "three lenses spread across waves still complete the pass",
+        "legacy lenses spread across waves still complete a HIGH pass",
         result.get("continue") is True and "decision" not in result,
         result,
     )
@@ -707,7 +820,7 @@ try:
         "transcript_path": transcript,
         "last_assistant_message": "[gate] verified: STANDARD; targeted tests passed",
     })
-    check("three-file standard with trio passes", result.get("continue") is True and "decision" not in result, result)
+    check("three-file standard with a lane passes", result.get("continue") is True and "decision" not in result, result)
 finally:
     cleanup(sid, locals().get("transcript"))
 
@@ -760,27 +873,16 @@ finally:
 
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/a.py", "C:/repo/src/b.py", "C:/repo/src/c.py"])
+    seed(sid, ["C:/repo/src/auth/session.ts"])
     events = [skill_use(120, "development-verification", "skill-dev")]
     events.append(skill_use(121, "simplify", "skill-simplify"))
-    for index, subtype in enumerate(sorted({
-        "simplify-reuse-reviewer",
-        "simplify-efficiency-reviewer",
-    })):
-        call_id = "simplify-ok-{}".format(index)
-        events.append(agent_use(122 + index, subtype, call_id))
-        events.append(tool_result(122.5 + index, call_id, "No findings."))
-    events.append(agent_use(
-        125, "simplify-quality-reviewer", "simplify-quality-fail-1"
-    ))
+    events.append(agent_use(125, gate.SIMPLIFY_LANE, "simplify-lane-fail-1"))
     events.append(tool_result(
-        125.5, "simplify-quality-fail-1", "unavailable", is_error=True
+        125.5, "simplify-lane-fail-1", "unavailable", is_error=True
     ))
-    events.append(agent_use(
-        127, "simplify-quality-reviewer", "simplify-quality-fail-2"
-    ))
+    events.append(agent_use(127, gate.SIMPLIFY_LANE, "simplify-lane-fail-2"))
     events.append(tool_result(
-        127.5, "simplify-quality-fail-2", "still unavailable", is_error=True
+        127.5, "simplify-lane-fail-2", "still unavailable", is_error=True
     ))
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
@@ -818,9 +920,234 @@ try:
         "transcript_path": transcript,
         "last_assistant_message": "[gate] verified: HIGH; auth tests and review passed",
     })
-    check("high with trio and current approval passes", result.get("continue") is True and "decision" not in result, result)
+    check("high with one simplify lane and current approval passes", result.get("continue") is True and "decision" not in result, result)
 finally:
     cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events()
+    add_review(events, 130, "review-no-lane", "No blockers.\nVERDICT: APPROVED")
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] verified: HIGH; auth tests and review passed",
+    })
+    check("high without a simplify lane is blocked", result.get("decision") == "block", result)
+    check(
+        "the missing lane is named",
+        "no foreground result" in result.get("reason", "") and gate.SIMPLIFY_LANE in result.get("reason", ""),
+        result,
+    )
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = [skill_use(120, "development-verification", "skill-dev")]
+    simplify_wave(events, 122, "legacy", LEGACY_LENSES)
+    add_review(events, 130, "review-legacy", "No blockers.\nVERDICT: APPROVED")
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] verified: HIGH; auth tests and review passed",
+    })
+    check("the legacy trio still satisfies a HIGH candidate", result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- candidate_shape reads a marker exactly as the Stop hook's own classification does
+for label, marker_entry in (
+    ("plain source", {"first_ts": 100.0, "last_ts": 110.0, "paths": ["c:/repo/src/app.py"], "minimum_risk_seen": "STANDARD"}),
+    ("tests only", {"first_ts": 100.0, "last_ts": 110.0, "paths": ["c:/repo/tests/app.test.py"], "minimum_risk_seen": "LOW"}),
+    ("shell mutation only", {"first_ts": 100.0, "last_ts": 110.0, "paths": [cwg.SHELL_MUTATION_PATH], "minimum_risk_seen": "LOW"}),
+    ("scratchpad only", {"first_ts": 100.0, "last_ts": 110.0, "paths": ["c:/users/in/appdata/local/temp/claude/x/scratchpad/run.py"], "minimum_risk_seen": None}),
+    ("overflowed", {"first_ts": 100.0, "last_ts": 110.0, "paths": [cwg.SHELL_MUTATION_PATH], "minimum_risk_seen": "LOW", "path_overflow": True}),
+    ("unattributed durable", {"first_ts": 100.0, "last_ts": 110.0, "paths": [cwg.SHELL_MUTATION_PATH], "minimum_risk_seen": "HIGH", "unattributed_durable": True}),
+    ("legacy last_path", {"first_ts": 100.0, "last_ts": 110.0, "paths": [], "last_path": "C:/repo/src/auth/session.ts", "minimum_risk_seen": None}),
+    ("auth and tests", {"first_ts": 100.0, "last_ts": 110.0, "paths": ["c:/repo/src/auth/session.ts", "c:/repo/tests/a.test.ts", "c:/repo/src/auth/session.ts"], "minimum_risk_seen": "HIGH"}),
+):
+    shape = cwg.candidate_shape(marker_entry)
+    persistent = gate.candidate_class(marker_entry) == cwg.WORK_PERSISTENT
+    check("candidate_shape agrees on persistence for {}".format(label), shape["persistent"] == persistent, (shape, persistent))
+    if persistent:
+        floor = cwg.max_risk(gate.minimum_risk(gate.marker_paths(marker_entry)), marker_entry.get("minimum_risk_seen"))
+        check("candidate_shape agrees on the floor for {}".format(label), shape["floor"] == floor, (shape, floor))
+    else:
+        check("no floor for an operational shape ({})".format(label), shape["floor"] is None, shape)
+check("a closed marker has no shape", cwg.candidate_shape({"first_ts": 1.0, "closed": True, "paths": ["c:/repo/src/app.py"]}) is None, "closed")
+check("a marker without a cycle has no shape", cwg.candidate_shape({"paths": ["c:/repo/src/app.py"]}) is None, "no first_ts")
+
+# --- the open-candidate reminder on every prompt, and silence without a candidate
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts", "C:/repo/src/app.py"])
+    result = run(PROMPT_HOOK, {"session_id": sid, "prompt": "continue"})
+    context = (result.get("hookSpecificOutput") or {}).get("additionalContext", "")
+    check("prompt reminder names the open candidate", "Open candidate: PERSISTENT" in context, result)
+    check("prompt reminder names the floor", "path floor HIGH" in context and "2 lasting files" in context, result)
+    check("prompt reminder names the receipt", "[gate] verified: HIGH" in context, result)
+finally:
+    cleanup(sid)
+
+sid = session()
+try:
+    result = run(PROMPT_HOOK, {"session_id": sid, "prompt": "hello"})
+    check("prompt reminder is silent without a candidate", "hookSpecificOutput" not in result and result.get("continue") is True, result)
+finally:
+    cleanup(sid)
+
+# --- the marker announces a candidate once, and again only when its floor rises
+sid = session()
+try:
+    repo = os.path.join(AGENT_HOME, "note-repo")
+    os.makedirs(repo, exist_ok=True)
+    def mark_note(event, tool, path):
+        result = run(MARK_HOOK, {
+            "session_id": sid, "hook_event_name": event, "tool_name": tool,
+            "tool_input": {"file_path": path}, "cwd": repo,
+        })
+        return (result.get("hookSpecificOutput") or {}).get("additionalContext")
+    note = mark_note("PostToolUse", "Write", "C:/repo/src/app.py")
+    check("first durable edit announces the candidate", bool(note) and "Candidate opened: PERSISTENT" in note and "floor STANDARD" in note, note)
+    check("the announcement names the receipt", bool(note) and "[gate] verified: STANDARD" in note, note)
+    check("a second edit of the same candidate is silent", mark_note("PostToolUse", "Edit", "C:/repo/src/app.py") is None, "silent")
+    check("another file at the same floor is silent", mark_note("PostToolUse", "Edit", "C:/repo/src/other.py") is None, "silent")
+    raised = mark_note("PostToolUse", "Write", "C:/repo/src/auth/session.ts")
+    check("a rising floor is announced once", bool(raised) and "floor raised" in raised and "HIGH" in raised, raised)
+    check("the raised floor is then silent", mark_note("PostToolUse", "Edit", "C:/repo/src/auth/session.ts") is None, "silent")
+    check("PreToolUse never announces", mark_note("PreToolUse", "Write", "C:/repo/src/more.py") is None, "silent")
+    shell = run(MARK_HOOK, {
+        "session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "echo x > C:/repo/src/app.py"},
+        "tool_response": {"stdout": "", "stderr": ""}, "cwd": repo,
+    })
+    check(
+        "a shell mutation inside an announced candidate is silent",
+        "hookSpecificOutput" not in shell and shell.get("continue") is True,
+        shell,
+    )
+finally:
+    cleanup(sid)
+    shutil.rmtree(os.path.join(AGENT_HOME, "note-repo"), ignore_errors=True)
+
+# --- the Codex lane circuit breaker reads the CLI's own refusal and expires on its own
+codex_lane.clear_state()
+try:
+    check("no record means available", codex_lane.status()[0] is True, codex_lane.status())
+    check(
+        "unrelated stderr records nothing",
+        codex_lane.record_outage("warning: Skill descriptions were shortened\nVERDICT: APPROVED") is False
+        and codex_lane.status()[0] is True,
+        codex_lane.status(),
+    )
+    now = datetime.datetime(2026, 9, 2, 12, 0, 0)
+    found = codex_lane.outage_from_text(
+        "ERROR: You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage "
+        "to purchase more credits or try again at 3:30 PM.", now=now)
+    check("usage limit names its retry time", found is not None and found[0] == now.replace(hour=15, minute=30).timestamp(), found)
+    found = codex_lane.outage_from_text("ERROR: You've hit your usage limit ... try again at 9:15 AM.", now=now)
+    check("a retry time already past is capped at the outage horizon", found is not None and found[0] == now.timestamp() + codex_lane.MAX_OUTAGE, found)
+    found = codex_lane.outage_from_text("ERROR: You've hit your usage limit ... try again at 3:75 PM.", now=now)
+    check("an impossible minute falls back to the default limit outage", found is not None and found[0] == now.timestamp() + codex_lane.DEFAULT_LIMIT_OUTAGE, found)
+    quoted = (
+        "user\nReview codex_lane.py: it matches the CLI text \"You've hit your usage limit ... try again "
+        "at 3:30 PM\" and 'Selected model is at capacity'.\n\ncodex\nThe matcher is anchored, so a quoted "
+        "hit your usage limit phrase does not count.\nVERDICT: APPROVED\ntokens used\n12 345\n"
+    )
+    check("a review that quotes the CLI phrases is not an outage", codex_lane.outage_from_text(quoted, now=now) is None, quoted)
+    found = codex_lane.outage_from_text("ERROR: Selected model is at capacity. Please try a different model.", now=now)
+    check("capacity is a bounded outage", found is not None and abs(found[0] - (now.timestamp() + codex_lane.DEFAULT_OUTAGE)) < 1, found)
+    check(
+        "a recorded outage makes the lane unavailable",
+        codex_lane.record_outage("ERROR: Selected model is at capacity. Please try a different model.") is True
+        and codex_lane.status()[0] is False and "unavailable until" in codex_lane.status()[1],
+        codex_lane.status(),
+    )
+    check("clearing restores the lane", codex_lane.clear_state() and codex_lane.status()[0] is True, codex_lane.status())
+    check(
+        "the stderr redirect of the lean command is found",
+        codex_lane.stderr_file_of("timeout 3600 codex exec --ignore-user-config - < /c/tmp/codex-packet-1.md 2>/c/tmp/codex-1.err  # CODE_WORK_GATE_REVIEW")
+        == "C:/tmp/codex-1.err",
+        codex_lane.stderr_file_of("x 2>/c/tmp/codex-1.err"),
+    )
+    err_path = os.path.join(AGENT_HOME, "codex-probe.err")
+    with open(err_path, "w", encoding="utf-8") as stream:
+        stream.write("tokens used\nERROR: You've hit your usage limit. try again at 3:30 PM.\n")
+    check(
+        "a finished codex exec call with a refusing stderr records the outage",
+        codex_lane.record_from_command("codex exec --ignore-user-config - < p.md 2>" + err_path.replace("\\", "/"), "")
+        is True and codex_lane.status()[0] is False,
+        codex_lane.status(),
+    )
+    codex_lane.clear_state()
+    check("an errand is ignored", codex_lane.record_from_command("git status", "You've hit your usage limit") is False, "ignored")
+    check(
+        "a redirect variable is resolved from the same command",
+        codex_lane.stderr_file_of('REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err')
+        == "C:/tmp/codex-r7.err",
+        codex_lane.stderr_file_of('REVIEW_ID=r7; x 2>/c/tmp/codex-${REVIEW_ID}.err'),
+    )
+    capture_dir = codex_lane.CAPTURE_GLOB.rsplit("/", 1)[0]
+    os.makedirs(capture_dir, exist_ok=True)
+    stale = os.path.join(capture_dir, "codex-gate-test-stale.err")
+    fresh = os.path.join(capture_dir, "codex-gate-test-fresh.err")
+    try:
+        launch = time.time()
+        with open(stale, "w", encoding="utf-8") as stream:
+            stream.write("ERROR: You've hit your usage limit. try again at 3:30 PM.\n")
+        os.utime(stale, (launch - 600, launch - 600))
+        with open(fresh, "w", encoding="utf-8") as stream:
+            stream.write("VERDICT: APPROVED\ntokens used\n1 234\n")
+        os.utime(fresh, (launch + 5, launch + 5))
+        codex_lane.clear_state()
+        check(
+            "an unresolved redirect falls back to the newest capture written after the launch",
+            codex_lane.record_from_command("codex exec - < p.md 2>/c/tmp/codex-${UNSET_ID}.err", "", started=launch) is False
+            and codex_lane.status()[0] is True,
+            codex_lane.status(),
+        )
+        with open(fresh, "w", encoding="utf-8") as stream:
+            stream.write("ERROR: Selected model is at capacity. Please try a different model.\ntokens used\n1 234\n")
+        os.utime(fresh, (launch + 6, launch + 6))
+        check(
+            "the newest capture's refusal is recorded",
+            codex_lane.record_from_command("codex exec - < p.md 2>/c/tmp/codex-${UNSET_ID}.err", "", started=launch) is True
+            and codex_lane.status()[0] is False,
+            codex_lane.status(),
+        )
+        codex_lane.clear_state()
+        check(
+            "a capture older than the launch is never read",
+            codex_lane.record_from_command("codex exec - < p.md 2>/c/tmp/codex-${UNSET_ID}.err", "", started=launch + 60) is False,
+            codex_lane.status(),
+        )
+    finally:
+        for stray in (stale, fresh):
+            try:
+                os.remove(stray)
+            except OSError:
+                pass
+    codex_lane.write_state({"unavailable_until": "garbage", "reason": "x"})
+    check("a corrupt record reads as available", codex_lane.status()[0] is True, codex_lane.status())
+    codex_lane.clear_state()
+    sid = session()
+    try:
+        result = run(MARK_HOOK, {
+            "session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md  # CODE_WORK_GATE_REVIEW"},
+            "tool_response": {"stdout": "", "stderr": "ERROR: Selected model is at capacity. Please try a different model."},
+            "cwd": AGENT_HOME,
+        })
+        check("the marker hook records an outage from the tool output", result.get("continue") is True and codex_lane.status()[0] is False, codex_lane.status())
+    finally:
+        cleanup(sid)
+finally:
+    codex_lane.clear_state()
 
 HARNESS_TRAILER = (
     "\nagentId: acfcde3916804b008 (use SendMessage with to: 'acfcde3916804b008',"
@@ -828,6 +1155,7 @@ HARNESS_TRAILER = (
     "\n<usage>subagent_tokens: 45848\ntool_uses: 9\nduration_ms: 154586</usage>"
 )
 
+FENCE = chr(96) * 3
 QUOTED_TRAILER = (
     "The trailer this hook has to strip looks like:\n"
     "<usage>subagent_tokens: 45848\ntool_uses: 9</usage>\n"
@@ -855,6 +1183,16 @@ for label, reviewer_text in (
         "verdict after a quoted trailer with no harness trailer",
         QUOTED_TRAILER + "No blockers.\nVERDICT: APPROVED",
     ),
+    (
+        "verdict the Codex CLI printed twice",
+        codex_cli_output("No blockers.\nVERDICT: APPROVED"),
+    ),
+    (
+        "verdict restated in another case",
+        codex_cli_output("No blockers.\nVERDICT: APPROVED").replace(
+            "VERDICT: APPROVED", "VERDICT: approved", 1
+        ),
+    ),
 ):
     sid = session()
     try:
@@ -878,7 +1216,21 @@ for label, reviewer_text in (
 for label, reviewer_text in (
     ("fenced verdict", "```\nVERDICT: APPROVED\n```"),
     ("trailing verdict prose", "VERDICT: APPROVED\nextra prose"),
-    ("duplicate verdict", "VERDICT: REVISE\nVERDICT: APPROVED"),
+    ("conflicting verdict values", "VERDICT: REVISE\nVERDICT: APPROVED"),
+    (
+        "two control kinds",
+        "CLOSURE_VALIDATION: BLOCKED\nprose\nVERDICT: APPROVED",
+    ),
+    (
+        "repeated verdict followed by prose",
+        codex_cli_output("VERDICT: APPROVED") + "\nextra prose",
+    ),
+    (
+        # Doubling makes the fences of an unbalanced result add up, which would expose the
+        # second copy's verdict and hide the first copy's inside the fence.
+        "unbalanced fence the CLI doubled into a balanced one",
+        codex_cli_output("Reviewed the candidate.\n" + FENCE + "\nVERDICT: APPROVED"),
+    ),
     (
         "prose after harness trailer",
         "VERDICT: APPROVED" + HARNESS_TRAILER + "\nextra prose",
@@ -1119,6 +1471,91 @@ try:
         "last_assistant_message": "[gate] verified: HIGH; Codex CLI reviewed the candidate",
     })
     check("the Codex CLI lane counts through any shell", result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    # What the CLI really returns: the reviewer's message, the footer, then the message again.
+    # The rollout log holds it once, which is what the result's tail has to bind to.
+    add_codex_review(events, 128, "codex-cli-twice",
+                     "codex exec --sandbox read-only - < /c/tmp/packet.md "
+                     "# CODE_WORK_GATE_REVIEW",
+                     codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] verified: HIGH; Codex approved the auth candidate",
+    })
+    check("the CLI printing its verdict twice still counts as one review",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    # Repetition is tolerated, disagreement is not: a REVISE that the tail turns into an
+    # APPROVED states two things and is no reviewer result at all.
+    add_codex_review(events, 128, "codex-cli-disagreeing",
+                     "codex exec --sandbox read-only - < /c/tmp/packet.md "
+                     "# CODE_WORK_GATE_REVIEW",
+                     review_text("REVISE")
+                     + "\nhook: Stop\ntokens used\n1\n"
+                     + review_text("APPROVED"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] verified: HIGH; Codex approved the auth candidate",
+    })
+    check("two different verdicts in one result are still malformed",
+          result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    # Closure validation runs through the same CLI, so it arrives doubled the same way.
+    add_codex_review(events, 128, "codex-r1", CODEX_CLI_COMMAND, review_text("REVISE"))
+    add_codex_review(events, 130, "codex-r2", CODEX_CLI_COMMAND, review_text("REVISE"))
+    add_codex_review(events, 132, "codex-r3", CODEX_CLI_COMMAND, review_text("ESCALATE"))
+    add_codex_review(events, 134, "codex-closure", CODEX_CLI_COMMAND,
+                     codex_cli_output(closure_text("READY")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] pr-ready: branch review/gate-codex-lane",
+    })
+    check("a doubled closure validation counts once",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    # A real Codex run whose message leaves a fence open: doubling balances the fence count, so
+    # only the second copy's verdict is visible. That is not a well-formed reviewer result.
+    add_codex_review(events, 128, "codex-unbalanced-fence", CODEX_CLI_COMMAND,
+                     codex_cli_output(review_text("APPROVED").replace(
+                         "VERDICT: APPROVED", FENCE + "\nVERDICT: APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] verified: HIGH; Codex approved the auth candidate",
+    })
+    check("doubling never balances an unbalanced fence into a verdict",
+          result.get("decision") == "block", result)
 finally:
     cleanup(sid, locals().get("transcript"))
 
@@ -2325,6 +2762,36 @@ def age_marker(sid, seconds):
 with tempfile.TemporaryDirectory(prefix="cwg_candidate_identity_") as repo:
     candidate_repo(repo, "candidate-one")
 
+    # One command, two writes: the sync's copy of a skill tree and the session's own source.
+    # Only the source belongs to the candidate, and asserting both halves keeps this from
+    # passing through the unresolved-command fallback if the snapshot ever stops working.
+    sid = session()
+    try:
+        synced = os.path.join(repo, ".agents", "skills", "charon-ux-design")
+        os.makedirs(synced, exist_ok=True)
+        own = os.path.join(repo, "src", "session_store.py")
+
+        def write_both():
+            with open(os.path.join(synced, "SKILL.md"), "w", encoding="utf-8") as stream:
+                stream.write("# copied into every worktree by the sync" + chr(10))
+            with open(own, "w", encoding="utf-8") as stream:
+                stream.write("VALUE = 2" + chr(10))
+
+        mark_shell(sid, repo, "npm test", action=write_both)
+        paths = (cwg.read_json(gate_paths(sid)[0]) or {}).get("paths") or []
+        check(
+            "the session's own write is named alongside a sync",
+            any(path.endswith("/src/session_store.py") for path in paths),
+            paths,
+        )
+        check(
+            "a skill tree synced into the worktree is not the session's work",
+            not any("/.agents/skills/" in path for path in paths),
+            paths,
+        )
+    finally:
+        cleanup(sid)
+
     sid = session()
     try:
         marker, _ = gate_paths(sid)
@@ -2671,19 +3138,19 @@ for path in (
 check("author is not auth", gate.minimum_risk(["src/author.ts"]) == "STANDARD")
 
 for path in (
-    "C:/Users/you/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
+    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
     "C:/tmp/sid/scratchpad/push.py",
     "/tmp/wipe.sh",
     "/var/tmp/rotate.py",
-    "C:/Users/you/.claude/state/checkpoints/proj.md",
-    "C:/Users/you/.claude/plans/plan.md",
+    "C:/Users/in/.claude/state/checkpoints/proj.md",
+    "C:/Users/in/.claude/plans/plan.md",
 ):
     check("throwaway artifact is not gated: {}".format(path), not cwg.is_gated(path), path)
     check("throwaway artifact is not durable: {}".format(path), not cwg.durable_paths([path]), path)
 
 for path in (
-    "C:/tmp/demo-project/backend/src/services/featureRegistry.ts",
-    "C:/Users/you/AppData/Local/Temp/build-clone/src/app.py",
+    "C:/tmp/charon-whatsnew/backend/src/services/featureRegistry.ts",
+    "C:/Users/in/AppData/Local/Temp/build-clone/src/app.py",
 ):
     check("a working clone under a temp root stays gated: {}".format(path), cwg.is_gated(path), path)
 
@@ -2726,14 +3193,14 @@ for path in (".env", ".env.production", "deploy/server.pem", "keys/id_ed25519"):
 check("environment plumbing is not a secret", gate.minimum_risk(["src/env.ts"]) == "STANDARD")
 
 for path in (
-    "C:/Users/you/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
+    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
     "/tmp/wipe.sh",
     "C:/tmp/sid/scratchpad/push.py",
 ):
     check("ephemeral matcher agrees with the gate: {}".format(path), cwg.is_ephemeral(path), path)
 
 for path in (
-    "C:/tmp/demo-project/backend/src/app.ts",
+    "C:/tmp/charon-whatsnew/backend/src/app.ts",
     "C:/repo/.claude/state-machine/runner.py",
     "C:/repo/src/scratchpadding.ts",
     "C:/repo/.claude/plans/rollout.md",
@@ -2743,8 +3210,8 @@ for path in (
     check("ephemeral matcher does not overreach: {}".format(path), not cwg.is_ephemeral(path), path)
 
 for path in (
-    "C:/Users/you/.claude/state/checkpoints/proj.md",
-    "C:/Users/you/.claude/plans/plan.md",
+    "C:/Users/in/.claude/state/checkpoints/proj.md",
+    "C:/Users/in/.claude/plans/plan.md",
     "/home/dev/.claude/state/checkpoints/proj.md",
 ):
     check("home bookkeeping is ephemeral: {}".format(path), cwg.is_ephemeral(path), path)
@@ -2819,22 +3286,69 @@ with tempfile.TemporaryDirectory(prefix="cwg_unresolved_") as outside:
         cleanup(sid)
 
 check(
-    "an empty snapshot vouches only for its own repository",
+    "an empty snapshot vouches only for the trees it covers",
     marker_hook.outside_snapshot(
-        ["c:/users/you/.claude/hooks/gate.py"], "C:/repo"
-    ) == ["c:/users/you/.claude/hooks/gate.py"],
+        ["c:/users/in/.claude/hooks/gate.py"], ["C:/repo"]
+    ) == ["c:/users/in/.claude/hooks/gate.py"],
+)
+check(
+    "a watched configuration tree is one of the trees a command is judged against",
+    marker_hook.outside_snapshot(
+        ["c:/users/in/.claude/hooks/gate.py"],
+        ["C:/repo"],
+        ["C:/Users/in/.claude/hooks"],
+    ) == [],
+)
+check(
+    # The scan opens six directories, not the home: claiming the home would vouch for the
+    # machine-managed plugin tree the gate still grades HIGH.
+    "an unwatched pocket of a configuration home is never vouched for",
+    marker_hook.outside_snapshot(
+        ["c:/users/in/.claude/plugins/repo/hook.js"],
+        [],
+        ["C:/Users/in/.claude/hooks", "C:/Users/in/.claude/skills"],
+    ) != [],
+)
+check(
+    "a skipped subdirectory inside a watched tree is not vouched for either",
+    marker_hook.outside_snapshot(
+        ["c:/users/in/.claude/skills/x/node_modules/tool.js"],
+        [],
+        ["C:/Users/in/.claude/skills"],
+    ) != [],
+)
+check(
+    "a watched file vouches for itself",
+    marker_hook.outside_snapshot(
+        ["c:/users/in/.claude/settings.json"], [], ["C:/Users/in/.claude/settings.json"]
+    ) == [],
+)
+check(
+    # `plans` and `state` are bookkeeping in a configuration home and ordinary source in a
+    # repository; Git reports on them either way.
+    "a repository vouches for source in a directory a configuration home would skip",
+    marker_hook.outside_snapshot(
+        ["c:/repo/src/pages/plans/planrow.tsx", "c:/repo/src/state/store.ts"],
+        ["C:/repo"],
+    ) == [],
 )
 check(
     "an empty snapshot vouches for paths under its root",
-    marker_hook.outside_snapshot(["c:/repo/src/app.ts"], "C:/repo") == [],
+    marker_hook.outside_snapshot(["c:/repo/src/app.ts"], ["C:/repo"]) == [],
 )
 check(
     "a sibling directory is not under the snapshot root",
-    marker_hook.outside_snapshot(["c:/repo-two/src/app.ts"], "C:/repo") != [],
+    marker_hook.outside_snapshot(["c:/repo-two/src/app.ts"], ["C:/repo"]) != [],
+)
+check(
+    "no snapshot at all vouches for nothing",
+    marker_hook.outside_snapshot(["c:/repo/src/app.ts"], []) == ["c:/repo/src/app.ts"],
 )
 check(
     "throwaway paths never count as unvouched",
-    marker_hook.outside_snapshot(["/tmp/probe.py", cwg.SHELL_MUTATION_PATH], "C:/repo") == [],
+    marker_hook.outside_snapshot(
+        ["/tmp/probe.py", cwg.SHELL_MUTATION_PATH], ["C:/repo"]
+    ) == [],
 )
 
 sid = session()
@@ -2851,5 +3365,998 @@ try:
     check("writing a scratch script opens no cycle", not os.path.exists(marker), scratch)
 finally:
     cleanup(sid)
+
+# The agent configuration this gate grades HIGH lives outside any repository, so a shell command
+# that rewrites a hook is invisible to the Git snapshot. These cover what the marker sees instead.
+with tempfile.TemporaryDirectory(prefix="cwg_config_home_") as home:
+    config_home = os.path.join(home, ".claude")
+    os.makedirs(os.path.join(config_home, "hooks"))
+    os.makedirs(os.path.join(config_home, "plugins"))
+    hook_file = os.path.join(config_home, "hooks", "gate.py")
+    with open(hook_file, "w", encoding="utf-8") as stream:
+        stream.write("value = 1\n")
+    os.environ["CLAUDE_CONFIG_DIR"] = config_home
+    try:
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-rewrites-hook",
+                "tool_name": "Bash",
+                # Outside any repository, which is the case the Git snapshot cannot answer.
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "python patch_hook.py"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            with open(hook_file, "w", encoding="utf-8") as stream:
+                stream.write("value = 2  # rewritten by the command\n")
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a shell edit to a hook outside any repository is named",
+                any(
+                    path.endswith("/.claude/hooks/gate.py")
+                    for path in data.get("paths") or []
+                ),
+                data,
+            )
+            check(
+                "a hook rewritten through the shell is a HIGH persistent candidate",
+                data.get("minimum_risk_seen") == "HIGH"
+                and cwg.work_class(data.get("paths") or []) == cwg.WORK_PERSISTENT,
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            reference = os.path.join(config_home, "reference", "codex-routing.md")
+            os.makedirs(os.path.dirname(reference), exist_ok=True)
+            with open(reference, "w", encoding="utf-8") as stream:
+                stream.write("# routing" + chr(10))
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-writes-reference",
+                "tool_name": "Bash",
+                "cwd": os.path.join(config_home, "reference"),
+                "tool_input": {"command": "python edit_reference.py"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            with open(reference, "a", encoding="utf-8") as stream:
+                stream.write("one more line" + chr(10))
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            paths = data.get("paths") or []
+            check(
+                "a reference document rewritten through the shell is named",
+                any(path.endswith("/reference/codex-routing.md") for path in paths),
+                data,
+            )
+            # A gated tree the snapshot does not watch would leave this path unvouched, and every
+            # later shell call would then expire the review verdict and strand the candidate.
+            probe = {
+                "session_id": sid,
+                "tool_use_id": "shell-after-reference",
+                "tool_name": "Bash",
+                "cwd": os.path.join(config_home, "reference"),
+                "tool_input": {"command": "python probe.py"},
+            }
+            run(MARK_HOOK, dict(probe, hook_event_name="PreToolUse"))
+            run(MARK_HOOK, dict(probe, hook_event_name="PostToolUse"))
+            after = cwg.read_json(marker) or {}
+            check(
+                "a later command does not re-expire a verdict over a watched reference tree",
+                after.get("last_durable_ts") == data.get("last_durable_ts"),
+                after,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-during-vendor-sync",
+                "tool_name": "Bash",
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "npm test"},
+            }
+            vendor = os.path.join(config_home, "skills", ".system", "imagegen")
+            os.makedirs(vendor, exist_ok=True)
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            with open(os.path.join(vendor, "SKILL.md"), "w", encoding="utf-8") as stream:
+                stream.write("# resynced by the CLI\n")
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a vendor namespace resynced mid-command opens no code candidate",
+                cwg.work_class(data.get("paths") or []) == cwg.WORK_OPERATIONAL,
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-writes-own-skill",
+                "tool_name": "Bash",
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "python author_skill.py"},
+            }
+            own = os.path.join(config_home, "skills", "hand-written")
+            os.makedirs(own, exist_ok=True)
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            with open(os.path.join(own, "SKILL.md"), "w", encoding="utf-8") as stream:
+                stream.write("# authored here\n")
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a hand-written skill in the same tree is still named",
+                any(path.endswith("/skills/hand-written/skill.md")
+                    for path in data.get("paths") or []),
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-leaves-config-alone",
+                "tool_name": "Bash",
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "python probe.py"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a command that rewrote no configuration stays operational",
+                data.get("minimum_risk_seen") == "LOW"
+                and cwg.work_class(data.get("paths") or []) == cwg.WORK_OPERATIONAL,
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-touches-plugins",
+                "tool_name": "Bash",
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "claude plugin update"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            with open(os.path.join(config_home, "plugins", "tool.js"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("module.exports = {};\n")
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "the machine-managed plugin tree opens no code candidate",
+                cwg.work_class(data.get("paths") or []) == cwg.WORK_OPERATIONAL,
+                data,
+            )
+        finally:
+            cleanup(sid)
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "shell-deletes-hook",
+                "tool_name": "Bash",
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "python retire_hook.py"},
+            }
+            doomed = os.path.join(config_home, "hooks", "retired.py")
+            with open(doomed, "w", encoding="utf-8") as stream:
+                stream.write("value = 1\n")
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            os.remove(doomed)
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a hook deleted through the shell is named too",
+                any(
+                    path.endswith("/.claude/hooks/retired.py")
+                    for path in data.get("paths") or []
+                ),
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "validation-outside-any-repository",
+                "tool_name": "Bash",
+                # No repository to vouch for the directory the build writes into, and the
+                # configuration snapshot answers for other trees entirely.
+                "cwd": tempfile.gettempdir(),
+                "tool_input": {"command": "npm run build"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a validation command whose directory nothing watched is still marked",
+                data.get("paths") == [cwg.SHELL_MUTATION_PATH],
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "validation-inside-watched-tree",
+                "tool_name": "Bash",
+                # Run inside a watched tree that the snapshot proves unchanged: nothing to mark.
+                "cwd": os.path.join(config_home, "hooks"),
+                "tool_input": {"command": "npm run build"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            check(
+                "a validation command that changed nothing where it ran opens no cycle",
+                not os.path.exists(marker),
+                cwg.read_json(marker),
+            )
+        finally:
+            cleanup(sid)
+
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            skipped_cwd = os.path.join(config_home, "skills", "demo", "state")
+            os.makedirs(skipped_cwd, exist_ok=True)
+            payload = {
+                "session_id": sid,
+                "tool_use_id": "validation-in-skipped-directory",
+                "tool_name": "Bash",
+                # Inside a watched tree by prefix, but in the bookkeeping the scan walks around,
+                # so nothing here was read and the command is not on proven ground.
+                "cwd": skipped_cwd,
+                "tool_input": {"command": "npm run build"},
+            }
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(
+                "a command run inside a skipped directory is not on proven ground",
+                data.get("paths") == [cwg.SHELL_MUTATION_PATH],
+                data,
+            )
+        finally:
+            cleanup(sid)
+
+        for label, action in (("created", "create"), ("deleted", "delete")):
+            sid = session()
+            try:
+                marker, _ = gate_paths(sid)
+                settings = os.path.join(config_home, "settings.local.json")
+                if action == "delete":
+                    with open(settings, "w", encoding="utf-8") as stream:
+                        stream.write('{"permissions": {"allow": []}}\n')
+                elif os.path.exists(settings):
+                    os.remove(settings)
+                payload = {
+                    "session_id": sid,
+                    "tool_use_id": "shell-{}-settings".format(label),
+                    "tool_name": "Bash",
+                    "cwd": tempfile.gettempdir(),
+                    "tool_input": {"command": "python write_settings.py"},
+                }
+                run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+                if action == "create":
+                    with open(settings, "w", encoding="utf-8") as stream:
+                        stream.write('{"permissions": {"allow": ["Bash"]}}\n')
+                else:
+                    os.remove(settings)
+                run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+                data = cwg.read_json(marker) or {}
+                check(
+                    "a settings file {} through the shell is named".format(label),
+                    any(
+                        path.endswith("/.claude/settings.local.json")
+                        for path in data.get("paths") or []
+                    ),
+                    data,
+                )
+                check(
+                    "a settings file {} through the shell is a HIGH candidate".format(label),
+                    data.get("minimum_risk_seen") == "HIGH"
+                    and cwg.work_class(data.get("paths") or []) == cwg.WORK_PERSISTENT,
+                    data,
+                )
+            finally:
+                if os.path.exists(os.path.join(config_home, "settings.local.json")):
+                    os.remove(os.path.join(config_home, "settings.local.json"))
+                cleanup(sid)
+
+        limit = marker_hook.AGENT_CONFIG_LIMIT
+        try:
+            marker_hook.AGENT_CONFIG_LIMIT = 1
+            check(
+                "a configuration tree past the cap proves nothing",
+                marker_hook.config_snapshot().get("overflow") is True,
+            )
+        finally:
+            marker_hook.AGENT_CONFIG_LIMIT = limit
+    finally:
+        os.environ["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+with tempfile.TemporaryDirectory(prefix="cwg_config_unreadable_") as home:
+    # A configuration directory that exists and cannot be listed must read as unknown, never as
+    # a clean tree. Permissions are not portable enough to arrange here, so the refusal itself
+    # is injected — what is under test is which answer the snapshot gives when a tree refuses.
+    config_home = os.path.join(home, ".claude")
+    os.makedirs(os.path.join(config_home, "hooks"))
+    os.environ["CLAUDE_CONFIG_DIR"] = config_home
+    real_scandir = os.scandir
+    try:
+        os.scandir = lambda path: (_ for _ in ()).throw(PermissionError(13, "denied"))
+        check(
+            "an unreadable configuration tree proves nothing",
+            marker_hook.config_snapshot().get("overflow") is True,
+        )
+    finally:
+        os.scandir = real_scandir
+        os.environ["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+with tempfile.TemporaryDirectory(prefix="cwg_config_notdir_") as home:
+    # A plain file standing where a watched tree would be holds no gated file; refusing every
+    # later command until someone finds it would be worse than reading it as empty.
+    config_home = os.path.join(home, ".claude")
+    os.makedirs(config_home)
+    with open(os.path.join(config_home, "hooks"), "w", encoding="utf-8") as stream:
+        stream.write("not a directory\n")
+    os.environ["CLAUDE_CONFIG_DIR"] = config_home
+    try:
+        check(
+            "a file standing where a watched tree would be is simply empty",
+            marker_hook.config_snapshot().get("overflow") is False,
+        )
+    finally:
+        os.environ["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+with tempfile.TemporaryDirectory(prefix="cwg_config_bare_") as home:
+    # A home holding none of the watched directories is ordinary, not unknown: most machines
+    # have only some of them, and an absent tree changed nothing.
+    config_home = os.path.join(home, ".claude")
+    os.makedirs(config_home)
+    os.environ["CLAUDE_CONFIG_DIR"] = config_home
+    try:
+        snapshot = marker_hook.config_snapshot()
+        check(
+            "a home missing every watched directory is still a clean snapshot",
+            snapshot.get("overflow") is False
+            and cwg.normalize_path(os.path.join(config_home, "hooks"))
+            in (snapshot.get("roots") or []),
+            snapshot,
+        )
+    finally:
+        os.environ["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+check(
+    "a Git-only snapshot written before the upgrade is still read as one",
+    marker_hook.stored_snapshot({"root": "c:/repo", "files": {}})
+    == {"git": {"root": "c:/repo", "files": {}}, "config": None},
+)
+
+# Two sessions in one working directory, on one branch. The marker file is per session, but the
+# snapshot a shell command is judged by reads a shared tree, so the second session used to end
+# up holding the first session's edits: it could then close under no receipt at all, because
+# `no-change` and `operational` are refused for a candidate that changed a lasting artifact and
+# `verified` demands a simplify pass over a diff it never wrote.
+with tempfile.TemporaryDirectory(prefix="cwg_two_sessions_") as repo:
+    candidate_repo(repo, "shared-branch")
+    editor = session()
+    auditor = session()
+    try:
+        editor_marker, _ = gate_paths(editor)
+        auditor_marker, _ = gate_paths(auditor)
+        payload = {
+            "session_id": auditor,
+            "tool_use_id": "auditor-git-op",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "git commit --amend --no-edit"},
+        }
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+        owned = mark_edit(editor, repo, "src/authentication/session.ts")
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+
+        editor_entry = cwg.read_json(editor_marker) or {}
+        auditor_entry = cwg.read_json(auditor_marker) or {}
+        check(
+            "the editing session still owns its own edit",
+            owned in (editor_entry.get("paths") or [])
+            and gate.candidate_class(editor_entry) == cwg.WORK_PERSISTENT,
+            editor_entry,
+        )
+        check(
+            "a neighbouring session's edit stays out of this candidate",
+            owned not in (auditor_entry.get("paths") or []),
+            auditor_entry,
+        )
+        check(
+            "a session that edited nothing stays operational",
+            gate.candidate_class(auditor_entry) == cwg.WORK_OPERATIONAL,
+            auditor_entry,
+        )
+        accepted, why = gate.receipt_preflight(
+            gate.receipt_of("[gate] no-change: read-only audit of the session state"),
+            auditor_entry,
+        )
+        check("a session that edited nothing can close as no-change", accepted, why)
+
+        # The same question with the neighbour writing through a shell command instead: while
+        # its window is open the change is real but unattributable, and charging it to whichever
+        # session happened to look at the tree is exactly the confusion being removed.
+        editor_shell = {
+            "session_id": editor,
+            "tool_use_id": "editor-writer",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "python -c writer"},
+        }
+        auditor_shell = {
+            "session_id": auditor,
+            "tool_use_id": "auditor-status",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "git commit --amend --no-edit"},
+        }
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PreToolUse"))
+        run(MARK_HOOK, dict(auditor_shell, hook_event_name="PreToolUse"))
+        concurrent_target = os.path.join(repo, "src", "billing", "invoice.py")
+        os.makedirs(os.path.dirname(concurrent_target), exist_ok=True)
+        with open(concurrent_target, "w", encoding="utf-8") as stream:
+            stream.write("total = 2" + chr(10))
+        run(MARK_HOOK, dict(auditor_shell, hook_event_name="PostToolUse"))
+        auditor_entry = cwg.read_json(auditor_marker) or {}
+        check(
+            "a change made while another session's command is running is not charged here",
+            not any(
+                path.endswith("/src/billing/invoice.py")
+                for path in auditor_entry.get("paths") or []
+            ),
+            auditor_entry,
+        )
+        # The path is another session's to review; the grade is not. Nobody can be shown to own
+        # this change, so the candidate keeps a floor for it - otherwise a session could reach
+        # the operational contract simply by running its command next to a busy neighbour.
+        check(
+            "an unattributable change still costs this candidate its floor",
+            gate.candidate_class(auditor_entry) == cwg.WORK_PERSISTENT
+            and auditor_entry.get("minimum_risk_seen") == "HIGH",
+            auditor_entry,
+        )
+        rejected, why = gate.receipt_preflight(
+            gate.receipt_of("[gate] no-change: read-only audit of the session state"),
+            auditor_entry,
+        )
+        check("an unattributable change cannot be closed as no-change", not rejected, why)
+        # The floor sends this candidate for a review it must then be able to keep. Freshness is
+        # measured against the last durable change, so an unattributable one has to anchor it:
+        # left at zero the Stop hook falls back to the whole-cycle timestamp, and the next
+        # command of any kind would expire the approval.
+        anchored = auditor_entry.get("last_durable_ts")
+        check(
+            "an unattributable change anchors review freshness",
+            cwg.valid_ts(anchored),
+            auditor_entry,
+        )
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PostToolUse"))
+        editor_entry = cwg.read_json(editor_marker) or {}
+        check(
+            "the session whose command wrote it still holds it",
+            any(
+                path.endswith("/src/billing/invoice.py")
+                for path in editor_entry.get("paths") or []
+            ),
+            editor_entry,
+        )
+
+        # An edit announced but not yet completed. Claiming on PostToolUse alone leaves a race:
+        # the announcement can land after a concurrent command has already resolved its diff.
+        # The hook therefore also answers PreToolUse for an edit tool, publishing the claim
+        # before the write; registering that matcher is what closes the race.
+        announced = os.path.join(repo, "src", "authorization", "policy.py")
+        os.makedirs(os.path.dirname(announced), exist_ok=True)
+        editor_edits = len((cwg.read_json(editor_marker) or {}).get("paths") or [])
+        run(MARK_HOOK, {
+            "session_id": editor,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": repo,
+            "tool_input": {"file_path": announced},
+        })
+        check(
+            "announcing an edit does not open a candidate by itself",
+            len((cwg.read_json(editor_marker) or {}).get("paths") or []) == editor_edits,
+            cwg.read_json(editor_marker),
+        )
+        # A session with no history of its own, so that neither half of the assertion below can
+        # be satisfied by something an earlier scenario left on the auditor's marker: the floor
+        # is sticky for a cycle by design, which would mask exactly what is being tested.
+        observer = session()
+        observer_marker, _ = gate_paths(observer)
+        observer_shell = {
+            "session_id": observer,
+            "tool_use_id": "observer-status",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "git commit --amend --no-edit"},
+        }
+        run(MARK_HOOK, dict(observer_shell, hook_event_name="PreToolUse"))
+        with open(announced, "w", encoding="utf-8") as stream:
+            stream.write("allow = False" + chr(10))
+        run(MARK_HOOK, dict(observer_shell, hook_event_name="PostToolUse"))
+        observer_entry = cwg.read_json(observer_marker) or {}
+        check(
+            "an announced edit is out of a concurrent command's delta before it completes",
+            not any(
+                path.endswith("/src/authorization/policy.py")
+                for path in observer_entry.get("paths") or []
+            ),
+            observer_entry,
+        )
+        # An announcement is not yet a write. It keeps the path out of this candidate, but it
+        # cannot excuse the candidate: until the edit lands, nobody has been shown to own the
+        # change, so the floor applies exactly as it does for an overlapping command.
+        check(
+            "an unconfirmed announcement narrows the question without excusing it",
+            gate.candidate_class(observer_entry) == cwg.WORK_PERSISTENT
+            and observer_entry.get("unattributed_durable") is True,
+            observer_entry,
+        )
+        cleanup(observer)
+
+        # Shared ground is decided per tree, and a repository passes no skip list: a directory
+        # inside it named `state`, `plans` or `node_modules` is ordinary source, not the
+        # bookkeeping those names mean in a configuration home. Judging the neighbour's working
+        # directory by the configuration skip list would read it as outside the repository it
+        # plainly sits in, and its writes would be charged here.
+        vendored = os.path.join(repo, "node_modules", "pkg")
+        os.makedirs(vendored, exist_ok=True)
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PreToolUse", cwd=vendored,
+                            tool_use_id="editor-vendored"))
+        run(MARK_HOOK, dict(auditor_shell, hook_event_name="PreToolUse"))
+        unclaimed = os.path.join(repo, "src", "deploy", "release.py")
+        os.makedirs(os.path.dirname(unclaimed), exist_ok=True)
+        with open(unclaimed, "w", encoding="utf-8") as stream:
+            stream.write("shipped = True" + chr(10))
+        run(MARK_HOOK, dict(auditor_shell, hook_event_name="PostToolUse"))
+        auditor_entry = cwg.read_json(auditor_marker) or {}
+        check(
+            "a neighbour working in a repository subdirectory still shares its tree",
+            not any(
+                path.endswith("/src/deploy/release.py")
+                for path in auditor_entry.get("paths") or []
+            ),
+            auditor_entry,
+        )
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PostToolUse", cwd=vendored,
+                            tool_use_id="editor-vendored"))
+
+        # A command whose own text says it writes keeps its whole delta. Another session
+        # announcing the same path only means that session wrote it too; subtracting on that
+        # weaker evidence would let a real in-place edit leave no candidate at all.
+        contested = os.path.join(repo, "src", "authentication", "session.ts")
+        os.makedirs(os.path.dirname(contested), exist_ok=True)
+        run(MARK_HOOK, {
+            "session_id": editor,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": repo,
+            "tool_input": {"file_path": contested},
+        })
+        writer = {
+            "session_id": auditor,
+            "tool_use_id": "auditor-sed",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "sed -i s/a/b/ src/authentication/session.ts"},
+        }
+        run(MARK_HOOK, dict(writer, hook_event_name="PreToolUse"))
+        with open(contested, "w", encoding="utf-8") as stream:
+            stream.write("export const value = 9;" + chr(10))
+        run(MARK_HOOK, dict(writer, hook_event_name="PostToolUse"))
+        auditor_entry = cwg.read_json(auditor_marker) or {}
+        check(
+            "a write-shaped command still owns the path it wrote",
+            any(
+                path.endswith("/src/authentication/session.ts")
+                for path in auditor_entry.get("paths") or []
+            ),
+            auditor_entry,
+        )
+        # And the claim is published before the window closes: a reader that sees the window
+        # gone must already be able to see what the command wrote, or the interval between the
+        # two is one where nobody owns the change.
+        registry = cwg.read_json(cwg.claim_path(cwg.session_key(auditor))) or {}
+        check(
+            "a resolved command closes its window only once its claims are readable",
+            not registry.get("shell_start_ts")
+            and any(
+                path.endswith("/src/authentication/session.ts")
+                for path in (registry.get("claims") or {})
+            ),
+            registry,
+        )
+
+        # A command killed before its PostToolUse leaves a window open. Another session must
+        # not silently lose its own delta to it: attribution may hand every path away, but what
+        # it must never do is leave no candidate at all for a tree that demonstrably changed.
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PreToolUse",
+                            tool_use_id="editor-killed"))
+        validation = {
+            "session_id": auditor,
+            "tool_use_id": "auditor-validation",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "npm test"},
+        }
+        run(MARK_HOOK, dict(validation, hook_event_name="PreToolUse"))
+        generated = os.path.join(repo, "src", "generated.ts")
+        with open(generated, "w", encoding="utf-8") as stream:
+            stream.write("export const built = true;" + chr(10))
+        before_edits = int((cwg.read_json(auditor_marker) or {}).get("edits") or 0)
+        run(MARK_HOOK, dict(validation, hook_event_name="PostToolUse"))
+        auditor_entry = cwg.read_json(auditor_marker) or {}
+        check(
+            "a delta given away entirely still leaves a candidate",
+            int(auditor_entry.get("edits") or 0) == before_edits + 1
+            and cwg.SHELL_MUTATION_PATH in (auditor_entry.get("paths") or []),
+            auditor_entry,
+        )
+        killed_marker, _ = gate_paths(auditor)
+        killed_entry = cwg.read_json(killed_marker) or {}
+        rejected, why = gate.receipt_preflight(
+            gate.receipt_of("[gate] operational: checked the tree first; tests passed"),
+            killed_entry,
+        )
+        check(
+            "a window nobody closed cannot buy the operational contract",
+            not rejected and gate.candidate_class(killed_entry) == cwg.WORK_PERSISTENT,
+            why,
+        )
+        run(MARK_HOOK, dict(editor_shell, hook_event_name="PostToolUse",
+                            tool_use_id="editor-killed"))
+
+        # Ownership must never lapse mid-hook. Sampling the registry while the PostToolUse hook
+        # is still resolving is the only way to see the interval the after-snapshot spans: with
+        # the window closed first, every sample taken during it shows a command that has stopped
+        # claiming to be writing and has not yet said what it wrote, and a session resolving
+        # then takes those writes for its own.
+        handover = os.path.join(repo, "src", "authentication", "handover.ts")
+        os.makedirs(os.path.dirname(handover), exist_ok=True)
+        sampler = {
+            "session_id": auditor,
+            "tool_use_id": "auditor-handover",
+            "tool_name": "Bash",
+            "cwd": repo,
+            "tool_input": {"command": "sed -i s/a/b/ src/authentication/handover.ts"},
+        }
+        run(MARK_HOOK, dict(sampler, hook_event_name="PreToolUse"))
+        with open(handover, "w", encoding="utf-8") as stream:
+            stream.write("export const handed = true;" + chr(10))
+        resolving = subprocess.Popen(
+            [sys.executable, MARK_HOOK],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        resolving.stdin.write(json.dumps(dict(sampler, hook_event_name="PostToolUse")))
+        resolving.stdin.close()
+        samples = 0
+        unowned = 0
+        while resolving.poll() is None:
+            snapshot = cwg.read_json(cwg.claim_path(cwg.session_key(auditor)))
+            if snapshot is None:
+                # A read that lost the race with the atomic replace is a missed sample, not a
+                # lapse in ownership; counting it as one would make this test flaky.
+                continue
+            samples += 1
+            if not snapshot.get("shell_start_ts") and not any(
+                path.endswith("/src/authentication/handover.ts")
+                for path in (snapshot.get("claims") or {})
+            ):
+                unowned += 1
+            time.sleep(0.005)
+        resolving.wait()
+        settled = cwg.read_json(cwg.claim_path(cwg.session_key(auditor))) or {}
+        # Only a run that ended up claiming the path can say anything about the interval before
+        # it: a Git snapshot that could not be compared - the timeout is reachable on a loaded
+        # machine - resolves nothing, and there is then no handover to observe. The mutation
+        # this pins moves the window close earlier without changing what is claimed in the end,
+        # so keying conclusiveness to the settled state does not weaken it.
+        conclusive = any(
+            path.endswith("/src/authentication/handover.ts")
+            for path in (settled.get("claims") or {})
+        )
+        check(
+            "a resolving command never stops owning what it wrote",
+            samples <= 1 or unowned == 0 or not conclusive,
+            "{} of {} samples owned by nobody; settled={}".format(unowned, samples, settled),
+        )
+    finally:
+        cleanup(editor)
+        cleanup(auditor)
+
+# The finite block budget is documented as a hard cap per unchanged candidate. Keyed to the
+# marker's last_ts it was not one: any later mark — the blocked turn's own checks, or a
+# neighbouring session refreshing the marker — reset the counter and enforcement could block
+# without end.
+sid = session()
+try:
+    marker, _ = gate_paths(sid)
+    seed(sid, ["C:/repo/src/app.py"])
+    payload = {"session_id": sid, "last_assistant_message": "done"}
+    for expected in range(1, 4):
+        result = run(STOP_HOOK, payload)
+        check(
+            "block {} survives a marker refresh".format(expected),
+            "block {}/3".format(expected) in result.get("reason", ""),
+            result,
+        )
+        refreshed = cwg.read_json(marker)
+        refreshed["last_ts"] = float(refreshed["last_ts"]) + 5.0
+        refreshed["edits"] = int(refreshed.get("edits") or 0) + 1
+        check("refresh marker", cwg.write_json(marker, refreshed), refreshed)
+    result = run(STOP_HOOK, payload)
+    check(
+        "a refreshed timestamp cannot buy a fourth block",
+        result.get("continue") is True and "UNVERIFIED" in result.get("systemMessage", ""),
+        result,
+    )
+finally:
+    cleanup(sid)
+
+# The other half of the same rule: a genuinely new edit is a new candidate and does get a fresh
+# budget, so the cap bounds disobedience without punishing progress.
+sid = session()
+try:
+    marker, _ = gate_paths(sid)
+    seed(sid, ["C:/repo/src/app.py"])
+    payload = {"session_id": sid, "last_assistant_message": "done"}
+    for expected in (1, 2):
+        result = run(STOP_HOOK, payload)
+        check(
+            "block {} before the candidate grows".format(expected),
+            "block {}/3".format(expected) in result.get("reason", ""),
+            result,
+        )
+    grown = cwg.read_json(marker)
+    grown["paths"] = list(grown["paths"]) + ["c:/repo/src/other.py"]
+    grown["last_ts"] = float(grown["last_ts"]) + 5.0
+    check("grow marker", cwg.write_json(marker, grown), grown)
+    result = run(STOP_HOOK, payload)
+    check(
+        "a new edit restarts the block budget",
+        "block 1/3" in result.get("reason", ""),
+        result,
+    )
+finally:
+    cleanup(sid)
+
+
+# The registry's own limits, driven directly: they decide whether a dead session can go on
+# suppressing attribution, and none of them is reachable from a real-time scenario. The
+# registry is redirected first — this suite runs inside a live session whose own claim file
+# sits in the real one, and these checks are about what a named file does, not about it.
+with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
+    stale = cwg.session_key(session())
+    real_root = cwg.claims_root
+    cwg.claims_root = lambda: registry
+    try:
+        now = time.time()
+        target = "c:/repo/src/app.py"
+        check(
+            "an announcement inside the window is foreign",
+            cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], now=now)
+            and cwg.foreign_activity("reader", now - 1, now)[0] == {target},
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "an announcement made before the window is not",
+            cwg.foreign_activity("reader", now + 2 * cwg.CLAIM_SLACK, now)[0] == set(),
+        )
+        check(
+            "a session's own announcements are not foreign to itself",
+            cwg.foreign_activity(stale, now - 1, now)[0] == set(),
+        )
+        check(
+            "an open shell window is reported with its working directory",
+            cwg.publish_claims(stale, shell_start_ts=now, cwd="C:/repo", now=now)
+            and cwg.foreign_activity("reader", now - 1, now)[2] == {"c:/repo"},
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "an announcement outlives any prompt, however long it is left open",
+            cwg.publish_claims(stale, paths=["C:/repo/src/slow.py"], pending=True,
+                               now=now - cwg.SHELL_WINDOW_LIMIT - 60)
+            and "c:/repo/src/slow.py"
+            in cwg.foreign_activity("reader", now, now + 2 * cwg.CLAIM_HORIZON)[1],
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "a file still holding an announcement survives the staleness sweep",
+            os.path.exists(cwg.claim_path(stale)),
+        )
+        check(
+            "a window left open by a killed command expires",
+            cwg.foreign_activity("reader", now, now + cwg.SHELL_WINDOW_LIMIT + 1)[2] == set(),
+        )
+        check(
+            "no elapsed time retires a file that still announces something",
+            cwg.foreign_activity("reader", now, now + 400 * 86400.0)[1]
+            == {"c:/repo/src/slow.py"}
+            and os.path.exists(cwg.claim_path(stale)),
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        # Nor does anyone else's activity. A reader is not the writer of that file and cannot
+        # know whether the prompt holding its edit was answered, so it may neither delete it nor
+        # rewrite it to shrink it; only its own session ends an announcement.
+        crowd = [cwg.session_key(session()) for _ in range(64)]
+        check(
+            "other sessions announcing edits do not displace an older announcement",
+            all(
+                cwg.publish_claims(other, paths=["C:/repo/src/x{}.py".format(index)],
+                                   pending=True, now=now + index)
+                for index, other in enumerate(crowd)
+            )
+            and "c:/repo/src/slow.py"
+            in cwg.foreign_activity("reader", now, now + 400 * 86400.0)[1]
+            and os.path.exists(cwg.claim_path(stale)),
+            sorted(os.listdir(cwg.claims_root()))[:3],
+        )
+        for other in crowd:
+            cwg.remove(cwg.claim_path(other))
+        check(
+            "a registry that does not exist yet is an answer, not a hole",
+            _registry_states() == (False, True),
+            _registry_states(),
+        )
+        check(
+            "entries this scan skips still spend its budget",
+            _crowded_registry_reports_overflow(),
+        )
+        check(
+            "a registry too large for one scan is unread, not silent",
+            all(
+                cwg.publish_claims(cwg.session_key(session()),
+                                   paths=["C:/repo/src/many{}.py".format(index)], now=now)
+                for index in range(cwg.SCAN_LIMIT + 1)
+            )
+            and cwg.foreign_activity("reader", now - 1, now)[3] is True
+            and mark.own_delta("reader", "c:/repo", ["c:/repo/src/mine.py"], now - 1, False,
+                               [("c:/repo", ())]) == ([], ["c:/repo/src/mine.py"]),
+            len(os.listdir(cwg.claims_root())),
+        )
+        for name in list(os.listdir(cwg.claims_root())):
+            if name != os.path.basename(cwg.claim_path(stale)):
+                cwg.remove(os.path.join(cwg.claims_root(), name))
+        check(
+            "a claim file past the horizon is dropped rather than believed",
+            # Promoted first, because only a file with nothing outstanding is the sweep's to
+            # take: an announcement is what keeps one alive past the horizon.
+            cwg.publish_claims(stale, paths=["C:/repo/src/slow.py"], now=now)
+            and cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], now=now)
+            and cwg.foreign_activity("reader", now, now + cwg.CLAIM_HORIZON + 1)
+            == (set(), set(), set(), False)
+            and not os.path.exists(cwg.claim_path(stale)),
+        )
+        with open(cwg.claim_path(stale), "w", encoding="utf-8") as stream:
+            stream.write("{not json")
+        check(
+            "a malformed claim file is unread, not silence",
+            # Present and unparseable is a session whose state this scan does not have, so it
+            # raises nothing and claims nothing: it reports the gap instead.
+            cwg.foreign_activity("reader", time.time() - 1) == (set(), set(), set(), True),
+        )
+        cwg.remove(cwg.claim_path(stale))
+        check(
+            "a relative announced path resolves to the same key the edit records",
+            cwg.publish_claims(stale, paths=["src/app.py"], cwd="C:/repo")
+            and target in (cwg.read_json(cwg.claim_path(stale)) or {}).get("claims", {}),
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "settling a path promotes it out of the announced map",
+            cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], pending=True)
+            and cwg.publish_claims(stale, paths=["C:/repo/src/app.py"])
+            and target in (cwg.read_json(cwg.claim_path(stale)) or {}).get("claims", {})
+            and target not in (cwg.read_json(cwg.claim_path(stale)) or {}).get("pending", {}),
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "an unconfirmed announcement is not read as a settled claim",
+            cwg.publish_claims(stale, paths=["C:/repo/src/only-announced.py"], pending=True)
+            and "c:/repo/src/only-announced.py"
+            not in cwg.foreign_activity("reader", time.time() - 1)[0]
+            and "c:/repo/src/only-announced.py"
+            in cwg.foreign_activity("reader", time.time() - 1)[1],
+            cwg.read_json(cwg.claim_path(stale)),
+        )
+        check(
+            "a closed cycle retires the registry file",
+            cwg.retire_claims(stale) and not os.path.exists(cwg.claim_path(stale)),
+        )
+        check(
+            "a still-open shell window survives the cycle that closed around it",
+            cwg.publish_claims(stale, shell_start_ts=time.time(), cwd="C:/repo")
+            and not cwg.retire_claims(stale)
+            and os.path.exists(cwg.claim_path(stale)),
+        )
+    finally:
+        cwg.claims_root = real_root
+
+
+# The registry closes a race only if the announcement reaches it before the write does, and
+# that depends on a hook registration, not on this code. A session that announces at
+# PostToolUse alone can still have its claim land after a concurrent command resolved its own
+# snapshot, so the matcher is part of the mechanism and is asserted here rather than assumed.
+# Read from the configuration home this suite lives in, not from the redirected one the
+# scenarios use: what matters is the deployment that actually runs these hooks.
+# A live configuration directory holds settings.json; a checkout of the published stack
+# holds only the template, whose hook registrations are the same facts.
+settings_file = os.path.join(REAL_CONFIG_HOME, "settings.json")
+if not os.path.exists(settings_file):
+    settings_file = os.path.join(REAL_CONFIG_HOME, "settings.example.json")
+with io.open(settings_file, encoding="utf-8") as stream:
+    registered = json.load(stream)
+events = registered.get("hooks") or {}
+marker_events = {}
+for event, groups in events.items():
+    for group in groups or ():
+        for hook in group.get("hooks") or ():
+            if "code_work_gate_mark" in str(hook.get("command") or ""):
+                marker_events.setdefault(event, []).append(group.get("matcher") or "")
+check(
+    "a run only ever cleans up after itself",
+    session().startswith(RUN + "_test_"),
+    RUN,
+)
+check(
+    "the marker answers both halves of a shell command",
+    any("Bash" in matcher for matcher in marker_events.get("PreToolUse") or ())
+    and any("Bash" in matcher for matcher in marker_events.get("PostToolUse") or ()),
+    marker_events,
+)
+check(
+    "an edit is announced before it lands, not only after",
+    any("Edit" in matcher for matcher in marker_events.get("PreToolUse") or ())
+    and any("Edit" in matcher for matcher in marker_events.get("PostToolUse") or ()),
+    marker_events,
+)
+check(
+    "a failed shell command is still marked",
+    any("Bash" in matcher for matcher in marker_events.get("PostToolUseFailure") or ()),
+    marker_events,
+)
+
 
 print("PASS: {} assertions".format(PASSED))

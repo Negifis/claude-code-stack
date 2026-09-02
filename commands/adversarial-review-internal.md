@@ -6,9 +6,10 @@ argument-hint: "[plan|code|file-path] [optional named risk]"
 # Native Adversarial Review
 
 This is the fallback review lane. `/adversarial-review` runs Codex and is the default; use this
-one when Codex is unavailable, died before a verdict on its one allowed resume, or the user
-declined it — and say so in the report, since the reviewer then shares the model that wrote the
-code. A round the Codex lane started continues here on the same ledger and budget.
+one when `codex_lane.py check` reports a recorded outage, Codex died before a verdict on its one
+allowed resume, or the user declined it — and say so in the report, since the reviewer then
+shares the model that wrote the code. A round the Codex lane started continues here on the same
+ledger and budget; never run both engines on the same round.
 
 This command is a thin entry point. Read and follow the development-verification skill first.
 That skill—not this command—owns risk classification, round limits, blocker policy, recovery,
