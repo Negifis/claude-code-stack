@@ -223,8 +223,8 @@ Worth knowing before you turn it on:
   else in the payload is Python and runs anywhere, except the worktree audit, which runs
   under Node.
 - `autoCompactWindow: "300k"` and `skillListingMaxDescChars: 320` ship in the template on
-  purpose: on this machine 90% of main-session requests carried 150k–1M tokens before the
-  window was set, and the skill listing was 24 KB. Drop them if your sessions are short.
+  purpose; the measurements behind them are in `reference/usage-optimization-2026-09.md`.
+  Drop them if your sessions are short.
 - The installer refuses a config path it cannot quote safely for the launching shell. On
   Windows that means no `"`, no `%` and no `!` anywhere in the path: quoting does not stop
   `cmd.exe` expanding `%NAME%`, delayed expansion eats `!NAME!`, and a literal quote cannot
