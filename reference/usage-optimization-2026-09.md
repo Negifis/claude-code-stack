@@ -104,8 +104,8 @@ directory, except that the stale `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` 
 `settings.local.json` was raised to `claude-sonnet-5` on request (on a runtime before 2.1.251
 that variable still overrides the reviewer's model, so it stays a caveat);
 `GITLAB_TOKEN` in `settings.json` env (a secret in a file that has a public example — flagged).
-`CLAUDE_CODE_SUBAGENT_MODEL` was not set globally for the same version reason: the winget CLI
-on this machine is 2.1.236.
+`CLAUDE_CODE_SUBAGENT_MODEL` was not set globally for the same version reason: the
+`minimumVersion` floor (2.1.246) is below 2.1.251, where the override semantics changed.
 
 ## 4. Expected effect per representative workload
 

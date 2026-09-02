@@ -19,8 +19,9 @@ Built-in `Explore` and `Plan` inherit the main session's model (capped at Opus);
 `agents/Explore.md` overrides the built-in with the Sonnet profile above, which is the
 documented override mechanism for Claude Code 2.1.25x. `Plan` is left built-in: two uses in
 seven weeks, both in plan mode where the strong model is the point. `CLAUDE_CODE_SUBAGENT_MODEL`
-is deliberately not set: before 2.1.251 it overrode every agent's own `model`, including the
-reviewer's, and the winget CLI on this machine is still 2.1.236.
+is deliberately not set globally (the wa-tg-tun-new project sets it locally to
+`claude-sonnet-5`; see usage-optimization-2026-09.md): before 2.1.251 it overrode every agent's
+own `model`, including the reviewer's, and the `minimumVersion` floor of 2.1.246 is below that.
 
 The aliases are pinned in `settings.json` (`env`): `opus` -> `claude-opus-5`, `sonnet` ->
 `claude-sonnet-5`, `fable` -> `claude-fable-5-1`. Raise the pins when a new generation ships;
