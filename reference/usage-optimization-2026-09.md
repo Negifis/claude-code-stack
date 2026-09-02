@@ -100,8 +100,9 @@ freshness rule (an approval must be newer than the last edit to a lasting artifa
 rebase or merge still costs a delta round); Codex as the default engine; the marketing and
 geo agent profiles (unused in the period, no evidence either way); the NotebookLM hooks (their
 latency is 1–1.5 s per event, their context 4 KB per session); the project's own `.claude`
-directory (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` in its `settings.local.json` is stale
-and, on a runtime before 2.1.251, would override the reviewer's model — flagged, not touched);
+directory, except that the stale `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` in its
+`settings.local.json` was raised to `claude-sonnet-5` on request (on a runtime before 2.1.251
+that variable still overrides the reviewer's model, so it stays a caveat);
 `GITLAB_TOKEN` in `settings.json` env (a secret in a file that has a public example — flagged).
 `CLAUDE_CODE_SUBAGENT_MODEL` was not set globally for the same version reason: the winget CLI
 on this machine is 2.1.236.
