@@ -91,6 +91,7 @@ reviewer lanes themselves are 6.3% of context tokens.
 | `skills/subagent-delegation` | trio exception; model guidance generic | routing by lane; `general-purpose` gets `model: "sonnet"` unless judgment is needed |
 | `commands/adversarial-review.md` | Codex first, resume on failure, effort xhigh | breaker check first; no resume on quota/capacity; effort high |
 | `CLAUDE.md` | 11.1 KB | 7.0 KB (hook contract and trio exception moved to the skill; NotebookLM block condensed) |
+| `settings.json` env | `ANTHROPIC_DEFAULT_FABLE_MODEL: claude-fable-5` | `claude-fable-5-1` (the Opus 5 and Sonnet 5 pins were already current); the project's `CLAUDE_CODE_SUBAGENT_MODEL` raised from `claude-sonnet-4-6` to `claude-sonnet-5` |
 | `continuity_session_start.py` | full checkpoint body injected on every fresh start | GOAL/STATUS/NEXT ACTION only on `startup`/`fork`; full body on `resume`/`compact` |
 | `reference/model-routing.md`, `reference/environment.md` | — | updated to the new lanes and files |
 

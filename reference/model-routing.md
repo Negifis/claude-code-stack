@@ -22,7 +22,10 @@ seven weeks, both in plan mode where the strong model is the point. `CLAUDE_CODE
 is deliberately not set: before 2.1.251 it overrode every agent's own `model`, including the
 reviewer's, and the winget CLI on this machine is still 2.1.236.
 
-The exact aliases available to the current Claude Code runtime are authoritative. Do not encode
+The aliases are pinned in `settings.json` (`env`): `opus` -> `claude-opus-5`, `sonnet` ->
+`claude-sonnet-5`, `fable` -> `claude-fable-5-1`; raise the pins when a new generation ships,
+every agent profile follows them. The exact aliases available to the current Claude Code
+runtime are authoritative. Do not encode
 a machine-wide assumption that one named alias always exists or that the most expensive tier is
 required for every review.
 
