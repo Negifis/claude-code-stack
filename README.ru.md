@@ -150,8 +150,9 @@ python hooks/hygiene_hooks_test.py
 
 ## Установка
 
-Нужны Claude Code ≥ 2.1.117 и Python 3.11+ (замещение `Explore`, `maxTurns` и
-`autoCompactWindow` требуют 2.1.246 или новее; `tools/worktree-audit.mjs` — Node 18+).
+Нужны Claude Code ≥ 2.1.246 (пол для замещения `Explore`, `maxTurns` и `autoCompactWindow`;
+то же значение стоит в `minimumVersion` шаблона) и Python 3.11+; `tools/worktree-audit.mjs`
+требует Node 18+.
 
 ```bash
 git clone https://github.com/Negifis/claude-code-stack.git && cd claude-code-stack
@@ -269,8 +270,11 @@ python test_install.py
 - встроенные скиллы Anthropic — `playwright`, `webapp-testing`, `theme-factory`
 - скиллы Figma — `figma`, `figma-implement-design`, `figma-create-design-system-rules`
 
-Также не вошёл мост памяти NotebookLM, на который ссылалась прежняя версия `CLAUDE.md`: он
-зависит от инструментов, которых здесь нет.
+Также не вошёл мост памяти NotebookLM. В `CLAUDE.md` остался его единственный абзац (со
+ссылкой на `reference/notebooklm-memory.md`), а в `reference/environment.md` — строка про мост,
+потому что оба файла опубликованы ровно такими, какими работают локально; ни самого
+reference-файла, ни моста здесь нет — они зависят от инструментов, которые не публикуются.
+Удалите этот абзац или не обращайте на него внимания, если NotebookLM не используете.
 
 ---
 

@@ -149,8 +149,9 @@ python hooks/hygiene_hooks_test.py
 
 ## Install
 
-Requires Claude Code ≥ 2.1.117 and Python 3.11+ (the `Explore` override, `maxTurns` and
-`autoCompactWindow` need 2.1.246 or later; `tools/worktree-audit.mjs` needs Node 18+).
+Requires Claude Code ≥ 2.1.246 (the floor for the `Explore` override, `maxTurns` and
+`autoCompactWindow`; the template's `minimumVersion` says the same) and Python 3.11+;
+`tools/worktree-audit.mjs` needs Node 18+.
 
 ```bash
 git clone https://github.com/Negifis/claude-code-stack.git && cd claude-code-stack
@@ -265,8 +266,11 @@ authors, and you should install them from the source:
 - Anthropic's own bundled skills — `playwright`, `webapp-testing`, `theme-factory`
 - Figma's `figma`, `figma-implement-design`, `figma-create-design-system-rules`
 
-Also left out: the NotebookLM memory bridge referenced by an earlier version of `CLAUDE.md`,
-since it depends on tooling that isn't published here.
+Also left out: the NotebookLM memory bridge. `CLAUDE.md` still carries its one paragraph
+(pointing at `reference/notebooklm-memory.md`) and `reference/environment.md` still lists the
+bridge, because both files are published exactly as they run locally; neither the reference
+file nor the bridge is here, since they depend on tooling that isn't published. Delete that
+paragraph, or ignore it, if you don't run NotebookLM.
 
 ---
 

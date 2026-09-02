@@ -248,5 +248,5 @@
   "autoMemoryEnabled": false,
   "autoCompactWindow": "300k",
   "skillListingMaxDescChars": 320,
-  "minimumVersion": "2.1.117"
+  "minimumVersion": "2.1.246"
 }
