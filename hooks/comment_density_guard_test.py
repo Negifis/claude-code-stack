@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comment_density_guard.py")
+HOOK = r"C:\Users\in\.claude\hooks\comment_density_guard.py"
 
 CHRONY_BLOAT = """# Ubuntu's default is `makestep 1 3`: step only during the first three updates, slew
 # afterwards.

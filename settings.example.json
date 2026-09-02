@@ -36,6 +36,16 @@
             "statusMessage": "Continuity: restoring task checkpoint..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/session_guard.py",
+            "timeout": 10,
+            "statusMessage": "Checking working tree for other sessions..."
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -45,6 +55,15 @@
             "type": "command",
             "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_prompt.py",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_prompt.py",
+            "timeout": 5
           }
         ]
       }
@@ -85,6 +104,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "mcp__ccd_session_mgmt__send_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-notified",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -119,9 +148,29 @@
             "statusMessage": "Final output lint"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-stop",
+            "timeout": 15,
+            "statusMessage": "Chip handoff check"
+          }
+        ]
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "Bash|PowerShell",
         "hooks": [
@@ -152,13 +201,52 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/session_index.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/worktree_snapshot.py",
+            "timeout": 120,
+            "statusMessage": "Saving unfinished work before removal..."
+          }
+        ]
+      }
+    ],
+    "Setup": [
+      {
+        "matcher": "maintenance",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __CLAUDE_DIR__/tools/worktree-audit.mjs --fix",
+            "timeout": 300,
+            "statusMessage": "Sweeping stale worktrees..."
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {
-    "codex@openai-codex": true
+    "codex@openai-codex": true,
+    "code-simplifier@claude-plugins-official": false
   },
   "outputStyle": "dense",
   "effortLevel": "high",
   "autoMemoryEnabled": false,
-  "minimumVersion": "2.1.117"
+  "autoCompactWindow": "300k",
+  "skillListingMaxDescChars": 320,
+  "minimumVersion": "2.1.246"
 }

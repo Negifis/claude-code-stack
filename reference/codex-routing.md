@@ -36,7 +36,11 @@ lane.
   user is not asked to choose an execution mode. A review that has to satisfy the gate takes
   `--wait` plus the literal `CODE_WORK_GATE_REVIEW` in its arguments: a detached run returns only
   a launch acknowledgement, and the marker is what keeps a review that ran but could not be
-  attributed from vanishing instead of standing as an unresolved lane.
+  attributed from vanishing instead of standing as an unresolved lane. This plugin route loads
+  the full local package — MCP servers, plugins, hooks — so for a gate review prefer the lean
+  `codex exec` invocation in `/adversarial-review`, which turns off the MCP servers, plugins,
+  hooks, memories and the browser, image and app tools while keeping the shell and web search.
+  Skills and the global `AGENTS.md` still load either way — that command lists the residuals.
 - `--fresh` (new task) / `--resume` (continue prior task) — pass one for rescue when the
   correct choice is clear.
 - `--base <ref>` — base ref for branch review (e.g. `--base main`).
@@ -52,7 +56,8 @@ Typical invocations:
     /codex:rescue --resume --background <follow-up>
     /codex:review --background                       # ad hoc, not gate evidence
     /codex:review --base main --background           # ad hoc, not gate evidence
-    /codex:adversarial-review --wait CODE_WORK_GATE_REVIEW <specific risk focus>
+    /codex:adversarial-review --wait CODE_WORK_GATE_REVIEW <risk focus>  # heavy; gate reviews
+                                                                        # use the lean exec
 
 ## Codex model / effort routing
 

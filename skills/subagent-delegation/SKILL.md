@@ -7,37 +7,32 @@ description: Use Claude Code subagents for bounded independent exploration, impl
 
 Start with the primary agent. Delegate only when a bounded lane is independent enough to save
 time, isolate verbose context, supply distinct expertise, or provide proportionate independent
-judgment.
+judgment. A second reasoning context is the expensive resource; a parallel deterministic tool
+call is not.
 
 ## Good lanes
 
-- disjoint repository exploration with a named output;
+- disjoint repository exploration with a named output (`Explore`, or a project explorer);
 - a non-overlapping implementation scope with one file owner;
 - a focused specialist check;
 - one read-only adversarial review for high-risk work;
+- the single `simplify-reviewer` lane when `simplify` needs one;
 - independent QA whose evidence can be checked by the parent.
 
 Keep small, linear, tightly coupled, destructive, sensitive, and ordinary sequential work local.
-Do not form an independent-review panel, duplicate a scope, or delegate merely because agents
-are available. The named `simplify` skill may run its three specialized read-only lenses in
-parallel; together they count as one bounded simplify pass.
+Do not form a reviewer panel, duplicate a scope, or delegate merely because agents are
+available. One optional lane is enough; add another only for a named, non-overlapping result.
 
 ## Task packet
 
-Give each lane only current state:
-
-- goal and concrete output;
-- authoritative requirements and acceptance criteria;
-- relevant files/evidence;
-- explicit read/write scope and exclusions;
-- verification expected from the lane.
-
-Do not pass the entire conversation. The parent owns decomposition, requirements, integration,
-verification, and the final answer.
+Give each lane only current state: goal and concrete output; authoritative requirements and
+acceptance criteria; relevant files/evidence; explicit read/write scope and exclusions; the
+verification expected. Do not pass the conversation. The parent owns decomposition,
+requirements, integration, verification, and the final answer.
 
 ## Ownership and review
 
-- Keep one writer per file or tightly coupled scope.
+- One writer per file or tightly coupled scope.
 - Review lanes are strictly read-only, do not delegate further, and do not start a code-work
   gate for their inspection.
 - Check every returned claim against the diff, repository, command output, or runtime evidence.
@@ -47,17 +42,20 @@ verification, and the final answer.
 
 ## Model and effort
 
-Use the agent profile's model by default. Override only when the lane has a clear cost or depth
-requirement:
+The agent profile's model and effort are the default; the profiles in `~/.claude/agents` are
+routed by lane already (`Explore` and `simplify-reviewer` on Sonnet/medium,
+`adversarial-reviewer` on Fable/high). Override only for a clear reason:
 
-- a deterministic lookup or named command can use a small/fast tier;
-- routine code exploration or bounded implementation can use a general coding tier;
-- architecture, security, root cause, or adversarial review can use a stronger reasoning tier.
+- a deterministic lookup or a named command: `haiku`;
+- `general-purpose` and any built-in lane without a profile: pass `model: "sonnet"` unless
+  the task is a genuine root-cause, architecture or security judgment — otherwise it inherits
+  the main session's model and effort, which is the most expensive combination available;
+- architecture, security, root cause, adversarial review: a strong reasoning tier.
 
-Start from configured effort. Increase it only for representative failures or material risk.
-If an explicit model is unavailable, retry once with the closest supported tier or keep the work
-in the parent; do not walk an open-ended fallback ladder. Record which tier actually ran when it
-matters to the evidence.
+Prefer a bounded lane: state the expected size of the answer and stop conditions in the packet.
+If an explicit model is unavailable, retry once with the closest supported tier or keep the
+work in the parent; do not walk a fallback ladder. Record which tier ran when it matters to
+the evidence.
 
 ## Bounded wait
 

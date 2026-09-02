@@ -5,95 +5,62 @@ description: Simplify a non-trivial changed scope when a concrete readability, r
 
 # Simplify
 
-Perform a bounded behavior-preserving polish pass over the changed scope. The goal is clearer,
-more maintainable code that fits the repository—not fewer lines and not a mandatory ceremony.
+A bounded, behavior-preserving polish pass over the changed scope: clearer, more maintainable
+code that fits the repository. Not fewer lines for their own sake, and not a ceremony.
 
-## When to use it
+## When
 
-Use this skill when:
+- The diff is non-trivial and has a concrete clarity or maintenance concern, repeated logic,
+  an existing helper that would shrink it, or control flow, types, errors, resources or hot-path
+  work that got harder to reason about.
+- The user asks to simplify or refactor.
+- `development-verification` requires it: a HIGH persistent candidate needs one foreground
+  `simplify-reviewer` result. STANDARD and LOW work never require it.
 
-- the diff is non-trivial and has a concrete clarity or maintenance concern;
-- repeated logic or an existing helper may materially reduce the change;
-- control flow, types, errors, resource handling, or hot-path work became harder to reason about;
-- the user explicitly asks to simplify or refactor.
+Skip it for routine low-risk work, small obvious fixes, generated output and docs churn.
+Never run it on operational work: a scratchpad or one-shot script that already executed, or a
+command against a live system — nothing reads that code again. A script being promoted into a
+repository is no longer throwaway and enters the ordinary rules.
 
-Skip it for routine low-risk work, small obvious fixes, generated output, and static/docs churn
-unless a specific concern makes a pass useful.
+## One pass, one lane
 
-Never run it on operational work: a scratchpad or one-shot script that has already executed, or
-a command issued against a live system. Nothing will read that code again, so there is no
-maintenance to buy, and the outcome it produced is already fixed. If such a script is being
-promoted into a repository, it is no longer throwaway and the ordinary rules apply.
+The main agent owns the pass and the edits.
 
-## Scope and evidence
+- **Local pass** — for a small or narrowly bounded diff, the main agent reviews reuse,
+  readability, control flow, type/error clarity, resource handling and avoidable cost itself,
+  from the diff and nearby patterns. No subagent.
+- **One lane** — for a non-trivial scope, or whenever the gate requires simplify evidence,
+  launch exactly one `simplify-reviewer` agent with `run_in_background: false` set
+  explicitly. It carries the reuse, quality and efficiency lenses in one report; the result is
+  the gate's evidence. Give it the bounded changed scope (diff or commit range, files, nearby
+  helpers worth knowing about), the invariants that must hold, and ask for file:line findings
+  with behavior-preservation reasoning. Do not pass the conversation.
 
-- Start from the current diff and recently modified files.
-- Read applicable project instructions and nearby patterns.
-- Use structural graph tools only when callers, ownership, reuse, or impact are unknown.
-  Focused diff/search/file reads are enough for bounded work.
-- Preserve public APIs, data formats, side effects, error semantics, and timing-sensitive
-  behavior unless the user explicitly requested a behavior change.
-- Expand only to a nearby helper, type, or test needed to complete a local simplification.
+There is no three-lane wave. The August 2026 transcripts showed the three-lens trio costing
+three Sonnet contexts and about nine minutes per wave, plus forced single-lens re-runs, while
+the lenses' findings overlapped by 6% and were acted on in about half of the waves; one lane
+covering all three concerns keeps the coverage at a third of the cost.
 
-## One composite pass
-
-The main agent owns the pass. It evaluates reuse, readability, control flow, type/error clarity,
-resource handling, and avoidable cost together.
-
-For a non-trivial changed scope, launch the three existing read-only reviewer profiles in the
-same assistant turn and set `run_in_background: false` explicitly on every call. They execute as
-one foreground wave and their completed results are observable by the finite Stop gate even
-after Claude Code versions where omitted subagent mode defaults to background:
-
-1. `simplify-reuse-reviewer` — missed local helpers, duplicated logic, repeated state/config/
-   schema shapes, and abstraction fit;
-2. `simplify-quality-reviewer` — naming, readability, control flow, type/error clarity, tests,
-   comments, dead code, and local style;
-3. `simplify-efficiency-reviewer` — redundant I/O, queries, loops, parsing, allocation,
-   async/concurrency overhead, hot-path cost, and cleanup.
-
-Together these lanes are one composite simplify pass. Give all three the same bounded changed
-scope and require concrete file/line evidence plus behavior-preservation reasoning. Keep them
-read-only and use their configured model/effort defaults. The main agent reconciles the output
-and applies only accepted findings.
-
-For tiny or narrowly bounded work, run the same lenses locally only when simplification is
-optional. When `development-verification` requires observable simplify evidence — HIGH, or
-STANDARD touching at least three gated files, both counted over lasting artifacts only — launch
-the trio even for a narrow candidate.
-
-Useful moves include:
-
-- reduce unnecessary nesting and redundant state;
-- reuse an established local helper;
-- remove an abstraction or wrapper that adds only indirection;
-- consolidate genuinely duplicated logic without widening ownership;
-- improve misleading names;
-- make error and resource lifecycles explicit;
-- remove avoidable repeated parsing, I/O, allocation, queries, or no-op updates.
+Useful moves: reduce needless nesting and redundant state; reuse an established local helper;
+remove a wrapper that only adds indirection; consolidate genuinely duplicated logic without
+widening ownership; fix misleading names; make error and resource lifecycles explicit; remove
+repeated parsing, I/O, allocation, queries or no-op updates.
 
 Reject aesthetic churn, speculative abstraction, dependency additions, semantic changes, test
-weakening, and suggestions whose equivalence cannot be established.
+weakening, and any suggestion whose equivalence cannot be established.
 
 ## Finite workflow
 
-1. Run one composite pass over the changed scope; for non-trivial work this is the parallel
-   three-lens pass above.
-2. Apply only concrete behavior-preserving improvements.
-3. Rerun affected checks after actual edits.
-4. For broad or high-risk work, one confirmation pass is allowed after accepted edits. Reuse
-   only the lanes whose concerns the edits touched; do not relaunch the full trio by default.
-5. Stop after a clean pass or after two runs of any one lens. A new finding is recorded for the
-   owning gate; it never opens a third pass.
-6. Lenses that already returned for this candidate are the completed pass, whether or not this
-   skill was invoked before them. Never re-run them to make the record look tidier.
+1. One pass over the changed scope: local, or the single lane.
+2. Apply only concrete behavior-preserving improvements; rerun affected checks after edits.
+3. For broad or high-risk work, one confirmation pass is allowed after accepted edits — reuse
+   the same lane with only the delta. Maximum two runs of the lane per candidate, no exception.
+4. Stop after a clean pass or after the second run. A new finding is recorded for the owning
+   gate; it never opens a third pass.
+5. A lane result that already exists for this candidate is the completed pass, whether or not
+   this skill was invoked before it. Never re-run it to make the record look tidier, and never
+   run it after review approval as a ritual.
 
-Do not convert this required wave to background tasks. If a foreground lens fails, retry that
-same lane once. If the pass was optional, report a second failure and continue with the
-candidate-bound gate; if the pass was required, record `SIMPLIFY_UNAVAILABLE` and finish
-`DRAFT_BLOCKED`. Never open a replacement lane or another wait loop.
-
-Do not run simplify after review approval as a ritual. If review remediation introduces a
-specific complexity concern before the second invocation has been used, the parent may spend
-that one remaining affected-lens confirmation. Once the absolute two-invocation cap is spent,
-record the concern in the finite review/closure ledger and do not invoke simplify again.
+If the foreground lane fails, retry it once. If the pass was optional, report the failure and
+continue; if it was required, record `SIMPLIFY_UNAVAILABLE` and finish `DRAFT_BLOCKED`. Never
+open a replacement lane, a background copy, or another wait loop.

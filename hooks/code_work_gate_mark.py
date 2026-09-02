@@ -63,6 +63,42 @@ VALIDATION_SHELL_RE = re.compile(
     r")[^;&|><`\r\n]*$"
 )
 
+# The gate grades executable agent configuration HIGH, and on this machine that configuration
+# lives outside any repository — exactly what a Git snapshot cannot see. A shell command that
+# rewrote a hook therefore left the candidate marked <shell-mutation>, and a session whose whole
+# product was a new hook graded as operational work needing neither simplify nor review. These
+# trees are small and hand-edited, which is what makes snapshotting them affordable on every
+# shell call. `plugins/` is deliberately excluded: it is machine-managed, an order of magnitude
+# larger, and rewritten by the autoupdate hook, so watching it would mark sessions that touched
+# nothing.
+# Deliberately not the same set as the directories `AGENT_EXECUTABLE_PATH_RE` grades HIGH:
+# `rules` and `reference` are watched but graded as prose. A gated tree left unwatched is not
+# merely unseen: `outside_snapshot` then finds a recorded path no snapshot can vouch for, which
+# expires the review verdict on every later shell call and leaves the candidate unable to close.
+# `plugins` stays out because it is machine-managed and an order of magnitude larger.
+AGENT_CONFIG_DIRS = (
+    "hooks", "agents", "commands", "skills", "output-styles", "rules", "reference",
+)
+AGENT_CONFIG_FILES = (
+    "settings.json", "settings.local.json", ".mcp.json", "claude.md", "agents.md",
+)
+# These trees are shared: a second session, an editor, or a background hook writing here while
+# a command runs is attributed to that command, the same way a dirty worktree is attributed to
+# the command that ran over it. The cost is a review round, never a missed one.
+# Bookkeeping and vendored trees a configuration directory may still contain. Dot-directories
+# are skipped wholesale for the same reason `plugins/` is: every one of them here is machine
+# managed — a vendor namespace the CLI re-syncs (`.codex/skills/.system`), a virtualenv, a cache,
+# a repository. Their churn arrives on whatever command happens to be running, which marked
+# sessions that touched nothing. An edit made through Edit/Write is still gated by path.
+AGENT_CONFIG_SKIP = {"__pycache__", "node_modules", "backups", "state", "plans"}
+# Across all the homes together: a configuration this large is not the hand-edited tree this
+# scan assumes, and proving nothing is safer than spending a Stop budget walking it.
+AGENT_CONFIG_LIMIT = 8192
+# Agent tooling copies its skill trees into every worktree, so one sync rewrites them on every
+# branch at once and lands on whichever command was running. Inside a repository they are that
+# copy, not the session's work; the sources they are copied from are watched in the homes above.
+# Attribution only, like the skip list: an edit made through Edit/Write is still gated by path.
+SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNORECASE)
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
 SHELL_UNKNOWN = "UNKNOWN_OR_MUTATING"
@@ -184,6 +220,221 @@ def git_snapshot(cwd):
     return {"root": root, "overflow": False, "files": files}
 
 
+def agent_config_roots():
+    """The agent-configuration homes, honouring the environment overrides the tools read."""
+    home = os.path.expanduser("~")
+    return (
+        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"),
+        os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"),
+        os.path.join(home, ".agents"),
+    )
+
+
+def file_metadata(stat):
+    """What the configuration snapshot stores per file: enough to see that it was written."""
+    return "{}:{}".format(stat.st_size, stat.st_mtime_ns)
+
+
+def scan_config_tree(directory, files):
+    """Record every gated file under one configuration directory.
+
+    False means the tree could not be read, and the snapshot must then prove nothing rather
+    than report it clean: an absent directory is ordinary — most homes have only some of these
+    — but one that exists and cannot be listed would otherwise read as "nothing changed here",
+    which is the one answer that must never be guessed. The Git snapshot fails the same way.
+    """
+    stack = [directory]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except (FileNotFoundError, NotADirectoryError):
+            # Absent, or a plain file standing where a tree would be: either way it holds no
+            # gated file. Refusing every command until someone finds it would be worse.
+            continue
+        except OSError:
+            return False
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    # Dot-prefixed and named-vendor trees alike: see AGENT_CONFIG_SKIP.
+                    if not (entry.name.startswith(".")
+                            or entry.name.lower() in AGENT_CONFIG_SKIP):
+                        stack.append(entry.path)
+                    continue
+                normalized = cwg.normalize_path(entry.path)
+                if not cwg.is_gated(normalized):
+                    continue
+                # On Windows the directory listing already carries size and timestamps, so this
+                # costs no further syscall — which is what keeps the scan affordable per call.
+                stat = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # Written and removed inside the command: the other snapshot will not hold it
+                # either, so the pair still agrees.
+                continue
+            except OSError:
+                return False
+            files[normalized] = file_metadata(stat)
+            if len(files) > AGENT_CONFIG_LIMIT:
+                return False
+    return True
+
+
+def config_snapshot():
+    """Size and mtime of the agent-configuration files a shell command could rewrite.
+
+    Metadata rather than content, unlike the Git snapshot: that one hashes the handful of files
+    Git already reports as changed, while this one looks at every file in the trees on every
+    shell call. The question here is only whether this command wrote here, which is what size
+    and mtime answer.
+    """
+    files = {}
+    roots = []
+    for root in agent_config_roots():
+        if not os.path.isdir(root):
+            continue
+        for name in AGENT_CONFIG_DIRS:
+            tree = os.path.join(root, name)
+            if not scan_config_tree(tree, files):
+                return {"overflow": True, "roots": [], "files": {}}
+            # Each watched tree vouches for itself. Claiming the home instead would vouch for
+            # `plugins/` and every other pocket this scan never opens, and an empty delta would
+            # then read as proof that a hook nobody looked at is unchanged.
+            roots.append(cwg.normalize_path(tree))
+        for name in AGENT_CONFIG_FILES:
+            path = os.path.join(root, name)
+            # Watched whether or not it exists right now: creating or deleting a settings file
+            # is the event to catch, and letting its existence decide what the snapshot covers
+            # would make exactly that write incomparable instead of naming it.
+            roots.append(cwg.normalize_path(path))
+            try:
+                stat = os.stat(path, follow_symlinks=False)
+            except OSError:
+                continue
+            files[cwg.normalize_path(path)] = file_metadata(stat)
+    return {"overflow": False, "roots": roots, "files": files}
+
+
+def shell_snapshot(cwd):
+    """Everything a shell command could change that the marker is able to name."""
+    return {"git": git_snapshot(cwd), "config": config_snapshot()}
+
+
+def vouching_tree(path, roots):
+    """The snapshotted tree a changed path belongs to, with the skip list that vouched for it.
+
+    The skip list travels with the tree because it differs by kind: a repository passes none —
+    Git reports every file beneath its root whatever the directory is called — while a
+    configuration home walks around its bookkeeping and vendored pockets. Asking the same
+    question of a repository with the configuration skip list would read a subdirectory named
+    `state`, `plans` or `node_modules` as outside the tree it plainly sits in.
+    """
+    for root, skip in roots:
+        if covers(root, path, skip):
+            return root, skip
+    return None, ()
+
+
+def own_delta(session, cwd, candidates, window_start, write_shaped, roots):
+    """Split a snapshot delta into what this command answers for and what nobody can name.
+
+    A before/after diff of the working repository and the configuration homes sees every write
+    those trees received while the command ran, not only this command's. Another session editing
+    the same checkout therefore landed in this candidate, and a session that changed nothing of
+    its own could be left holding paths it must then review, simplify and close on — which no
+    receipt it can honestly write covers.
+
+    A write-shaped command keeps its whole delta. Its own text says it wrote something, which is
+    direct evidence about this session; another session announcing the same path only says that
+    session wrote it too. Subtracting on the weaker evidence would let a real in-place edit of a
+    sensitive file leave no candidate at all, and losing a durable write out of the gate is worse
+    than one extra review round.
+
+    For every other command, two subtractions, in order of how much they prove. A path another
+    session announced inside this window is that session's, recorded in its own marker. What is
+    left over is charged here unless another session had a shell command in flight *in the same
+    tree*: then the change is real, nobody can attribute it, and the only thing tying it to this
+    command is that this session happened to look at that tree at that moment. Shared ground is
+    the whole test: a command running in an unrelated repository proves nothing about this one,
+    and treating every concurrent command anywhere on the machine as a competing writer would
+    drop attribution far more often than it would correct it.
+
+    The subtractions differ in what the caller owes afterwards, which is why they are reported
+    separately. A settled claim is positively someone else's, recorded in that session's marker,
+    and carries no obligation here. Everything else dropped - a write another session announced
+    but has not confirmed, or a command it had in flight in this tree - is owned by nobody the
+    registry can name: it may well be this command's, so the caller keeps a conservative floor
+    for it even though it must not record another session's file. Ambiguity narrows what a
+    session is asked about; it must never reduce what a session owes.
+
+    An unconfirmed announcement is deliberately on the ambiguous side. Treating it as ownership
+    would mean an edit that was declared and then denied could silently absolve another session
+    of a durable write it really made, for as long as the announcement stood.
+
+    A registry too large to read in one scan puts everything left over on the ambiguous side for
+    the same reason: what was not read cannot be evidence that nobody else owns it.
+    """
+    if write_shaped:
+        return list(candidates), []
+    claimed, announced, busy_dirs, overflow = cwg.foreign_activity(session, window_start)
+    mine = []
+    ambiguous = []
+    for path in candidates:
+        normalized = cwg.absolute_path(path, cwd)
+        if normalized in claimed:
+            continue
+        if normalized in announced:
+            ambiguous.append(normalized)
+            continue
+        tree, skip = vouching_tree(normalized, roots)
+        if tree and any(covers(tree, busy, skip) for busy in busy_dirs):
+            ambiguous.append(normalized)
+            continue
+        if overflow:
+            # More sessions than one scan may read. A path missing from what was read is not
+            # thereby this command's: unread is not silent, so it goes where everything else
+            # nobody can be shown to own goes.
+            ambiguous.append(normalized)
+            continue
+        # The normalized form, not the raw one: what this command is judged to have written and
+        # what it then announces must be the same string, or the two disagree on one path.
+        mine.append(normalized)
+    return mine, ambiguous
+
+
+def stored_snapshot(data):
+    """One stored pre-command snapshot, including the Git-only shape written before the
+    configuration homes were watched: a session upgraded mid-flight must not read as a command
+    whose effect could not be resolved."""
+    # A Git snapshot always names its root at the top level; the current shape never does.
+    if isinstance(data, dict) and "root" in data:
+        return {"git": data, "config": None}
+    return data if isinstance(data, dict) else {}
+
+
+def changed_config_paths(before, after):
+    """Absolute configuration paths this command rewrote, or None when nothing is provable."""
+    if (
+        not before
+        or not after
+        or before.get("overflow")
+        or after.get("overflow")
+        or before.get("roots") != after.get("roots")
+    ):
+        return None
+    return rewritten(before, after)
+
+
+def rewritten(before, after):
+    """Keys whose recorded state differs between two snapshots of the same tree."""
+    before_files = before.get("files") or {}
+    after_files = after.get("files") or {}
+    return [
+        path
+        for path in set(before_files) | set(after_files)
+        if before_files.get(path) != after_files.get(path)
+    ]
+
+
 def changed_snapshot_paths(before, after):
     if (
         not before
@@ -193,18 +444,12 @@ def changed_snapshot_paths(before, after):
         or after.get("overflow")
     ):
         return None
-    before_files = before.get("files") or {}
-    after_files = after.get("files") or {}
-    changed = [
-        path
-        for path in set(before_files) | set(after_files)
-        if before_files.get(path) != after_files.get(path)
-    ]
+    changed = rewritten(before, after)
     root = after["root"]
     return [
         os.path.join(root, *path.split("/"))
         for path in changed
-        if cwg.is_gated(path)
+        if cwg.is_gated(path) and not SYNCED_AGENT_TREE_RE.search("/" + path)
     ]
 
 
@@ -304,6 +549,7 @@ def cycle_start(marker, now, identity, incoming):
         "path_overflow": False,
         "identity": identity,
         "last_durable_ts": 0.0,
+        "unattributed_durable": False,
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -326,6 +572,7 @@ def cycle_start(marker, now, identity, incoming):
             "path_overflow": bool(existing.get("path_overflow")),
             "identity": stored if mismatch else (identity or stored),
             "last_durable_ts": float(carried) if cwg.valid_ts(carried) else 0.0,
+            "unattributed_durable": bool(existing.get("unattributed_durable")),
         }
     if os.path.exists(marker):
         try:
@@ -335,26 +582,58 @@ def cycle_start(marker, now, identity, incoming):
     return fresh
 
 
-def outside_snapshot(paths, root):
-    """Durable recorded paths a snapshot of `root` says nothing about."""
-    covered = cwg.normalize_path(root)
-    if not covered:
-        return list(cwg.durable_paths(paths))
+def covers(root, path, skipped=()):
+    """Whether a snapshot of `root` looked at `path`.
+
+    `skipped` names the subdirectories that snapshot walks around, together with the dot-prefixed
+    ones it always does; anything below either was never read, so nothing about it was proved. A
+    repository passes no skip list: Git reports on every tracked and untracked file beneath its
+    root whatever the directory is called, and `plans` or `state` there is ordinary source, not
+    the bookkeeping those names mean in a configuration home.
+    """
+    if path == root:
+        return True
+    if not root or not path.startswith(root + "/"):
+        return False
+    parts = path[len(root) + 1:].split("/")
+    if skipped and any(part.startswith(".") for part in parts[:-1]):
+        return False
+    return not any(part in skipped for part in parts)
+
+
+def outside_snapshot(paths, roots, watched=()):
+    """Durable recorded paths no snapshot taken for this command says anything about.
+
+    `roots` are repositories and `watched` the configuration trees — the same question, asked of
+    two snapshots that see their own trees differently.
+    """
+    repositories = [cwg.normalize_path(root) for root in roots or () if root]
+    trees = [cwg.normalize_path(root) for root in watched or () if root]
     return [
         path
         for path in cwg.durable_paths(paths)
-        if path != covered and not path.startswith(covered + "/")
+        if not any(covers(root, path) for root in repositories)
+        and not any(covers(root, path, AGENT_CONFIG_SKIP) for root in trees)
     ]
 
 
-def record_paths(data, candidate_paths, unresolved=False, snapshot_root=None):
+def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
+                 watched_roots=(), unattributed_risk=None):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
+    `unattributed_risk` is the grade of a lasting change seen during this command that no
+    session can be shown to own. Its path stays out of the marker - it may be another session's
+    file, and recording it would put that session's work into this candidate - but the grade
+    does not, because it may equally be this command's own write, and letting ambiguity close
+    the cycle under the operational contract would be a way out of the gate rather than a
+    narrower question. Sticky for the cycle: a later resolvable command does not make an earlier
+    unattributable one go away.
+
     `unresolved` means a mutation was observed but the snapshot could not name what it touched,
-    so it may have been a source edit made through the shell. `snapshot_root` bounds what an
-    empty delta actually proves: it vouches for its own repository and for nothing else, and
-    this machine keeps its highest-risk artifacts — the agent configuration itself — outside
-    any repository.
+    so it may have been a source edit made through the shell. `snapshot_roots` bounds what an
+    empty delta actually proves: each snapshot vouches for its own tree and for nothing else —
+    the working repository, and the agent-configuration homes this machine keeps outside any
+    repository.
     """
     marker = cwg.marker_path(cwg.session_key(data.get("session_id")))
     now = time.time()
@@ -369,7 +648,10 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_root=None):
         if normalized not in paths:
             paths.append(normalized)
     observed_risk = cwg.minimum_risk(paths)
-    minimum_risk_seen = cwg.max_risk(cycle["minimum_risk_seen"], observed_risk)
+    minimum_risk_seen = cwg.max_risk(
+        cycle["minimum_risk_seen"], observed_risk, unattributed_risk
+    )
+    unattributed_durable = cycle["unattributed_durable"] or bool(unattributed_risk)
     overflow = cycle["path_overflow"] or len(paths) > 128
     # Freshness of a review verdict is measured against the last change to a lasting artifact,
     # not against any mark at all. Rewriting a throwaway script or re-running a maintenance
@@ -377,10 +659,16 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_root=None):
     # edit forced a fresh review round for work the verdict already covered. An unresolved
     # mutation is the exception: it could have edited source through the shell, so once the
     # cycle holds durable paths it must expire the verdict the same way a named edit would.
-    expired = unresolved or outside_snapshot(paths, snapshot_root)
+    expired = unresolved or outside_snapshot(paths, snapshot_roots, watched_roots)
+    # An unattributable durable change anchors freshness too, even though its path is not
+    # recorded: without an anchor such a candidate keeps last_durable_ts at zero, the Stop hook
+    # falls back to the whole-cycle timestamp, and every later command then expires the very
+    # approval the floor made it go and get.
     last_durable_ts = (
         now
-        if cwg.durable_paths(incoming) or (expired and cwg.durable_paths(paths))
+        if cwg.durable_paths(incoming)
+        or unattributed_risk
+        or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
     return cwg.write_json(marker, {
@@ -393,11 +681,64 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_root=None):
         "minimum_risk_seen": minimum_risk_seen,
         "path_overflow": overflow,
         "identity": cycle["identity"],
+        "unattributed_durable": unattributed_durable,
     })
+
+
+def candidate_note(before, after):
+    """One line for the model when the candidate it is editing opened, or its floor rose.
+
+    The Stop hook can only teach after the model has tried to finish, at the price of one more
+    full-context turn: 114 of the 391 blocks recorded in August 2026 were a missing receipt on
+    a candidate the session had opened long before. This states the contract at the moment it
+    starts to apply and again only when it tightens; every other edit stays silent.
+    """
+    old = cwg.candidate_shape(before)
+    new = cwg.candidate_shape(after)
+    if new is None:
+        return None
+    if old is not None and old["first_ts"] == new["first_ts"] and (
+        old["persistent"], old["floor"]
+    ) == (new["persistent"], new["floor"]):
+        return None
+    if not new["persistent"]:
+        return (
+            "[gate] Candidate opened: OPERATIONAL (a shell mutation, no lasting artifact yet). "
+            "Close it with `[gate] operational: <pre-execution check>; <verified effect>` or "
+            "`[gate] no-change: <reason>` as the last line of the final message."
+        )
+    opened = old is None or old["first_ts"] != new["first_ts"] or not old["persistent"]
+    files = new["files"]
+    return (
+        "[gate] Candidate {}: PERSISTENT, path floor {} ({} lasting file{}). Requires {}. Close "
+        "it with `[gate] verified: {}; <candidate and decisive checks>` as the last line "
+        "(pr-ready/draft-blocked only after autonomous closure)."
+    ).format(
+        "opened" if opened else "floor raised",
+        new["floor"], files, "" if files == 1 else "s",
+        cwg.receipt_requirements(new["floor"]), new["floor"],
+    )
+
+
+def tool_output_text(data):
+    """The finished tool's output as text, one stream per line, whatever shape the harness
+    delivered it in — the breaker matches the CLI's error lines at line start."""
+    response = data.get("tool_response")
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        return "\n".join(str(value) for value in response.values() if isinstance(value, str))
+    try:
+        return json.dumps(response, ensure_ascii=False)
+    except Exception:
+        return str(response)
 
 
 def main():
     data = cwg.read_payload() or {}
+    output = {"continue": True}
     try:
         path = cwg.edited_path(data.get("tool_input"))
         tool = str(data.get("tool_name") or "")
@@ -405,44 +746,150 @@ def main():
         is_shell = tool in cwg.SHELL_TOOLS
         policy = shell_policy(data) if is_shell else None
 
-        if is_shell and event == "PreToolUse":
-            if policy != SHELL_READ_ONLY:
-                snapshot = git_snapshot(str(data.get("cwd") or os.getcwd()))
-                if snapshot is not None:
-                    cwg.write_json(shell_snapshot_path(data), snapshot)
+        session = cwg.session_key(data.get("session_id"))
+        cwd = str(data.get("cwd") or os.getcwd())
+        marker_before = (
+            cwg.read_json(cwg.marker_path(session)) if event == "PostToolUse" else None
+        )
+
+        if event == "PreToolUse":
+            if is_shell:
+                if policy != SHELL_READ_ONLY:
+                    started = time.time()
+                    # The window is published before the command runs, so a session resolving a
+                    # diff that overlaps it can see that someone else was writing.
+                    cwg.publish_claims(
+                        session, shell_start_ts=started, cwd=cwd, now=started
+                    )
+                    cwg.write_json(
+                        shell_snapshot_path(data),
+                        dict(
+                            shell_snapshot(cwd),
+                            ts=started,
+                        ),
+                    )
+            elif cwg.is_gated(path):
+                # Announced before the write lands, not after it: a claim published only once
+                # the edit is done can arrive after a concurrent command has already resolved
+                # its diff, which is the race this whole registry exists to close. Pending until
+                # the edit actually completes - an announcement is not yet a write, and must not
+                # excuse another session from one.
+                cwg.publish_claims(session, paths=[path], pending=True, cwd=cwd)
             print(json.dumps({"continue": True}))
             return
 
         shell_paths = None
-        snapshot_root = None
-        if is_shell and policy != SHELL_READ_ONLY:
+        observed = False
+        floor = None
+        snapshot_roots = []
+        watched_roots = []
+        # Whether anything watched the directory the command ran in. A command writes there by
+        # default, so an empty delta from a snapshot of some other tree says nothing about it.
+        home_ground = False
+        resolving = is_shell and policy != SHELL_READ_ONLY
+        shell_started = None
+        if resolving:
             snapshot_file = shell_snapshot_path(data)
-            before = cwg.read_json(snapshot_file)
+            before = stored_snapshot(cwg.read_json(snapshot_file))
+            shell_started = before.get("ts")
             cwg.remove(snapshot_file)
-            after = git_snapshot(str(data.get("cwd") or os.getcwd()))
-            shell_paths = changed_snapshot_paths(before, after)
-            if shell_paths is not None:
-                snapshot_root = (after or {}).get("root")
-
-        if cwg.is_gated(path):
-            record_paths(data, [path or cwg.SHELL_MUTATION_PATH])
-        elif is_shell and policy != SHELL_READ_ONLY:
-            if shell_paths:
-                record_paths(data, shell_paths, snapshot_root=snapshot_root)
-            elif shell_paths is None or policy == SHELL_UNKNOWN:
-                # An empty Git delta is not proof of no write: ignored files and paths outside
-                # the repository are invisible to the snapshot. Unknown or mutating commands
-                # therefore open a conservative operational candidate, and a snapshot that could
-                # not be built proves nothing even for an allowlisted validation command.
-                record_paths(
-                    data,
-                    [cwg.SHELL_MUTATION_PATH],
-                    unresolved=shell_paths is None,
-                    snapshot_root=snapshot_root,
+            after = shell_snapshot(cwd)
+            repo_paths = changed_snapshot_paths(before.get("git"), after["git"])
+            config_paths = changed_config_paths(before.get("config"), after["config"])
+            # Each source answers for its own tree, so one of them proving nothing narrows what
+            # the command is known not to have touched instead of discarding the other's answer.
+            if repo_paths is not None:
+                shell_paths = list(repo_paths)
+                snapshot_roots.append((after["git"] or {}).get("root"))
+                home_ground = True
+            if config_paths is not None:
+                shell_paths = (shell_paths or []) + config_paths
+                config_roots = after["config"].get("roots") or []
+                watched_roots.extend(config_roots)
+                home_ground = home_ground or any(
+                    covers(root, cwg.normalize_path(cwd), AGENT_CONFIG_SKIP)
+                    for root in config_roots
                 )
+            if shell_paths:
+                observed = True
+                shell_paths, ambiguous = own_delta(
+                    session,
+                    cwd,
+                    shell_paths,
+                    before.get("ts"),
+                    shell_write(data),
+                    [(cwg.normalize_path(root), ()) for root in snapshot_roots if root]
+                    + [(root, AGENT_CONFIG_SKIP) for root in watched_roots],
+                )
+                unattributed = cwg.durable_paths(ambiguous)
+                floor = cwg.minimum_risk(unattributed) if unattributed else None
+
+        try:
+            if cwg.is_gated(path):
+                cwg.publish_claims(session, paths=[path], cwd=cwd)
+                record_paths(data, [path or cwg.SHELL_MUTATION_PATH])
+            elif resolving:
+                if shell_paths:
+                    cwg.publish_claims(session, paths=shell_paths, cwd=cwd)
+                    record_paths(data, shell_paths, snapshot_roots=snapshot_roots,
+                                 watched_roots=watched_roots, unattributed_risk=floor)
+                elif observed or not home_ground or policy == SHELL_UNKNOWN:
+                    # An empty delta is not proof of no write: ignored files, and paths
+                    # outside both the repository and the configuration homes, are invisible
+                    # to either snapshot. Unknown or mutating commands therefore open a
+                    # conservative operational candidate, and `None` — neither snapshot could
+                    # be compared, as opposed to an empty list from one that could — proves
+                    # nothing even for a validation command.
+                    # `observed` carries a third case: the tree really did change and
+                    # attribution gave every path away. That must still leave a candidate this
+                    # session can be asked about rather than nothing at all.
+                    record_paths(
+                        data,
+                        [cwg.SHELL_MUTATION_PATH],
+                        unresolved=not home_ground,
+                        snapshot_roots=snapshot_roots,
+                        watched_roots=watched_roots,
+                        unattributed_risk=floor,
+                    )
+        finally:
+            # Closed on every path out of this block, and deliberately not before it: closing
+            # it ahead of the after-snapshot left an interval as wide as a full Git snapshot
+            # in which this command had neither an open window nor its resolved claims, and a
+            # session resolving inside that interval would take its writes for its own. An
+            # exception during the resolution above this block leaves the window open instead,
+            # which SHELL_WINDOW_LIMIT absorbs the same way it absorbs a killed command.
+            if resolving:
+                cwg.publish_claims(session, shell_start_ts=0)
+
+        if event == "PostToolUse":
+            if is_shell:
+                # A Codex launch that the CLI itself refused (usage limit, model at capacity)
+                # is recorded once, so the next candidate skips the lane instead of paying for
+                # the same refusal again. Reading the command text here is attribution of an
+                # outage, never proof that a review ran: that stays with the Stop hook.
+                try:
+                    # Imported here, not at the top: the breaker is optional, and a marker
+                    # that cannot import it must still mark.
+                    import codex_lane
+                    codex_lane.record_from_command(
+                        str((data.get("tool_input") or {}).get("command") or ""),
+                        tool_output_text(data),
+                        started=shell_started,
+                    )
+                except Exception:
+                    pass
+            # `marker_before`, not `before`: the shell branch above reuses `before` for its
+            # snapshot, and comparing a snapshot to the marker announced the candidate on every
+            # shell call.
+            note = candidate_note(marker_before, cwg.read_json(cwg.marker_path(session)))
+            if note:
+                output["hookSpecificOutput"] = {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": note,
+                }
     except Exception:
         pass
-    print(json.dumps({"continue": True}))
+    print(json.dumps(output, ensure_ascii=False))
 
 
 if __name__ == "__main__":
