@@ -18,6 +18,7 @@ cycle is retired as unverified, preventing an infinite Stop loop.
 import datetime
 import fnmatch
 import hashlib
+import glob
 import json
 import math
 import os
@@ -477,25 +478,33 @@ PACKET_MIN_CHARS = 200
 
 
 def packet_of_launch(command, call_id):
-    """(fed_on_stdin, packet_text) for a Codex launch, from what the marker hook captured.
+    """(fed_on_stdin, distinctive_packet_text) for a Codex launch, from the marker hook's capture.
 
     The packet is what the session was given, and Codex logs it verbatim, so it names the one
     session among several that this launch started. It is read from the capture the marker hook
     took before the command ran — not from the file, which the model may have rewritten since.
-    A launch that fed a packet but left no usable capture binds nothing.
+    What names the session is the packet beyond the role every review is given, and it has to
+    be long enough to be distinctive. A launch that fed something it cannot be bound by — no
+    usable capture, an unrecognizable launch, a packet that is all role — binds nothing.
     """
     try:
         import code_work_gate_mark as mark
-        fed = bool(mark.codex_packet_path(command))
+        launch = mark.codex_launch(command)
     except Exception:
-        fed = "<" in str(command or "")
-    if not fed:
+        launch = {"fed": "<" in str(command or ""), "path": ""}
+    if not launch["fed"]:
         return False, ""
+    if not launch["path"]:
+        return True, ""
     capture = cwg.read_json(cwg.packet_capture_path(_SESSION["key"], str(call_id or "")))
     text = capture.get("text") if isinstance(capture, dict) else ""
-    if not isinstance(text, str) or len(text) < PACKET_MIN_CHARS or capture.get("truncated"):
+    if not isinstance(text, str) or capture.get("truncated"):
         return True, ""
-    return True, text
+    role = reviewer_role()
+    distinctive = " ".join((text.replace(role, " ") if role else text).split())
+    if len(distinctive) < PACKET_MIN_CHARS:
+        return True, ""
+    return True, distinctive
 
 
 def session_given(path, mtime_ns, size, started, finished, packet):
@@ -525,10 +534,10 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
         # The usual cause: the packet was written by the same shell command that launched
         # Codex, so nothing existed when the marker hook looked before the command ran.
         review_note(at=finished, engine="codex-background", verdict=None,
-                    reason="packet fed on stdin but no usable capture at launch; write the "
+                    reason="packet fed on stdin but nothing to bind by at launch; write the "
                            "packet in its own call before launching")
         return None
-    verdicts = {}
+    verdicts, given = {}, []
     for path, _ in codex_run_files(since):
         try:
             stat = os.stat(path)
@@ -544,15 +553,16 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
             control = reviewer_control(spoken)
             if control[0] in ("ordinary", "closure"):
                 # The session's last stated verdict inside the window is its answer.
-                verdicts[path] = (control, stat)
+                verdicts[path] = control
+        if packet and session_given(path, stat.st_mtime_ns, stat.st_size, started, finished, packet):
+            given.append(path)
     if packet:
-        verdicts = {
-            path: value for path, value in verdicts.items()
-            if session_given(path, value[1].st_mtime_ns, value[1].st_size, started, finished, packet)
-        }
+        # Exactly one session may have been given this packet, whether or not it answered:
+        # two chats reviewing with the same words are told apart by nothing, and bind nothing.
+        return verdicts.get(given[0]) if len(given) == 1 else None
     if len(verdicts) != 1:
         return None
-    return next(iter(verdicts.values()))[0]
+    return next(iter(verdicts.values()))
 
 
 def record_control(evidence, stamp, control, malformed=False):
@@ -1466,8 +1476,12 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
         return False
 
     # The attribution registry outlives no candidate: what this session announced is only ever
-    # read by a command running at the same time, and the cycle it belonged to is over.
+    # read by a command running at the same time, and the cycle it belonged to is over. The
+    # packet captures go with it: every Stop re-reads the transcript, so a capture has to
+    # outlive the notification it binds, but not the candidate.
     cwg.retire_claims(session_key_)
+    for capture in glob.glob(cwg.packet_capture_path(session_key_, "*")):
+        cwg.remove(capture)
 
     current = cwg.read_json(marker)
     if current is None or current.get("last_ts") == candidate_ts:

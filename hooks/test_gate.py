@@ -1,6 +1,7 @@
 """Regression tests for the strict finite Code Work Gate."""
 import atexit
 import datetime
+import glob
 import io
 import json
 import os
@@ -1119,6 +1120,48 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- how a launch is read: any spelling of codex, one exec segment, no conditional execution
+for command, fed, tail in (
+    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err  # CODE_WORK_GATE_REVIEW", True, "C:/tmp/p.md"),
+    ('PYTHONIOENCODING=utf-8 "C:/tools/Codex.exe" exec - < "C:/tmp/q.md"', True, "C:/tmp/q.md"),
+    ("CODEX EXEC - < p.md", True, "p.md"),
+    ("true || codex exec - < p.md", True, ""),
+    ("helper < other.md && codex exec - < target.md", True, "target.md"),
+    ("codex exec - < a.md; codex exec - < b.md", True, ""),
+    ("codex exec - <<'PY'", False, ""),
+    ("codex exec -", False, ""),
+    ("cat < notes.md | grep x", True, ""),
+):
+    launch = marker_hook.codex_launch(command)
+    check("codex_launch reads {!r}".format(command[:48]),
+          launch["fed"] is fed and launch["path"].replace(chr(92), "/").endswith(tail) and (bool(launch["path"]) == bool(tail)), launch)
+
+# --- the fingerprint: records that cannot imitate one another, existence by presence, the index included
+with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
+    a = os.path.join(tree, "src", "a.py")
+    b = os.path.join(tree, "src", "b.py")
+    os.makedirs(os.path.dirname(a))
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    only_a = marker_hook.content_fingerprint([a, b])
+    with open(b, "wb") as stream:
+        stream.write(b"<missing>")
+    check("a file holding the old sentinel bytes is not a missing file",
+          marker_hook.content_fingerprint([a, b]) != only_a, only_a)
+    os.remove(b)
+    check("an add that was deleted again is no change", marker_hook.content_fingerprint([a, b]) == only_a
+          and marker_hook.content_fingerprint([a]) == only_a, only_a)
+    subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    staged_a = marker_hook.content_fingerprint([a])
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('changed')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    check("the index is part of the record: the same bytes on disk with a different staged blob differ",
+          marker_hook.content_fingerprint([a]) != staged_a, staged_a)
+
 # --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
 def marker_with_marks(sid, marks):
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=marks[-1][0], durable_ts=marks[-1][0])
@@ -1217,13 +1260,21 @@ def capture_launch(sid, call_id, command):
                     "tool_use_id": call_id, "cwd": AGENT_HOME, "tool_input": {"command": command}})
 
 
-for label, packet_on_disk, rewrite_after, expect_bound in (
+PACKET_A = "Round 1 packet for the auth candidate: " + "the session store rotates ids on privilege change and the tests pin it. " * 4
+PACKET_B = "Round 1 packet for another chat's candidate: " + "the deploy preamble names its failure and the fixtures cover the retry. " * 4
+PACKET_ROLE_ONLY = "Round 1."
+
+for label, packet_on_disk, rewrite_after, other_packet, expect_bound in (
     ("the session given this launch's packet is the one bound, another session alongside notwithstanding",
-     "Round 1 packet for the auth candidate", None, True),
+     PACKET_A, None, PACKET_B, True),
     ("a packet rewritten after the launch still binds the session the launch fed",
-     "Round 1 packet for the auth candidate", "Round 1 packet for another chat's candidate", True),
+     PACKET_A, PACKET_B, PACKET_B, True),
+    ("two sessions given the same packet are told apart by nothing and bind nothing",
+     PACKET_A, None, PACKET_A, False),
+    ("a packet that is all role, with nothing distinctive, binds nothing",
+     PACKET_ROLE_ONLY, None, PACKET_B, False),
     ("a packet naming no session binds nothing",
-     "Round 1 packet rewritten before the launch", None, False),
+     "Round 1 packet rewritten before the launch: " + "nobody was given these words in this window. " * 5, None, PACKET_B, False),
 ):
     sid = session()
     try:
@@ -1248,14 +1299,17 @@ for label, packet_on_disk, rewrite_after, expect_bound in (
         events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
         events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
         events.append(notification(now - 600, task_id, out_file, "completed"))
-        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")), packet="Round 1 packet for the auth candidate")
+        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")), packet=PACKET_A)
         log_codex_run(now - 640, codex_cli_output(review_text("APPROVED", subject="another chat's candidate")),
-                      packet="Round 1 packet for another chat's candidate")
+                      packet=other_packet)
         transcript = write_transcript(events)
         result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                                  "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
         bound = result.get("continue") is True and "decision" not in result
         check(label, bound is expect_bound, result)
+        if expect_bound:
+            check("closing the candidate discards its packet captures",
+                  not glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")), sid)
     finally:
         cleanup(sid, locals().get("transcript"))
 
@@ -1278,7 +1332,7 @@ try:
     check("a launch that fed a packet but left no capture binds nothing, whatever else spoke",
           result.get("decision") == "block", result)
     check("the stdin redirect is read from the codex segment, not the first redirect on the line",
-          marker_hook.codex_packet_path(command).replace(chr(92), "/").endswith("missing-packet.md"), marker_hook.codex_packet_path(command))
+          marker_hook.codex_launch(command)["path"].replace(chr(92), "/").endswith("missing-packet.md"), marker_hook.codex_launch(command))
 finally:
     cleanup(sid, locals().get("transcript"))
 

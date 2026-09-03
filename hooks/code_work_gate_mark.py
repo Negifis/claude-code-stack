@@ -16,6 +16,7 @@ Fail-open: any error returns continue=true.
 """
 import json
 import hashlib
+import glob
 import os
 import re
 import subprocess
@@ -150,9 +151,10 @@ GH_READ_RE = re.compile(
 )
 # What a Codex launch feeds on stdin, read before the command runs: the Stop hook binds the
 # verdict to the session that was given exactly this text, whatever the file holds later.
-CODEX_SEGMENT_RE = re.compile(r"\bcodex\s+exec\b")
 STDIN_REDIRECT_RE = re.compile(r"(?<![<>])<(?!<)\s*\"?([^\s\"<>|;&]+)\"?")
 PACKET_KEEP_BYTES = 256 * 1024
+# A capture older than this belongs to a launch whose notification never came.
+PACKET_CAPTURE_TTL = 24 * 3600.0
 # `-c key=value` is not skipped: it can point a reading subcommand at an external program
 # (`diff.external`, `core.fsmonitor`), and so falls through as an unknown subcommand.
 GIT_GLOBAL_OPTIONS_RE = re.compile(
@@ -889,25 +891,50 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     })
 
 
-def codex_packet_path(command):
-    """The file a `codex exec` segment reads on stdin, or empty when it feeds none."""
-    for segment in SEGMENT_SPLIT_RE.split(str(command or "")):
-        if not CODEX_SEGMENT_RE.search(segment):
-            continue
-        matches = STDIN_REDIRECT_RE.findall(segment)
-        if not matches:
-            return ""
-        import codex_lane
-        return codex_lane.windows_path(matches[-1])
-    return ""
+def codex_launch(command):
+    """How a shell command launches Codex: whether anything is fed on stdin, and the packet file.
+
+    `fed` is any stdin redirect anywhere in the command; `path` is the file read by the one
+    segment whose executable is codex — any spelling, `.exe` or not, behind `timeout` or an
+    environment assignment — running `exec`. It is empty when that segment cannot be named: no
+    codex segment, several, or a `||` that may skip it. The Stop hook treats a launch that fed
+    something it cannot bind by as binding nothing.
+    """
+    command = str(command or "")
+    fed = bool(STDIN_REDIRECT_RE.search(command))
+    if "||" in command:
+        return {"fed": fed, "path": ""}
+    fed_by = []
+    for segment in SEGMENT_SPLIT_RE.split(command):
+        head, rest = command_head(segment)
+        words = rest.split()
+        if head == "codex" and words and words[0].lower() == "exec":
+            matches = STDIN_REDIRECT_RE.findall(segment)
+            fed_by.append(matches[-1] if matches else "")
+    if len(fed_by) != 1 or not fed_by[0]:
+        return {"fed": fed, "path": ""}
+    import codex_lane
+    return {"fed": fed, "path": codex_lane.windows_path(fed_by[0])}
+
+
+def forget_stale_captures(session, now=None):
+    """Drop this session's packet captures older than a day: their launches never reported back."""
+    now = time.time() if now is None else now
+    for path in glob.glob(cwg.packet_capture_path(session, "*")):
+        try:
+            if now - os.path.getmtime(path) > PACKET_CAPTURE_TTL:
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def capture_packet(data, session):
     """Keep what this launch is about to feed Codex, so a later rewrite of the file changes nothing."""
     command = str((data.get("tool_input") or {}).get("command") or "")
-    path = codex_packet_path(command)
+    path = codex_launch(command)["path"]
     if not path or not data.get("tool_use_id"):
         return
+    forget_stale_captures(session)
     import hashlib
     try:
         with open(path, "rb") as stream:
@@ -923,25 +950,62 @@ def capture_packet(data, session):
 
 
 def content_fingerprint(paths):
-    """A digest of the lasting paths' current bytes, or None when it cannot be known cheaply."""
+    """A digest of the lasting paths as they are now, or None when it cannot be known cheaply.
+
+    Every record is domain-separated and length-prefixed — kind, path, mode, bytes or link
+    target — so no content can imitate another record. A path that no longer exists contributes
+    nothing: the candidate is what is on disk, so an add that was deleted again is no change,
+    while a file the approval covered going missing is one. Inside a repository the index entry
+    (mode and blob) is part of the record, because the commit is made from the index.
+    """
     import hashlib
+    import struct
     durable = sorted(set(cwg.durable_paths(paths)))
     if not durable or len(durable) > FINGERPRINT_MAX_FILES:
         return None
     digest = hashlib.sha256()
+
+    def add(kind, *fields):
+        digest.update(kind)
+        for field in fields:
+            data = field if isinstance(field, bytes) else str(field).encode("utf-8", "replace")
+            digest.update(struct.pack(">Q", len(data)))
+            digest.update(data)
+
+    by_dir = {}
     for path in durable:
-        digest.update(path.encode("utf-8", "replace") + b"\0")
         try:
+            if os.path.islink(path):
+                add(b"L", path, os.readlink(path))
+                continue
+            if not os.path.exists(path):
+                continue
+            if os.path.isdir(path):
+                add(b"D", path)
+                continue
             if os.path.getsize(path) > FINGERPRINT_MAX_BYTES:
                 return None
             with open(path, "rb") as stream:
-                digest.update(stream.read())
-        except FileNotFoundError:
-            digest.update(b"<missing>")
+                content = stream.read()
+            add(b"F", path, os.stat(path).st_mode & 0o777, content)
+            by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
         except OSError:
             return None
-        digest.update(b"\0")
+    for directory, names in sorted(by_dir.items()):
+        add(b"I", directory, index_entries(directory, names))
     return digest.hexdigest()
+
+
+def index_entries(directory, names):
+    """`git ls-files -s` for these files: empty outside a repository or on any failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", directory, "ls-files", "-s", "--"] + [":(icase)" + name for name in sorted(names)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
 
 
 def content_marks_after(marks, now, fingerprint):
