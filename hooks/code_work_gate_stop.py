@@ -19,10 +19,12 @@ import datetime
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import sys
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import code_work_gate_common as cwg  # noqa: E402
@@ -118,11 +120,11 @@ _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
 # The session being judged, for the ledger lines written from inside the transcript scan — and
 # whether they are written at all: the inbox runs the same scan for inspection only.
-_SESSION = {"key": "", "ledger": True}
+_SESSION = {"key": "", "effects": True}
 
 
 def review_note(**fields):
-    if _SESSION["ledger"]:
+    if _SESSION["effects"]:
         cwg.log_event("review", session=_SESSION["key"], **fields)
 REQUIRED_EXTERNAL_TOKEN = "CODE_WORK_GATE_REQUIRED"
 # Declared intent, never proof, and it governs one case only: whether a result that cannot be
@@ -610,7 +612,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 # returns; a background lane returns at launch, so its outage
                                 # (usage limit, capacity) is only readable here, from the
                                 # capture the command named.
-                                record_background_outage(call)
+                                if _SESSION["effects"]:
+                                    record_background_outage(call)
                     if notices:
                         continue
                 if stamp and stamp + 1 < skill_since:
@@ -1058,7 +1061,16 @@ def anomaly_closure(receipt, state, key):
         report = None
     if report is None:
         return False, "anomaly-reported names no report filed by this session (gate_inbox.py report)"
-    if float(report.get("ts") or 0) < float(state.get("last_block_ts") or 0):
+    # The nonce is minted at the block and printed only in its text, so a report carrying it
+    # was written after the hook spoke, whatever timestamp the record claims; the timestamp is
+    # still required to be a real one.
+    nonce = str(state.get("block_nonce") or "")
+    if not nonce or report.get("block_nonce") != nonce:
+        return False, "the anomaly report does not carry this block's nonce (copy the command from the block text)"
+    filed = report.get("ts")
+    if not isinstance(filed, (int, float)) or not math.isfinite(filed) or filed > time.time() + 300:
+        return False, "the anomaly report carries no real timestamp"
+    if filed < float(state.get("last_block_ts") or 0):
         return False, "the anomaly report predates the last block"
     last = normalized(state.get("last_block_reason"))
     if not last or last not in normalized(report.get("block_reason")):
@@ -1351,7 +1363,8 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     return cwg.write_json(marker, current)
 
 
-def reminder(reason, block_number, operational, session_id="", repeated=False, transcript=""):
+def reminder(reason, block_number, operational, session_id="", repeated=False, transcript="",
+             nonce=""):
     if operational:
         contract = (
             "This candidate changed no lasting artifact: it ran commands or a throwaway "
@@ -1384,13 +1397,14 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
         "This is finite enforcement block {n}/{cap} for the unchanged candidate.{repeat} "
         "If this block contradicts facts you can verify in the transcript — the evidence exists "
         "in the shape required, or the hook asks to repeat a lane that already ran — do not "
-        "re-run lanes or poll: file `python \"{inbox}\" report --session {sid}{transcript} --block "
+        "re-run lanes or poll: file `python \"{inbox}\" report --session {sid}{transcript} "
+        "--nonce {nonce} --block "
         "\"{reason}\" --facts \"<what the transcript shows>\" --did \"<what you did instead>\"` "
         "and end with `[gate] anomaly-reported: <id>; <fact>`, which closes this candidate "
         "UNVERIFIED with the report attached (development-verification section 10)."
     ).format(reason=reason, contract=contract, n=block_number, cap=MAX_BLOCKS_PER_CANDIDATE,
              repeat=" Same reason as the previous block." if repeated else "",
-             inbox=inbox, sid=session_id or "<session id>",
+             inbox=inbox, sid=session_id or "<session id>", nonce=nonce or "<nonce>",
              transcript=' --transcript \"{}\"'.format(transcript) if transcript else "")
 
 
@@ -1501,6 +1515,7 @@ def main():
         state["blocks"] = blocks + 1
         state["last_block_ts"] = time.time()
         state["last_block_reason"] = reason
+        state["block_nonce"] = uuid.uuid4().hex[:12]
         if not cwg.write_json(state_file, state):
             allow("Code Work Gate state is unavailable and enforcement is failing open.")
             return
@@ -1511,7 +1526,7 @@ def main():
             "reason": reminder(
                 reason, blocks + 1, candidate_class(entry) == cwg.WORK_OPERATIONAL,
                 session_id=str(data.get("session_id") or ""), repeated=repeated,
-                transcript=str(data.get("transcript_path") or ""),
+                transcript=str(data.get("transcript_path") or ""), nonce=state["block_nonce"],
             ),
         })
     except Exception as error:

@@ -7,7 +7,7 @@ the gate's own ledger by fixed rules. The gate-ops session reads the unresolved 
 
   gate_inbox.py report --block "<block reason, verbatim>" --facts "<what the transcript shows>"
                        [--did "<what was done instead>"] [--kind <label>] [--session <id>]
-                       [--transcript <path>]
+                       [--transcript <path>] [--nonce <nonce from the block text>]
   gate_inbox.py list | show <id> | ack <id> [--note "<what fixed it>"] | scan | digest
 
 A report is evidence for the person who maintains the gate, never a key that opens it: the Stop
@@ -18,6 +18,7 @@ UNVERIFIED with the report attached.
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -54,13 +55,20 @@ def read_jsonl(path):
         return
 
 
+def number(value, default=0.0):
+    """A finite float, or the default for anything a JSON line may have put there instead."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return default
+    return float(value)
+
+
 def read_records():
-    """(reports, acks) from the inbox."""
+    """(reports, acks) from the inbox; a record whose id or ack is not a string is skipped."""
     reports, acks = [], {}
     for record in read_jsonl(inbox_path()):
-        if record.get("ack"):
-            acks[str(record["ack"])] = record
-        elif record.get("id"):
+        if isinstance(record.get("ack"), str):
+            acks[record["ack"]] = record
+        elif isinstance(record.get("id"), str) and isinstance(record.get("session"), str):
             reports.append(record)
     return reports, acks
 
@@ -97,14 +105,14 @@ def find_transcript(session_id):
 def hook_view(transcript, marker, key):
     """What the Stop hook's own scan sees in this transcript — the other side of the report.
 
-    The scan is the hook's own code, run here for inspection only: its ledger lines are switched
-    off so filing a report writes nothing the Stop hook would not have written itself.
+    The scan is the hook's own code, run here for inspection only: its side effects — ledger
+    lines, the Codex breaker — are switched off, so filing a report changes nothing but the inbox.
     """
     if not transcript:
         return {"available": False, "reason": "transcript not found"}
     try:
         import code_work_gate_stop as gate
-        gate._SESSION.update(key=key, ledger=False)
+        gate._SESSION.update(key=key, effects=False)
         first_ts = float(marker.get("first_ts") or marker.get("last_ts") or 0.0)
         evidence = gate.transcript_evidence(transcript, first_ts, skill_since=0.0)
         return {
@@ -145,6 +153,7 @@ def report(args):
         "cwd": os.getcwd(),
         "transcript": transcript,
         "block_reason": args.block.strip(),
+        "block_nonce": (args.nonce or "").strip(),
         "facts": args.facts.strip(),
         "did": (args.did or "").strip(),
         "marker": {
@@ -167,10 +176,10 @@ def report(args):
 
 
 def summary(record):
-    when = time.strftime("%m-%d %H:%M", time.localtime(float(record.get("ts") or 0)))
-    text = record.get("block_reason") or record.get("rule") or ""
+    when = time.strftime("%m-%d %H:%M", time.localtime(number(record.get("ts"))))
+    text = str(record.get("block_reason") or record.get("rule") or "")
     return "{} {} {} {}: {}".format(
-        record["id"], when, record.get("kind") or "?", str(record.get("session") or "")[:8],
+        record["id"], when, str(record.get("kind") or "?"), record["session"][:8],
         text[:SUMMARY_CHARS],
     )
 
@@ -203,38 +212,46 @@ def ack(args):
     return 0
 
 
+def moment(event):
+    """When an event happened: a review when the verdict was stated, anything else when written."""
+    return number(event.get("at")) or number(event.get("ts"))
+
+
 def scan(args):
-    """Derive the anomalies the ledger shows on its own, each once."""
+    """Derive the anomalies the ledger shows on its own, each once.
+
+    Events are judged in the order they happened, not the order the Stop hook wrote them: a
+    verdict is only appended when a Stop runs, which may be after the edit that expired it.
+    """
     import code_work_gate_stop as gate
     reports, _ = read_records()
     seen = {(r.get("session"), r.get("rule"), r.get("event_at")) for r in reports if r.get("auto")}
     per_session = {}
     for event in ledger_events():
-        per_session.setdefault(event.get("session") or "?", []).append(event)
+        per_session.setdefault(str(event.get("session") or "?"), []).append(event)
     added = 0
     for key, events in per_session.items():
-        last_review = None
-        for event in events:
-            kind, stamp = event.get("kind"), event.get("ts")
+        last_approval = None
+        for event in sorted(events, key=moment):
+            kind, stamp = event.get("kind"), moment(event)
             rule = None
             if kind == "exhausted":
                 rule = "exhausted"
             elif kind == "hook_error":
                 rule = "hook-error"
-            elif kind == "wait" and int(event.get("waits") or 0) >= gate.MAX_BACKGROUND_WAITS:
+            elif kind == "wait" and number(event.get("waits")) >= gate.MAX_BACKGROUND_WAITS:
                 rule = "waits-exhausted"
             elif kind == "review" and event.get("verdict"):
-                last_review = float(event.get("at") or stamp or 0)
+                last_approval = stamp if event.get("verdict") == "APPROVED" else None
             elif kind == "review" and event.get("engine") == "codex-background":
                 rule = "unbound-background-review"
-            elif (kind == "durable" and event.get("reason") == "unresolved-write-capable"
-                  and last_review and 0 <= float(stamp or 0) - last_review <= EXPIRY_WINDOW):
-                rule = "verdict-expired-after-review"
+            elif kind == "durable" and last_approval and 0 <= stamp - last_approval <= EXPIRY_WINDOW:
+                rule = "verdict-expired-after-approval"
             if not rule:
                 continue
             # One incident, however many Stop runs re-read it: a review event keyed by the
             # moment it was stated or by its task, a state event by when it was written.
-            event_at = event.get("at") or event.get("task") or stamp
+            event_at = event.get("at") or event.get("task") or event.get("ts")
             if (key, rule, event_at) in seen:
                 continue
             seen.add((key, rule, event_at))
@@ -253,6 +270,8 @@ def digest(args):
     try:
         payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
     except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
         payload = {}
     cwd = os.path.abspath(str(payload.get("cwd") or os.getcwd()))
     home = os.path.abspath(cwg.config_home())
@@ -283,6 +302,7 @@ def main(argv):
     filing.add_argument("--kind", default="agent", help="a short label for the anomaly")
     filing.add_argument("--session", default="", help="session id (default: CLAUDE_CODE_SESSION_ID)")
     filing.add_argument("--transcript", default="", help="transcript path (default: found by session id)")
+    filing.add_argument("--nonce", default="", help="the nonce printed in the block text")
     filing.set_defaults(run=report)
     commands.add_parser("list").set_defaults(run=list_reports)
     showing = commands.add_parser("show")

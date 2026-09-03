@@ -1329,8 +1329,9 @@ def inbox(*args, stdin=None):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def file_report(sid, block_reason, facts="the transcript shows the evidence"):
-    code, out, err = inbox("report", "--session", sid, "--block", block_reason, "--facts", facts)
+def file_report(sid, block_reason, facts="the transcript shows the evidence", nonce=""):
+    code, out, err = inbox("report", "--session", sid, "--block", block_reason, "--facts", facts,
+                           *(["--nonce", nonce] if nonce else []))
     check("gate_inbox report exits zero", code == 0, err)
     match = re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out)
     check("gate_inbox report prints an id", bool(match), out)
@@ -1342,6 +1343,15 @@ def block_reason_of(result):
     return match.group(1) if match else ""
 
 
+def nonce_of(result):
+    match = re.search(r"--nonce ([0-9a-f]{12})", result.get("reason") or "")
+    return match.group(1) if match else ""
+
+
+def gate_inbox_path():
+    return os.path.join(CLAUDE_CONFIG_DIR, "state", "gate-anomalies.jsonl")
+
+
 sid = session()
 try:
     seed(sid, ["C:/repo/src/app.py"])
@@ -1349,32 +1359,35 @@ try:
     result = run(STOP_HOOK, payload)
     check("an anomaly receipt before any block is refused",
           result.get("decision") == "block" and "only available after the gate has blocked" in result["reason"], result)
-    check("the block reminder offers the report command with the session id",
-          "gate_inbox.py" in result["reason"] and sid in result["reason"], result)
-    result = run(STOP_HOOK, payload)
-    check("an anomaly receipt naming no report is refused",
-          result.get("decision") == "block" and "names no report" in result["reason"], result)
-    wrong = file_report(sid, "some other reason entirely")
+    check("the block reminder offers the report command with the session id and a nonce",
+          "gate_inbox.py" in result["reason"] and sid in result["reason"] and nonce_of(result), result)
+    without_nonce = file_report(sid, block_reason_of(result), "the facts")
+    refused = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(without_nonce)})
+    check("a report without the block's nonce is refused",
+          refused.get("decision") == "block" and "nonce" in refused["reason"], refused)
+    check("every block mints a fresh nonce", nonce_of(refused) and nonce_of(refused) != nonce_of(result), refused["reason"][-300:])
+    wrong = file_report(sid, "some other reason entirely", nonce=nonce_of(refused))
     result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(wrong)})
     check("a report that does not quote the block's reason is refused",
           result.get("decision") == "block" and "does not quote" in result["reason"], result)
-    report_id = file_report(sid, block_reason_of(result), "APPROVED at 12:00 from a foreground lane after the last edit at 11:58")
-    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(report_id)})
-    check("a report filed after the block, quoting its reason, closes the candidate as anomaly-reported",
-          result.get("continue") is True and "anomaly-reported" in result.get("systemMessage", "") and "UNVERIFIED" in result.get("systemMessage", ""), result)
+    report_id = file_report(sid, block_reason_of(result), "APPROVED at 12:00 from a foreground lane after the last edit at 11:58", nonce=nonce_of(result))
+    closed = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(report_id)})
+    check("a report filed after the block, carrying its nonce and quoting its reason, closes the candidate as anomaly-reported",
+          closed.get("continue") is True and "anomaly-reported" in closed.get("systemMessage", "") and "UNVERIFIED" in closed.get("systemMessage", ""), closed)
     check("the anomaly closure retires the candidate", not os.path.exists(gate_paths(sid)[0]) or (cwg.read_json(gate_paths(sid)[0]) or {}).get("closed"), gate_paths(sid)[0])
     ledger_lines = open(cwg.event_log_path(), encoding="utf-8").read().splitlines()
     check("the ledger records the anomaly closure with its report id",
           any('"receipt": "anomaly-reported"' in line and report_id in line and sid in line for line in ledger_lines), report_id)
     code, out, _ = inbox("show", report_id)
     shown = json.loads(out)
-    check("the report carries the marker, the state and the hook's own view",
+    check("the report carries the marker, the state, the nonce and the hook's own view",
           shown.get("session") == cwg.session_key(sid) and shown["state"].get("blocks") == 3
-          and shown["marker"].get("paths") == 1 and "hook_view" in shown, shown.get("state"))
+          and shown["marker"].get("paths") == 1 and "hook_view" in shown
+          and shown.get("block_nonce") == nonce_of(result), shown.get("state"))
     code, out, _ = inbox("list")
-    check("the report is listed until acknowledged", report_id in out and wrong in out, out)
-    code, out, _ = inbox("ack", report_id, "--note", "fixed in the hook")
-    inbox("ack", wrong)
+    check("the report is listed until acknowledged", report_id in out and wrong in out and without_nonce in out, out)
+    for pending_id in (report_id, wrong, without_nonce):
+        inbox("ack", pending_id, "--note", "test")
     code, out, _ = inbox("list")
     check("an acknowledged report leaves the list", code == 0 and report_id not in out and wrong not in out, out)
 finally:
@@ -1391,7 +1404,7 @@ try:
     third = run(STOP_HOOK, {"session_id": sid, "transcript_path": "C:/x/session.jsonl", "last_assistant_message": "done"})
     check("the block reminder names the transcript when the hook was given one",
           '--transcript "C:/x/session.jsonl"' in third["reason"], third["reason"][-400:])
-    report_id = file_report(sid, block_reason_of(second), "the transcript holds the evidence the hook denies")
+    report_id = file_report(sid, block_reason_of(third), "the transcript holds the evidence the hook denies", nonce=nonce_of(third))
     result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the transcript holds the evidence".format(report_id)})
     check("a substantive block can be answered with a report",
           result.get("continue") is True and "UNVERIFIED" in result.get("systemMessage", ""), result)
@@ -1403,15 +1416,43 @@ sid = session()
 try:
     seed(sid, ["C:/repo/src/app.py"])
     early = file_report(sid, "HIGH candidate lacks a current APPROVED verdict")
-    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    blocked = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: 0badc0de; the hook is wrong"})
+    check("an anomaly receipt naming no report is refused",
+          result.get("decision") == "block" and "names no report" in result["reason"], result)
     result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(early)})
     check("a report filed before the block cannot close the candidate",
-          result.get("decision") == "block" and "predates the last block" in result["reason"], result)
+          result.get("decision") == "block" and "nonce" in result["reason"], result)
     inbox("ack", early)
 finally:
     cleanup(sid, locals().get("transcript"))
 
-# --- filing a report inspects the transcript without writing the hook's ledger lines
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    blocked = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    # A record written by hand: the minted nonce cannot be guessed, so the forger's best try is
+    # the right reason and a timestamp that compares as fresh — NaN never compares as older.
+    forged = uuid.uuid4().hex[:8]
+    with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"id": forged, "session": cwg.session_key(sid), "ts": float("nan"),
+                                 "block_reason": block_reason_of(blocked), "block_nonce": "0" * 12}) + chr(10))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(forged)})
+    check("a hand-written record without the minted nonce is refused",
+          result.get("decision") == "block" and "nonce" in result["reason"], result)
+    forged_timed = uuid.uuid4().hex[:8]
+    with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"id": forged_timed, "session": cwg.session_key(sid), "ts": float("nan"),
+                                 "block_reason": block_reason_of(result), "block_nonce": nonce_of(result)}) + chr(10))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(forged_timed)})
+    check("a record with the nonce but no real timestamp is refused",
+          result.get("decision") == "block" and "no real timestamp" in result["reason"], result)
+    inbox("ack", forged)
+    inbox("ack", forged_timed)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- filing a report inspects the transcript without writing the hook's ledger lines, nor the breaker
 sid = session()
 try:
     now = time.time()
@@ -1425,6 +1466,19 @@ try:
     code, out, err = inbox("report", "--session", sid, "--transcript", transcript, "--block", "x", "--facts", "y")
     after = open(cwg.event_log_path(), encoding="utf-8").read().count(chr(10))
     check("filing a report writes no ledger lines", code == 0 and after == before, (before, after, err))
+    import codex_lane
+    codex_lane.clear_state()
+    limited = "blim" + uuid.uuid4().hex[:5]
+    err_path = os.path.join(AGENT_HOME, "codex-report-limit.err")
+    with open(err_path, "w", encoding="utf-8") as stream:
+        stream.write("ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 4:24 PM." + chr(10))
+    events.append(bash_use(now - 500, "codex-rl", CODEX_CLI_COMMAND + " 2>" + err_path.replace(chr(92), "/"), run_in_background=True))
+    events.append(tool_result(now - 499, "codex-rl", DETACHED_ACK.format(id=limited, out=os.path.join(tasks_dir, limited + ".output"))))
+    events.append(notification(now - 400, limited, os.path.join(tasks_dir, limited + ".output"), "failed"))
+    transcript = write_transcript(events)
+    code, out, err = inbox("report", "--session", sid, "--transcript", transcript, "--block", "x", "--facts", "y")
+    check("filing a report does not touch the Codex breaker", code == 0 and codex_lane.status()[0] is True, codex_lane.status())
+    inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
     shown = json.loads(inbox("show", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))[1])
     check("the report still carries the hook's view of the transcript",
           shown["hook_view"].get("available") is True and shown["hook_view"].get("review_events"), shown["hook_view"])
@@ -1439,18 +1493,30 @@ check("the digest names unresolved reports for a gate-ops session",
       code == 0 and pending in out and "additionalContext" in out, out)
 code, out, _ = inbox("digest", stdin=json.dumps({"cwd": AGENT_HOME, "hook_event_name": "SessionStart"}))
 check("the digest stays silent elsewhere", code == 0 and out.strip() == "", out)
+with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+    stream.write('{"id": ["x"]}' + chr(10) + "not json" + chr(10) + '{"ack": 5}' + chr(10)
+                 + json.dumps({"id": "deadbeef", "session": "s", "ts": "soon", "kind": 7, "block_reason": None}) + chr(10))
+code, out, err = inbox("digest", stdin="[]")
+check("the digest survives a list payload and malformed inbox lines", code == 0 and out.strip() == "", err)
+code, out, err = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR}))
+check("malformed inbox lines are skipped, real ones still shown", code == 0 and pending in out and "deadbeef" in out, err or out)
+code, out, err = inbox("list")
+check("the list survives malformed lines", code == 0 and pending in out, err)
+inbox("ack", "deadbeef")
 inbox("ack", pending)
 with open(cwg.event_log_path(), "a", encoding="utf-8") as stream:
     stream.write(json.dumps({"ts": time.time(), "kind": "exhausted", "session": "scan-test", "reason": "x"}) + "\n")
-    stream.write(json.dumps({"ts": time.time() - 30, "kind": "review", "session": "scan-test-2", "at": time.time() - 30, "engine": "codex", "verdict": "APPROVED"}) + "\n")
-    stream.write(json.dumps({"ts": time.time() - 20, "kind": "durable", "session": "scan-test-2", "reason": "unresolved-write-capable", "command": "git"}) + "\n")
+    # Written in the order the hooks write them: the edit first, the verdict it expired only at
+    # the next Stop — the scan must judge by when things happened.
+    stream.write(json.dumps({"ts": time.time() - 20, "kind": "durable", "session": "scan-test-2", "reason": "edit", "command": "git"}) + "\n")
+    stream.write(json.dumps({"ts": time.time() - 5, "kind": "review", "session": "scan-test-2", "at": time.time() - 30, "engine": "codex", "verdict": "APPROVED"}) + "\n")
     for offset in (10, 5):
         stream.write(json.dumps({"ts": time.time() - offset, "kind": "review", "session": "scan-test-3", "engine": "codex-background", "verdict": None, "task": "btask-same"}) + "\n")
 code, out, _ = inbox("scan")
 check("the scan derives anomalies from the ledger", code == 0 and re.search(r"GATE_SCAN: [1-9]", out), out)
 code, listed, _ = inbox("list")
-check("the scan reports exhaustion and a verdict expired right after a review",
-      "auto:exhausted" in listed and "auto:verdict-expired-after-review" in listed, listed)
+check("the scan reports exhaustion and an approval expired right after it was stated",
+      "auto:exhausted" in listed and "auto:verdict-expired-after-approval" in listed, listed)
 check("one unbound review task re-read by several Stop runs is one anomaly",
       sum(1 for line in listed.splitlines() if "scan-tes" in line and "unbound-background-review" in line) == 1, listed)
 code, out, _ = inbox("scan")
