@@ -34,7 +34,7 @@ SHELL_WRITE_RE = re.compile(
     r"\bperl\b[^\r\n]*\s-pi\b|\b(Set-Content|Add-Content|Out-File)\b|"
     r"\b(Copy-Item|Move-Item|Remove-Item|Rename-Item|New-Item)\b|"
     r"\b(prettier|eslint|ruff)\b[^\r\n]*"
-    r"(--write|--fix)\b|\b(cat|echo|printf)\b[^\r\n]*(>>?|\btee\b))"
+    r"(--write|--fix)\b|\b(cat|echo|printf)\b[^\r\n]*((?<![0-9])>>?(?!&)|\btee\b))"
 )
 READ_ONLY_SHELL_RE = re.compile(
     r"(?i)^\s*(?:"
@@ -99,22 +99,39 @@ AGENT_CONFIG_LIMIT = 8192
 # copy, not the session's work; the sources they are copied from are watched in the homes above.
 # Attribution only, like the skip list: an edit made through Edit/Write is still gated by path.
 SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNORECASE)
-# Commands that could rewrite a file even though the snapshot could not see it: an interpreter
-# running code or a script, an in-place editor, a redirect into a file, a VCS operation that
-# moves the working tree. The review verdict expires on an unresolved shell mutation only for
-# these. `git status --porcelain | wc -l` seven seconds after a Codex approval expired that
-# approval on 2026-09-03 and cost the session a native review round it did not need; nothing
-# that command can do touches a lasting artifact.
-WRITE_CAPABLE_RE = re.compile(
-    r"(?im)("
-    r"\b(?:python3?|py|node|deno|bun|ruby|perl|php|pwsh|powershell(?:\.exe)?|bash|sh|zsh|cmd(?:\.exe)?)\b"
-    r"(?![^\r\n]*\b(?:--version|-V\b|codex_lane\.py check))|"
-    r"(?<![0-9&<])(?:&>|>>?)\s*(?!/dev/null|nul\b|&)|"
-    r"<<-?\s*['\"]?\w|"
-    r"\bgit\s+(?:checkout|switch|merge|rebase|stash|reset|cherry-pick|pull|am|restore|revert|clean)\b|"
-    r"\b(?:cp|install|patch|dd|mkdir|touch|chmod|unzip|tar)\b"
-    r")"
+# Whether a shell command could have rewritten a file the snapshot did not see decides whether
+# an unresolved mutation expires the review verdict. The rule is an allowlist of commands proven
+# read-only, judged per pipeline segment: anything unknown, any redirect other than a discarded
+# or merged stderr, a command substitution, a heredoc or a script block is write-capable.
+# `git status --porcelain | wc -l` seven seconds after a Codex approval expired that approval on
+# 2026-09-03 and cost the session a native review round it did not need; nothing that command
+# can do touches a lasting artifact, while `tee`, `truncate` or `1>` plainly can.
+READ_ONLY_COMMANDS = frozenset("""
+    cd ls dir cat head tail less more grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
+    stat file du df pwd echo printf date true false test [ type which where whoami hostname
+    printenv jq column nl tac basename dirname realpath readlink md5sum sha1sum sha256sum tree
+    ps tasklist nproc uname sleep
+    get-childitem get-content get-item get-command select-string select-object measure-object
+    format-table format-list out-string write-output write-host test-path resolve-path
+    get-process get-location get-date sort-object gci gc gi sls findstr
+""".split())
+GIT_READ_SUBCOMMANDS = frozenset("""
+    status log diff show rev-parse ls-files ls-tree blame describe rev-list cat-file shortlog
+    for-each-ref name-rev merge-base grep check-ignore diff-tree diff-index count-objects reflog
+    var version help
+""".split())
+# The listing forms of git subcommands that also write: `git branch` alone lists, `git branch x`
+# creates, and `git stash` alone stashes.
+GIT_LISTING_RE = re.compile(
+    r"^(?:(?:branch|tag|remote|worktree|config)\b(?:\s+(?:list|-l|--list|-a|-v|-vv|--all|"
+    r"--show-current|--merged|--no-merged|--contains\s+\S+|--get(?:-all|-regexp)?\s+\S+))*"
+    r"|stash\s+(?:list|show)\b[^\r\n]*)\s*$"
 )
+# Only a discarded or merged stderr is not a file the command may have written into.
+HARMLESS_REDIRECT_RE = re.compile(r"2>\s*(?:/dev/null|\$null|nul\b)|2>&1|1>&2|>&2")
+SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\r\n]")
+ENV_ASSIGNMENT_RE = re.compile(r"^\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s*")
+WRAPPER_RE = re.compile(r"^(?:timeout\s+(?:-\S+\s+)*\S+|time|nohup|command|builtin)\s+")
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
 SHELL_UNKNOWN = "UNKNOWN_OR_MUTATING"
@@ -132,22 +149,70 @@ def shell_write(data):
     return bool(SHELL_WRITE_RE.search(command))
 
 
+def command_head(segment):
+    """The executable a pipeline segment starts with (lower-case basename, no `.exe`), and its
+    arguments. Environment assignments and timing wrappers in front of it are skipped."""
+    segment = segment.strip().lstrip("({!").strip()
+    while True:
+        stripped = WRAPPER_RE.sub("", ENV_ASSIGNMENT_RE.sub("", segment, count=1), count=1)
+        if stripped == segment:
+            break
+        segment = stripped
+    words = segment.split(None, 1)
+    if not words:
+        return "", ""
+    token = words[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if token.endswith(".exe"):
+        token = token[:-4]
+    return token, (words[1] if len(words) > 1 else "")
+
+
+def command_label(command):
+    """What the ledger keeps of a command: its first executable, never its arguments."""
+    first = SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0] if command else ""
+    return command_head(first)[0][:40]
+
+
+def read_only_pipeline(command):
+    """Whether every segment of the command is a command proven not to write."""
+    if "$(" in command or "`" in command or "<<" in command or "{" in command:
+        return False
+    # A merged stderr (`2>&1`) is dropped before splitting, or its `&` would cut the pipeline.
+    cleaned = HARMLESS_REDIRECT_RE.sub(" ", command)
+    if ">" in cleaned:
+        return False
+    for segment in SEGMENT_SPLIT_RE.split(cleaned):
+        if not segment.strip():
+            continue
+        head, rest = command_head(segment)
+        if head == "git":
+            words = rest.split()
+            if (words and words[0].lower() in GIT_READ_SUBCOMMANDS) or GIT_LISTING_RE.match(rest):
+                continue
+            return False
+        if head not in READ_ONLY_COMMANDS:
+            return False
+    return True
+
+
 def write_capable(data):
     """Whether this shell command could have rewritten a file the snapshot did not see.
 
     Broader than `shell_write`, which names the shapes that definitely write and therefore keep
     their whole delta in `own_delta`; this one only decides whether an unresolved mutation may
-    expire a review verdict. A validation command is deliberately outside it: reruns of the
-    checks the skill asks for never edit source.
+    expire a review verdict. Only a pipeline of commands proven read-only is outside it, plus a
+    validation command: reruns of the checks the skill asks for never edit source.
     """
     if str(data.get("tool_name") or "") not in cwg.SHELL_TOOLS:
         return False
     command = str((data.get("tool_input") or {}).get("command") or "")
     if shell_write(data):
         return True
+    if not command.strip():
+        return False
     if VALIDATION_SHELL_RE.match(command) and "$(" not in command:
         return False
-    return bool(WRITE_CAPABLE_RE.search(command))
+    return not read_only_pipeline(command)
 
 
 def shell_policy(data):
@@ -717,7 +782,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
                     "unattributed" if unattributed_risk else "unresolved-write-capable"),
             paths=[p for p in cwg.durable_paths(incoming)][:5],
             tool=str(data.get("tool_name") or ""),
-            command=str((data.get("tool_input") or {}).get("command") or "")[:160],
+            command=command_label(str((data.get("tool_input") or {}).get("command") or "")),
         )
     return cwg.write_json(marker, {
         "first_ts": cycle["first_ts"],

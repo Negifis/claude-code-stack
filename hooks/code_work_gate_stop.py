@@ -37,11 +37,28 @@ MAX_BLOCKS_PER_CANDIDATE = 3
 # waiting stops before the ordinary block applies again.
 BACKGROUND_WAIT_LIMIT = 2 * 3600.0
 MAX_BACKGROUND_WAITS = 8
-BACKGROUND_ACK_RE = re.compile(
-    r"(?:running in background with ID|moved to the background \(ID): ?([A-Za-z0-9_-]+)"
+# The harness's own acknowledgement envelopes, anchored at the start of the result: a review
+# that merely mentions a background task is still a review.
+DETACHED_ACK_RE = re.compile(
+    r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\.\s*"
+    r"Output is being written to: ([^\n]+?\.output)"
 )
-AGENT_BG_RE = re.compile(r"Async agent launched[^\n]*\n?agentId: ([A-Za-z0-9_-]+)")
-OUTPUT_FILE_RE = re.compile(r"Output is being written to: ([^\n]+?\.output)")
+MOVED_ACK_RE = re.compile(
+    r"^\s*Command did not complete within its \d+s timeout and was moved to the background "
+    r"\(ID: ?([A-Za-z0-9_-]+)\)\.\s*Output is being written to: ([^\n]+?\.output)"
+)
+AGENT_BG_RE = re.compile(
+    r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"
+)
+# A background task's output file stops changing when the task ends; one written after the
+# completion notification is no longer the harness's record of what the task printed.
+OUTPUT_SETTLE_SLACK = 15.0
+# Raw-line tokens without which a pre-candidate transcript line can contribute nothing: a skill
+# timestamp, or the background bookkeeping that spans the whole session.
+PRE_CANDIDATE_TOKENS = (
+    '"Skill"', '"SlashCommand"', '"TaskStop"',
+    "in background with ID", "moved to the background", "Async agent launched",
+)
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
 NOTIFICATION_FILE_RE = re.compile(r"<output-file>([^<]+)</output-file>")
@@ -477,6 +494,7 @@ def transcript_evidence(path, since, skill_since=None):
         "external_results": [],
         "background": {},
         "background_done": {},
+        "background_judged": [],
         "scan_failed": False,
     }
     if not path or not os.path.isfile(path):
@@ -521,7 +539,9 @@ def transcript_evidence(path, since, skill_since=None):
                             if not call or stamp + 1 < since:
                                 continue
                             # A backgrounded review lane reports through its output file.
-                            text_out = output_tail(output_file or call.get("output_file") or "")
+                            text_out = output_evidence(
+                                output_file or call.get("output_file") or "", stamp
+                            )
                             control = reviewer_control(text_out)
                             stated = control[0] in ("ordinary", "closure")
                             bound = stated and status == "completed" and codex_produced(
@@ -531,6 +551,7 @@ def transcript_evidence(path, since, skill_since=None):
                                 (stamp, call["call_id"], call["required"],
                                  "success" if bound else "failure")
                             )
+                            evidence["background_judged"].append(call["call_id"])
                             if bound:
                                 record_control(evidence, stamp, control)
                                 cwg.log_event("review", engine="codex-background",
@@ -545,9 +566,11 @@ def transcript_evidence(path, since, skill_since=None):
                 if stamp and stamp + 1 < skill_since:
                     continue
                 before_candidate = bool(stamp) and stamp + 1 < since
-                # A pre-candidate entry can only contribute a skill timestamp, and a skill call
-                # cannot be present without its tool name appearing verbatim in the raw line.
-                if before_candidate and '"Skill"' not in raw and '"SlashCommand"' not in raw:
+                # A pre-candidate entry can only contribute a skill timestamp or background
+                # bookkeeping — a server or suite started before the candidate opened is still
+                # this session's running work — and neither is present without its token
+                # appearing verbatim in the raw line.
+                if before_candidate and not any(token in raw for token in PRE_CANDIDATE_TOKENS):
                     continue
 
                 for block in content_blocks(entry):
@@ -559,9 +582,6 @@ def transcript_evidence(path, since, skill_since=None):
                             evidence["skills"][called_skill] = max(
                                 stamp, evidence["skills"].get(called_skill, 0.0)
                             )
-                        if before_candidate:
-                            continue
-
                         tool_name = block.get("name")
                         payload = block.get("input")
                         if not isinstance(payload, dict):
@@ -579,6 +599,7 @@ def transcript_evidence(path, since, skill_since=None):
                                     evidence["external_results"].append(
                                         (stamp, call["call_id"], call["required"], "failure")
                                     )
+                                    evidence["background_judged"].append(call["call_id"])
                                     evidence["review_failures"].append(stamp)
                                     record_control(evidence, stamp, ("unbound", None),
                                                    malformed=True)
@@ -586,6 +607,8 @@ def transcript_evidence(path, since, skill_since=None):
                                                   verdict=None, task=stopped,
                                                   status="stopped",
                                                   reason="the review task was stopped")
+                            continue
+                        if before_candidate:
                             continue
                         if tool_name in cwg.SHELL_TOOLS and call_id:
                             command = str(payload.get("command") or "")
@@ -639,31 +662,32 @@ def transcript_evidence(path, since, skill_since=None):
                     if block.get("type") != "tool_result":
                         continue
                     call = calls.get(block.get("tool_use_id"))
-                    if not call:
-                        continue
                     text = result_text(block)
-                    # Background bookkeeping spans the whole transcript: a server started
-                    # before the candidate opened is still this session's running work.
-                    ack = BACKGROUND_ACK_RE.search(text) if call["kind"] == "external" else None
-                    if ack:
-                        task_id = ack.group(1)
-                        file_match = OUTPUT_FILE_RE.search(text)
-                        evidence["background"][task_id] = {
-                            "started": stamp, "kind": "shell", "label": call.get("label", ""),
-                            "review": bool(call.get("marked")),
-                        }
-                        if call.get("marked"):
-                            background_calls[task_id] = dict(
-                                call, output_file=(file_match.group(1).strip() if file_match else "")
-                            )
-                        continue
-                    if call["kind"] in ("agent", "simplify", "review") and not call["foreground"]:
-                        launched = AGENT_BG_RE.search(text)
+                    # Background bookkeeping spans the whole transcript: a server started before
+                    # the candidate opened is still this session's running work, so the harness's
+                    # acknowledgement is read even for a call the scan did not register.
+                    if call is None or call["kind"] == "external":
+                        ack = background_ack(text, None if call is None else call["foreground"])
+                        if ack:
+                            task_id, output_file = ack
+                            evidence["background"][task_id] = {
+                                "started": stamp, "kind": "shell",
+                                "label": call.get("label", "") if call else "",
+                                "review": bool(call and call.get("marked")),
+                            }
+                            if call and call.get("marked"):
+                                background_calls[task_id] = dict(call, output_file=output_file)
+                            continue
+                    if call is None or (call["kind"] != "external" and not call["foreground"]):
+                        launched = AGENT_BG_RE.match(text)
                         if launched:
                             evidence["background"][launched.group(1)] = {
-                                "started": stamp, "kind": "agent", "label": call.get("label", ""),
-                                "review": call["kind"] == "review",
+                                "started": stamp, "kind": "agent",
+                                "label": call.get("label", "") if call else "",
+                                "review": bool(call and call["kind"] == "review"),
                             }
+                            continue
+                    if call is None:
                         continue
                     if before_candidate or call["kind"] == "agent" or not call["foreground"]:
                         continue
@@ -754,6 +778,39 @@ def output_tail(path):
             return stream.read().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def background_ack(text, foreground=None):
+    """(task id, output file) when a shell result is the harness's own background envelope.
+
+    A detached launch acknowledges as running and a foreground call only as moved at its
+    timeout, so each envelope is accepted for its own polarity; `foreground=None` — a call the
+    scan did not register — accepts either. Both are anchored at the start of the result.
+    """
+    if foreground is not True:
+        match = DETACHED_ACK_RE.match(text)
+        if match:
+            return match.group(1), match.group(2).strip()
+    if foreground is not False:
+        match = MOVED_ACK_RE.match(text)
+        if match:
+            return match.group(1), match.group(2).strip()
+    return None
+
+
+def output_evidence(path, notified_at):
+    """The tail of a background task's output file, or empty when it cannot vouch for the task.
+
+    The file is the harness's record of what the task printed and it stops changing when the
+    task ends: one written after the completion notification is no longer that record, whatever
+    it says now. The rollout log still has to vouch for the content.
+    """
+    try:
+        if os.stat(path).st_mtime > notified_at + OUTPUT_SETTLE_SLACK:
+            return ""
+    except OSError:
+        return ""
+    return output_tail(path)
 
 
 def in_flight(evidence, now=None):
@@ -1113,8 +1170,10 @@ def evaluate_receipt(receipt, entry, evidence):
             default=(0.0, None, True, "missing"),
             key=lambda item: item[0],
         )
+        # A background call is observable once its notification was judged, in either
+        # direction; only a launch nothing ever reported on is not.
         current_external = (
-            foreground
+            (foreground or call_id in evidence.get("background_judged", ()))
             and call_ts >= durable_ts
             and result_ts >= durable_ts
         )

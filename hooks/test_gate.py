@@ -983,6 +983,16 @@ def background_review_events(now, task_id, out_file, ack_text, notify_status="co
 
 tasks_dir = os.path.join(AGENT_HOME, "tasks")
 os.makedirs(tasks_dir, exist_ok=True)
+
+
+def write_review_output(path, text, finished_at):
+    """A background task's output file as the harness leaves it: last written when the task ended."""
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    os.utime(path, (finished_at, finished_at))
+
+
+DETACHED_ACK = "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."
 for label, ack in (
     ("a detached launch",
      "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."),
@@ -994,8 +1004,7 @@ for label, ack in (
         now = time.time()
         task_id = "btask" + uuid.uuid4().hex[:5]
         out_file = os.path.join(tasks_dir, task_id + ".output")
-        with open(out_file, "w", encoding="utf-8") as stream:
-            stream.write(codex_cli_output(review_text("APPROVED")))
+        write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 601)
         seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
         events = background_review_events(now, task_id, out_file, ack.format(id=task_id, out=out_file))
         log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
@@ -1090,6 +1099,115 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a background lane's evidence has to be the harness's record, and it serves --required too
+sid = session()
+try:
+    now = time.time()
+    task_id = "brew" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 100)
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("an output file rewritten after the notification binds nothing",
+          result.get("decision") == "block" and "systemMessage" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "breq" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 601)
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-req", REQUIRED_CODEX_COMMAND, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-req", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; required Codex evidence bound in the background"})
+    check("a required Codex review bound in the background satisfies the requirement",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "breqf" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-req", REQUIRED_CODEX_COMMAND, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-req", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; required Codex evidence unavailable"})
+    check("a failed required background review cannot close as verified",
+          result.get("decision") == "block", result)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: required Codex evidence unavailable"})
+    check("a required background review that failed is an unavailable reviewer for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a foreground review that mentions a background task is still a review
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    spoken = ("Command running in background with ID: example. Output is being written to: "
+              "C:/tmp/example.output. That earlier run is unrelated to this verdict.\n"
+              + review_text("APPROVED"))
+    add_codex_review(events, now - 700, "codex-fg", CODEX_CLI_COMMAND, codex_cli_output(spoken))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the foreground"})
+    check("a foreground result starting with the launch wording is judged as a review",
+          result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a server started before the candidate opened is still this session's running work
+sid = session()
+try:
+    now = time.time()
+    server_id = "bsrv" + uuid.uuid4().hex[:5]
+    server_out = os.path.join(tasks_dir, server_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [
+        bash_use(now - 3000, "srv-call", "npm run dev", run_in_background=True),
+        tool_result(now - 2999, "srv-call", DETACHED_ACK.format(id=server_id, out=server_out)),
+        skill_use(now - 890, "development-verification", "skill-dev"),
+    ]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; the suite is still running"})
+    check("a background task launched before the candidate lets the turn end",
+          result.get("continue") is True and server_id in result.get("systemMessage", ""), result)
+    events.append(entry(now - 500, "assistant", [{
+        "type": "tool_use", "id": "stop-srv", "name": "TaskStop", "input": {"task_id": server_id},
+    }]))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; the suite is still running"})
+    check("stopping that task ends the allowance", result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
 # --- the ledger records the decision
 sid = session()
 try:
@@ -1110,14 +1228,41 @@ for command, expected in (
     ("python -c rewrite_source", True),
     ("python - <<'PY'\nimport io\nPY", True),
     ("ls > out.txt", True),
-    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err", False),
+    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err", True),
     ("git merge --no-ff chip/x", True),
-    ("git commit -m x && git push", False),
+    ("git commit -m x && git push", True),
     ("sed -i 's/a/b/' file.py", True),
+    ("rg pattern | tee reviewed.py", True),
+    ("truncate -s 0 reviewed.py", True),
+    ("echo hi 1> reviewed.py", True),
+    ("grep -rn foo . 2>/dev/null | head -5", False),
+    ("cat a.txt 2>&1 | head", False),
+    ("git branch --show-current && git remote -v && git stash list", False),
+    ("git branch new-branch", True),
+    ("git stash", True),
+    ("for f in *.py; do cat $f; done", True),
+    ("curl -sL https://example.org | head", True),
+    ("ls $(pwd)", True),
+    ('PYTHONIOENCODING=utf-8 timeout 30 "C:/tools/python.exe" -c pass', True),
+    ("", False),
 ):
     check("write-capable: {!r} -> {}".format(command[:50], expected),
           marker_hook.write_capable({"tool_name": "Bash", "tool_input": {"command": command}}) is expected,
           command)
+
+for command, expected in (
+    ("Get-Content x.py | Select-String foo", False),
+    ("Get-ChildItem -Recurse | Where-Object { $_.Length -gt 5MB }", True),
+    ("Set-Content x.py 'y'", True),
+    ("git status --porcelain | Measure-Object -Line", False),
+):
+    check("write-capable (PowerShell): {!r} -> {}".format(command[:50], expected),
+          marker_hook.write_capable({"tool_name": "PowerShell", "tool_input": {"command": command}}) is expected,
+          command)
+check("the ledger keeps only the executable of a command",
+      marker_hook.command_label('cd "C:/repo" && python deploy.py --token=SECRET') == "cd"
+      and marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h") == "curl",
+      marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h"))
 
 with tempfile.TemporaryDirectory(prefix="cwg_quiet_") as outside:
     sid = session()
