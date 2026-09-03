@@ -265,11 +265,15 @@ python "~/.claude/hooks/gate_inbox.py" report --session <session id> --nonce <no
 
 Copy the command from the block text: it carries the session id, the transcript path and the
 nonce the hook minted for that block, and the receipt is accepted only for a report carrying
-that nonce. It prints an id; end with `[gate] anomaly-reported: <id>; <the contradiction in one line>`. The
-hook accepts that receipt only after it has blocked this candidate, for a report filed after
-that block and quoting its reason, and closes the candidate UNVERIFIED with the report attached
-— once per candidate, never as `verified`. The report reaches the gate-ops session, which fixes
-the hook or this skill; overuse shows up there as a pattern and is treated as one.
+that nonce. It prints an id and the message for the gate-ops session: deliver that message at
+once with `mcp__ccd_session_mgmt__send_message` to the session id it names (or `SendMessage`
+to the name it gives when that tool is absent), then go on with your work — the report is
+handled there, not by you, and no reply is needed. End with
+`[gate] anomaly-reported: <id>; <the contradiction in one line>`. The hook accepts that
+receipt only after it has blocked this candidate, for a report filed after that block and
+quoting its reason, and closes the candidate UNVERIFIED with the report attached — once per
+candidate, never as `verified`. Overuse shows up in the gate-ops session as a pattern and is
+treated as one.
 
 ## Incident hotfix order
 

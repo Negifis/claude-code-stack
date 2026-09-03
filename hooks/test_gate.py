@@ -1486,6 +1486,31 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a report is delivered to the registered gate-ops session, or stays in the inbox
+registry = os.path.join(CLAUDE_CONFIG_DIR, "state", "gate-ops-session.json")
+if os.path.exists(registry):
+    os.remove(registry)
+sid = session()
+code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
+check("without a gate-ops session the report stays in the inbox",
+      code == 0 and "No gate-ops session is registered" in out and "[gate anomaly] report" in out, out)
+inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+code, out, err = inbox("register", "--session", "ops-session-1", "--name", "in-50 [915105]", "--title", "Gate ops")
+check("a session registers as the gate-ops session", code == 0 and "ops-session-1" in out and os.path.exists(registry), err)
+code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y", "--did", "continued")
+check("a report names the registered session and the messaging tool",
+      code == 0 and 'session_id "ops-session-1"' in out and "mcp__ccd_session_mgmt__send_message" in out
+      and 'SendMessage to "in-50 [915105]"' in out and "did: continued" in out and "show:" in out, out)
+inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+with open(registry, "w", encoding="utf-8") as stream:
+    stream.write("[1, 2]")
+code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
+check("a corrupt registry means no gate-ops session, not a crash",
+      code == 0 and "No gate-ops session is registered" in out, err)
+inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+os.remove(registry)
+cleanup(sid)
+
 # --- the inbox digest reaches only a session started in the config home; the scan derives ledger anomalies
 pending = file_report(session(), "HIGH candidate lacks a current APPROVED verdict")
 code, out, _ = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR, "hook_event_name": "SessionStart"}))

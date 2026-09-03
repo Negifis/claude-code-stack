@@ -9,6 +9,11 @@ the gate's own ledger by fixed rules. The gate-ops session reads the unresolved 
                        [--did "<what was done instead>"] [--kind <label>] [--session <id>]
                        [--transcript <path>] [--nonce <nonce from the block text>]
   gate_inbox.py list | show <id> | ack <id> [--note "<what fixed it>"] | scan | digest
+  gate_inbox.py register [--title "<name>"]      # this session becomes the gate-ops session
+
+Delivery is push, not pull: `report` prints the message to send to the registered gate-ops
+session with the session-messaging tool, so the report starts a turn there while the reporting
+session goes on with its work; the inbox file is the record and the fallback.
 
 A report is evidence for the person who maintains the gate, never a key that opens it: the Stop
 hook accepts `[gate] anomaly-reported: <id>; <fact>` only after it has blocked the candidate,
@@ -39,6 +44,42 @@ RULE_ALIASES = {"verdict-expired-after-review": "verdict-expired-after-approval"
 
 def inbox_path():
     return os.path.join(cwg.config_home(), "state", "gate-anomalies.jsonl")
+
+
+def registry_path():
+    return os.path.join(cwg.config_home(), "state", "gate-ops-session.json")
+
+
+def gate_ops():
+    """The registered gate-ops session, or an empty dict."""
+    data = cwg.read_json(registry_path())
+    return data if isinstance(data, dict) and isinstance(data.get("session_id"), str) else {}
+
+
+def delivery(record):
+    """The message that carries a report to the gate-ops session, and how to send it."""
+    ops = gate_ops()
+    body = (
+        "[gate anomaly] report {id} from session {session} ({cwd})\n"
+        "block: {block}\n"
+        "facts: {facts}\n"
+        "did: {did}\n"
+        "transcript: {transcript}\n"
+        "show: python \"{inbox}\" show {id}"
+    ).format(id=record["id"], session=record.get("session_id") or record["session"],
+             cwd=record.get("cwd") or "?", block=record.get("block_reason") or "",
+             facts=record.get("facts") or "", did=record.get("did") or "-",
+             transcript=record.get("transcript") or "?",
+             inbox=os.path.join(HERE, "gate_inbox.py"))
+    if not ops:
+        return body, ("No gate-ops session is registered (gate_inbox.py register there); the "
+                      "report stays in the inbox for the next gate-ops session start.")
+    how = (
+        "Deliver it now, then continue your work: call mcp__ccd_session_mgmt__send_message with "
+        "session_id \"{sid}\" and the message above (it arrives there as a turn). If that tool is "
+        "not available, SendMessage to \"{name}\"; if neither is, the inbox holds the report."
+    ).format(sid=ops["session_id"], name=ops.get("name") or ops["session_id"])
+    return body, how
 
 
 def read_jsonl(path):
@@ -171,8 +212,33 @@ def report(args):
         "hook_view": hook_view(transcript, marker, key),
     }
     append(record)
+    body, how = delivery(record)
     print("GATE_ANOMALY: {}".format(record["id"]))
+    print("--- message for the gate-ops session ---")
+    print(body)
+    print("--- delivery ---")
+    print(how)
     print("Close with: [gate] anomaly-reported: {}; <the verifiable contradiction, one line>".format(record["id"]))
+    return 0
+
+
+def register(args):
+    """Make the calling session the gate-ops session that reports are delivered to."""
+    # The id the messaging tool takes is the desktop app's session id (`get_session self` →
+    # sessionId), not the hook-side CLAUDE_CODE_SESSION_ID, so it has to be given explicitly.
+    session_id = (args.session or "").strip()
+    if not session_id:
+        print("GATE_OPS: pass --session <sessionId from mcp__ccd_session_mgmt__get_session self>",
+              file=sys.stderr)
+        return 2
+    record = {"session_id": session_id, "name": (args.name or "").strip(),
+              "title": (args.title or "").strip(), "registered_at": time.time(),
+              "cwd": os.getcwd()}
+    if not cwg.write_json(registry_path(), record):
+        print("GATE_OPS: could not write {}".format(registry_path()), file=sys.stderr)
+        return 1
+    print("GATE_OPS: reports will be delivered to session {}{}".format(
+        session_id, " ({})".format(record["name"]) if record["name"] else ""))
     return 0
 
 
@@ -324,6 +390,11 @@ def main(argv):
     acking.add_argument("--note", default="")
     acking.set_defaults(run=ack)
     commands.add_parser("scan").set_defaults(run=scan)
+    registering = commands.add_parser("register")
+    registering.add_argument("--session", default="", help="the desktop app's sessionId of this session (get_session self)")
+    registering.add_argument("--name", default="", help="the name ListAgents shows for this session")
+    registering.add_argument("--title", default="", help="the session's title, for the record")
+    registering.set_defaults(run=register)
     commands.add_parser("digest").set_defaults(run=digest)
     args = parser.parse_args(argv)
     return args.run(args)

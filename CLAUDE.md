@@ -64,8 +64,9 @@ checks, one bounded simplify lane, one review lane per round, finite closure, an
   lets a turn end while this session's own background task (a review, a suite, a server) is
   in flight: wait for the notification, never poll.
 - A block that contradicts facts verifiable in the transcript is reported
-  (`gate_inbox.py report`) and closed as `anomaly-reported`, never argued with by re-running
-  lanes; the gate-ops session started from `~/.claude` reads the inbox.
+  (`gate_inbox.py report`), the report is sent to the registered gate-ops session with the
+  session-messaging tool, and the candidate closes as `anomaly-reported` — never argued with
+  by re-running lanes.
 - Active production incident: mitigate user-visible harm with the smallest reversible step
   first, then finish proportionate verification and report both separately.
 
