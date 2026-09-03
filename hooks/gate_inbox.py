@@ -9,7 +9,8 @@ the gate's own ledger by fixed rules. The gate-ops session reads the unresolved 
                        [--did "<what was done instead>"] [--kind <label>] [--session <id>]
                        [--transcript <path>] [--nonce <nonce from the block text>]
   gate_inbox.py list | show <id> | ack <id> [--note "<what fixed it>"] | scan | digest
-  gate_inbox.py register [--title "<name>"]      # this session becomes the gate-ops session
+  gate_inbox.py register --session <sessionId> [--name "<ListAgents name>"] [--title "<title>"]
+                                                 # this session becomes the gate-ops session
 
 Delivery is push, not pull: `report` prints the message to send to the registered gate-ops
 session with the session-messaging tool, so the report starts a turn there while the reporting
@@ -51,9 +52,15 @@ def registry_path():
 
 
 def gate_ops():
-    """The registered gate-ops session, or an empty dict."""
+    """The registered gate-ops session, or an empty dict for any registry that names none."""
     data = cwg.read_json(registry_path())
-    return data if isinstance(data, dict) and isinstance(data.get("session_id"), str) else {}
+    if not isinstance(data, dict):
+        return {}
+    session_id = data.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return {}
+    name = data.get("name")
+    return dict(data, session_id=session_id.strip(), name=name.strip() if isinstance(name, str) else "")
 
 
 def delivery(record):
@@ -236,6 +243,7 @@ def register(args):
     record = {"session_id": session_id, "name": (args.name or "").strip(),
               "title": (args.title or "").strip(), "registered_at": time.time(),
               "cwd": os.getcwd()}
+    os.makedirs(os.path.dirname(registry_path()), exist_ok=True)
     if not cwg.write_json(registry_path(), record):
         print("GATE_OPS: could not write {}".format(registry_path()), file=sys.stderr)
         return 1

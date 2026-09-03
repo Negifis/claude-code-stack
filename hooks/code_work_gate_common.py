@@ -228,6 +228,15 @@ def config_home():
     return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
 
 
+def normalized(text):
+    return " ".join(str(text or "").split()).lower()
+
+
+def packet_capture_path(session_key_, tool_use_id):
+    """Where the marker hook keeps what a Codex launch fed on stdin, for the Stop hook to bind by."""
+    return os.path.join(tempfile.gettempdir(), "cwg_packet_{}_{}.json".format(session_key_, tool_use_id))
+
+
 def codex_home():
     return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 

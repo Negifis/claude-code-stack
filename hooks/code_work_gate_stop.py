@@ -472,26 +472,30 @@ def codex_produced(text, started, finished, since):
     )
 
 
-PACKET_REDIRECT_RE = re.compile(r"<\s*\"?([^\s\"<>|;&]+\.md)\"?")
+# A packet shorter than this is not distinctive enough to name a session.
+PACKET_MIN_CHARS = 200
 
 
-def packet_text_of(command):
-    """The normalized text of the packet a launch fed to Codex on stdin, or empty.
+def packet_of_launch(command, call_id):
+    """(fed_on_stdin, packet_text) for a Codex launch, from what the marker hook captured.
 
     The packet is what the session was given, and Codex logs it verbatim, so it names the one
-    session among several that this launch started. A packet the model rewrote after the launch
-    no longer matches what was logged and binds nothing, which is the right direction too.
+    session among several that this launch started. It is read from the capture the marker hook
+    took before the command ran — not from the file, which the model may have rewritten since.
+    A launch that fed a packet but left no usable capture binds nothing.
     """
-    match = PACKET_REDIRECT_RE.search(str(command or ""))
-    if not match:
-        return ""
     try:
-        import codex_lane
-        path = codex_lane.windows_path(match.group(1))
-        with open(path, encoding="utf-8", errors="replace") as stream:
-            return normalized(stream.read())
-    except (OSError, ImportError):
-        return ""
+        import code_work_gate_mark as mark
+        fed = bool(mark.codex_packet_path(command))
+    except Exception:
+        fed = "<" in str(command or "")
+    if not fed:
+        return False, ""
+    capture = cwg.read_json(cwg.packet_capture_path(_SESSION["key"], str(call_id or "")))
+    text = capture.get("text") if isinstance(capture, dict) else ""
+    if not isinstance(text, str) or len(text) < PACKET_MIN_CHARS or capture.get("truncated"):
+        return True, ""
+    return True, text
 
 
 def session_given(path, mtime_ns, size, started, finished, packet):
@@ -506,7 +510,7 @@ def session_given(path, mtime_ns, size, started, finished, packet):
     return any(packet in heard for heard in _CODEX_GIVEN.get((path, mtime_ns, size, started, finished), ()))
 
 
-def rollout_verdict(started, finished, since, command=""):
+def rollout_verdict(started, finished, since, command="", call_id=""):
     """The verdict one briefed Codex session stated between a background launch and its notification.
 
     The task's output file is the harness's copy of what Codex printed, and nothing keeps it that
@@ -516,7 +520,9 @@ def rollout_verdict(started, finished, since, command=""):
     briefed session may have spoken there — two are ambiguous, and an ambiguous verdict binds
     to nothing, which is the safe direction.
     """
-    packet = packet_text_of(command)
+    fed, packet = packet_of_launch(command, call_id)
+    if fed and not packet:
+        return None
     verdicts = {}
     for path, _ in codex_run_files(since):
         try:
@@ -633,7 +639,7 @@ def transcript_evidence(path, since, skill_since=None):
                             # is for the parent to read, not evidence.
                             control = (
                                 rollout_verdict(call["started"], stamp, skill_since,
-                                                call.get("command", ""))
+                                                call.get("command", ""), call["call_id"])
                                 if status == "completed" else None
                             )
                             bound = control is not None
@@ -1185,7 +1191,35 @@ def latest(events):
     return max(events, default=(0.0, None), key=lambda item: item[0])
 
 
-def active_review_start(evidence, last_ts):
+def content_at(entry, stamp):
+    """The fingerprint the candidate's lasting paths had at this moment, or None when unknown."""
+    current = None
+    for mark in entry.get("content_marks") or []:
+        if not isinstance(mark, dict) or not cwg.valid_ts(mark.get("ts")):
+            continue
+        if float(mark["ts"]) <= stamp:
+            current = mark.get("fp")
+        else:
+            break
+    return current if isinstance(current, str) else None
+
+
+def covers(entry, stamp, durable_ts):
+    """Whether evidence stated at this moment still describes the candidate on disk.
+
+    Freshness is measured against content, not against edit events: a verdict given before an
+    edit that was later reverted covers exactly the bytes the reviewer read. Without content
+    marks — a marker written before they existed, or a change the snapshot could not attribute —
+    the strict rule stands: nothing older than the last durable change covers it.
+    """
+    if stamp >= durable_ts:
+        return True
+    marks = entry.get("content_marks") or []
+    now_fp = content_at(entry, float("inf")) if marks else None
+    return now_fp is not None and content_at(entry, stamp) == now_fp
+
+
+def active_review_start(evidence, stale):
     """Timestamp after which the ordinary review record still describes this candidate.
 
     An APPROVED ends the gate, so a marked edit after one retires it together with the round
@@ -1199,7 +1233,7 @@ def active_review_start(evidence, last_ts):
     """
     start = -1.0
     for stamp, verdict in evidence["ordinary_reviews"]:
-        if verdict == "APPROVED" and stamp < last_ts:
+        if verdict == "APPROVED" and stale(stamp):
             start = max(start, stamp)
     return start
 
@@ -1236,7 +1270,8 @@ def evaluate_receipt(receipt, entry, evidence):
     if not cwg.valid_ts(durable_ts):
         durable_ts = last_ts
 
-    review_start = active_review_start(evidence, durable_ts)
+    current = lambda stamp: covers(entry, stamp, durable_ts)  # noqa: E731
+    review_start = active_review_start(evidence, lambda stamp: not current(stamp))
     ordinary_reviews = [
         item for item in evidence["ordinary_reviews"] if item[0] > review_start
     ]
@@ -1302,7 +1337,7 @@ def evaluate_receipt(receipt, entry, evidence):
     ordinary_ts, ordinary_verdict = latest(ordinary_reviews)
     closure_ts, closure_verdict = latest(evidence["closure_reviews"])
     failed_ts = max(evidence["review_failures"], default=0.0)
-    current_failure = failed_ts >= durable_ts
+    current_failure = current(failed_ts)
     required_external_calls = [
         call
         for call in evidence["external_calls"]
@@ -1328,8 +1363,8 @@ def evaluate_receipt(receipt, entry, evidence):
         # direction; only a launch nothing ever reported on is not.
         current_external = (
             (foreground or call_id in evidence.get("background_judged", ()))
-            and call_ts >= durable_ts
-            and result_ts >= durable_ts
+            and current(call_ts)
+            and current(result_ts)
         )
         required_external_success = (
             current_external and result_status == "success"
@@ -1376,7 +1411,7 @@ def evaluate_receipt(receipt, entry, evidence):
         if ordinary_verdicts and ordinary_verdict != "APPROVED":
             return False, "an invoked review has no terminal APPROVED verdict"
         if risk == "HIGH" and not (
-            ordinary_verdict == "APPROVED" and ordinary_ts >= durable_ts
+            ordinary_verdict == "APPROVED" and current(ordinary_ts)
         ):
             return False, "HIGH candidate lacks a current APPROVED verdict"
         return True, "verified"
@@ -1395,14 +1430,14 @@ def evaluate_receipt(receipt, entry, evidence):
             ).format(kind)
 
     if kind == "pr-ready":
-        if not (closure_verdict == "READY" and closure_ts >= durable_ts):
+        if not (closure_verdict == "READY" and current(closure_ts)):
             return False, "pr-ready lacks current CLOSURE_VALIDATION: READY"
         return True, "pr-ready"
 
     if closure_verdict == "READY":
         return False, "draft-blocked conflicts with CLOSURE_VALIDATION: READY"
     if not (
-        (closure_verdict == "BLOCKED" and closure_ts >= durable_ts)
+        (closure_verdict == "BLOCKED" and current(closure_ts))
         or (
             current_failure
             and (ordinary_verdict != "ESCALATE" or failed_ts > ordinary_ts)

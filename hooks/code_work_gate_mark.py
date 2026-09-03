@@ -110,7 +110,7 @@ READ_ONLY_COMMANDS = frozenset("""
     cd ls dir cat head tail grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
     stat file du df pwd echo printf date true false test [ type which where whoami
     printenv jq column nl tac basename dirname realpath readlink md5sum sha1sum sha256sum tree
-    ps tasklist nproc uname sleep gh
+    ps tasklist nproc uname sleep
     get-childitem get-content get-item get-command select-string select-object measure-object
     format-table format-list out-string write-output write-host test-path resolve-path
     get-process get-location get-date sort-object gci gc gi sls findstr
@@ -138,10 +138,21 @@ MUTATING_ARGS = {
     "tree": re.compile(r"(?:^|\s)-(?!-)\w*o"),
     "date": re.compile(r"(?:^|\s)(?:-s\b|--set\b)"),
     "git": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
-    # gh talks to GitHub; only these forms touch the working tree or the local clone.
-    "gh": re.compile(r"^\s*(?:pr\s+(?:checkout|merge)|repo\s+(?:clone|sync|fork|create)|"
-                     r"release\s+download|run\s+download|gist\s+clone|codespace|auth)\b"),
 }
+# gh talks to GitHub; only these forms are known not to touch the working tree or the local
+# clone. Anything else — `pr checkout`, `repo clone`, an alias, an extension — is write-capable.
+GH_READ_RE = re.compile(
+    r"^(?:(?:-R|--repo)(?:=\S+|\s+\S+)\s+)*(?:"
+    r"pr\s+(?:view|list|status|diff|checks|comment|edit|create|close|reopen|review|ready)|"
+    r"issue\s+(?:view|list|status|create|comment|edit|close|reopen)|repo\s+(?:view|list)|"
+    r"api|run\s+(?:view|list|watch)|release\s+(?:view|list)|search\s+\S+|label\s+list|"
+    r"auth\s+status|browse)\b"
+)
+# What a Codex launch feeds on stdin, read before the command runs: the Stop hook binds the
+# verdict to the session that was given exactly this text, whatever the file holds later.
+CODEX_SEGMENT_RE = re.compile(r"\bcodex\s+exec\b")
+STDIN_REDIRECT_RE = re.compile(r"(?<![<>])<(?!<)\s*\"?([^\s\"<>|;&]+)\"?")
+PACKET_KEEP_BYTES = 256 * 1024
 # `-c key=value` is not skipped: it can point a reading subcommand at an external program
 # (`diff.external`, `core.fsmonitor`), and so falls through as an unknown subcommand.
 GIT_GLOBAL_OPTIONS_RE = re.compile(
@@ -155,6 +166,13 @@ HARMLESS_REDIRECT_RE = re.compile(r"2>\s*(?:/dev/null|\$null|nul\b)|2>&1|1>&2|>&
 SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\r\n]")
 ENV_ASSIGNMENT_RE = re.compile(r"^\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s*")
 WRAPPER_RE = re.compile(r"^(?:timeout\s+(?:-\S+\s+)*\S+|time|nohup|command|builtin)\s+")
+# A verdict covers content, not edit events: the marker keeps a fingerprint of its lasting
+# paths at every durable change, so an edit that was reverted leaves the approved content — and
+# the approval — in place. Bounded so a wide candidate costs nothing: past these limits the
+# fingerprint is unknown and freshness falls back to the timestamp rule.
+FINGERPRINT_MAX_FILES = 64
+FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
+CONTENT_MARKS_KEPT = 32
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
 SHELL_UNKNOWN = "UNKNOWN_OR_MUTATING"
@@ -200,7 +218,9 @@ def command_label(command):
     `$token='…'`, a quoted path with spaces — is not copied at all, so no value it carries can
     reach the ledger.
     """
-    first = SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0] if command else ""
+    if not command.strip():
+        return ""
+    first = SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0]
     head = command_head(first)[0]
     return head if SAFE_LABEL_RE.match(head) else "(unrecognized)"
 
@@ -237,6 +257,10 @@ def read_only_pipeline(command):
             return False
         if head == "git":
             if git_read_only(rest):
+                continue
+            return False
+        if head == "gh":
+            if GH_READ_RE.match(rest.strip()):
                 continue
             return False
         if head not in READ_ONLY_COMMANDS:
@@ -703,6 +727,7 @@ def cycle_start(marker, now, identity, incoming):
         "identity": identity,
         "last_durable_ts": 0.0,
         "unattributed_durable": False,
+        "content_marks": [],
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -726,6 +751,7 @@ def cycle_start(marker, now, identity, incoming):
             "identity": stored if mismatch else (identity or stored),
             "last_durable_ts": float(carried) if cwg.valid_ts(carried) else 0.0,
             "unattributed_durable": bool(existing.get("unattributed_durable")),
+            "content_marks": list(existing.get("content_marks") or []),
         }
     if os.path.exists(marker):
         try:
@@ -830,7 +856,15 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
+    content_marks = cycle.get("content_marks") or []
     if last_durable_ts == now:
+        # A change the snapshot could not attribute may have touched anything, so the content
+        # after it is unknown; a named edit leaves the lasting paths' bytes to be measured.
+        fingerprint = (
+            None if (unattributed_risk or not cwg.durable_paths(incoming))
+            else content_fingerprint(paths)
+        )
+        content_marks = content_marks_after(content_marks, now, fingerprint)
         cwg.log_event(
             "durable", session=cwg.session_key(data.get("session_id")),
             reason=("edit" if cwg.durable_paths(incoming) else
@@ -838,6 +872,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
             paths=[p for p in cwg.durable_paths(incoming)][:5],
             tool=str(data.get("tool_name") or ""),
             command=command_label(str((data.get("tool_input") or {}).get("command") or "")),
+            fp=(fingerprint or "")[:12],
         )
     return cwg.write_json(marker, {
         "first_ts": cycle["first_ts"],
@@ -850,7 +885,71 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "path_overflow": overflow,
         "identity": cycle["identity"],
         "unattributed_durable": unattributed_durable,
+        "content_marks": content_marks,
     })
+
+
+def codex_packet_path(command):
+    """The file a `codex exec` segment reads on stdin, or empty when it feeds none."""
+    for segment in SEGMENT_SPLIT_RE.split(str(command or "")):
+        if not CODEX_SEGMENT_RE.search(segment):
+            continue
+        matches = STDIN_REDIRECT_RE.findall(segment)
+        if not matches:
+            return ""
+        import codex_lane
+        return codex_lane.windows_path(matches[-1])
+    return ""
+
+
+def capture_packet(data, session):
+    """Keep what this launch is about to feed Codex, so a later rewrite of the file changes nothing."""
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    path = codex_packet_path(command)
+    if not path or not data.get("tool_use_id"):
+        return
+    import hashlib
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(PACKET_KEEP_BYTES + 1)
+    except OSError:
+        raw = b""
+    text = cwg.normalized(raw[:PACKET_KEEP_BYTES].decode("utf-8", "replace"))
+    cwg.write_json(cwg.packet_capture_path(session, str(data.get("tool_use_id"))), {
+        "path": path, "ts": time.time(), "text": text,
+        "digest": hashlib.sha256(raw).hexdigest() if raw else "",
+        "truncated": len(raw) > PACKET_KEEP_BYTES,
+    })
+
+
+def content_fingerprint(paths):
+    """A digest of the lasting paths' current bytes, or None when it cannot be known cheaply."""
+    import hashlib
+    durable = sorted(set(cwg.durable_paths(paths)))
+    if not durable or len(durable) > FINGERPRINT_MAX_FILES:
+        return None
+    digest = hashlib.sha256()
+    for path in durable:
+        digest.update(path.encode("utf-8", "replace") + b"\0")
+        try:
+            if os.path.getsize(path) > FINGERPRINT_MAX_BYTES:
+                return None
+            with open(path, "rb") as stream:
+                digest.update(stream.read())
+        except FileNotFoundError:
+            digest.update(b"<missing>")
+        except OSError:
+            return None
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def content_marks_after(marks, now, fingerprint):
+    """The marks with this change appended: a new one only when the content actually differs."""
+    kept = [mark for mark in (marks or []) if isinstance(mark, dict)]
+    if not kept or fingerprint is None or kept[-1].get("fp") != fingerprint:
+        kept.append({"ts": now, "fp": fingerprint})
+    return kept[-CONTENT_MARKS_KEPT:]
 
 
 def candidate_note(before, after):
@@ -922,6 +1021,7 @@ def main():
 
         if event == "PreToolUse":
             if is_shell:
+                capture_packet(data, session)
                 if policy != SHELL_READ_ONLY:
                     started = time.time()
                     # The window is published before the command runs, so a session resolving a

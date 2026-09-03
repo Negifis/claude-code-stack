@@ -268,6 +268,8 @@ CODEX_COMMAND = 'node "codex-companion.mjs" adversarial-review "--wait CODE_WORK
 REQUIRED_CODEX_COMMAND = CODEX_COMMAND[:-1] + ' CODE_WORK_GATE_REQUIRED"'
 CODEX_ERRAND_COMMAND = 'node "codex-companion.mjs" review "--wait CODE_WORK_GATE_REVIEW"'
 CODEX_CLI_COMMAND = "codex exec --json - < /c/tmp/packet-CODE_WORK_GATE_REVIEW.md"
+# A launch that feeds no packet on stdin: bound by the single-session rule, no capture needed.
+CODEX_BG_COMMAND = "codex exec --json -  # CODE_WORK_GATE_REVIEW"
 
 
 def review_text(verdict, subject="the auth session candidate"):
@@ -991,7 +993,7 @@ def midturn_notification(stamp, task_id, output_file, status="completed"):
 def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
     events = [skill_use(now - 890, "development-verification", "skill-dev")]
     simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
-    events.append(bash_use(now - 700, "codex-" + task_id, CODEX_CLI_COMMAND,
+    events.append(bash_use(now - 700, "codex-" + task_id, CODEX_BG_COMMAND,
                            run_in_background=(True if "running in background" in ack_text else None)))
     events.append(tool_result(now - 699, "codex-" + task_id, ack_text))
     if notify:
@@ -1069,7 +1071,7 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=old - 200, last_ts=old - 100, durable_ts=old - 100)
     events = [skill_use(old - 190, "development-verification", "skill-dev")]
     simplify_wave(events, old - 180, "simplify", SIMPLIFY_LENSES)
-    events.append(bash_use(old, "codex-dead", CODEX_CLI_COMMAND, run_in_background=True))
+    events.append(bash_use(old, "codex-dead", CODEX_BG_COMMAND, run_in_background=True))
     events.append(tool_result(old + 1, "codex-dead", DETACHED_ACK.format(id=task_id, out=out_file)))
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
@@ -1117,6 +1119,63 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
+def marker_with_marks(sid, marks):
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=marks[-1][0], durable_ts=marks[-1][0])
+    marker, _ = gate_paths(sid)
+    data = cwg.read_json(marker)
+    data["content_marks"] = [{"ts": stamp, "fp": fp} for stamp, fp in marks]
+    cwg.write_json(marker, data)
+
+
+for label, marks, verdict_at, expect in (
+    ("an approval between an edit and its byte-identical revert still covers the candidate",
+     [(110.0, "fpA"), (140.0, "fpB"), (150.0, "fpA")], 120.0, True),
+    ("an approval of content that was changed since does not",
+     [(110.0, "fpA"), (140.0, "fpB"), (150.0, "fpA")], 145.0, False),
+    ("a change the snapshot could not attribute leaves the content unknown",
+     [(110.0, "fpA"), (150.0, None)], 120.0, False),
+    ("a marker without content marks keeps the strict timestamp rule",
+     [], 120.0, False),
+):
+    sid = session()
+    try:
+        if marks:
+            marker_with_marks(sid, marks)
+        else:
+            seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=150.0, durable_ts=150.0)
+        events = base_events(include_simplify=True)
+        add_review(events, verdict_at, "review-content", review_text("APPROVED"))
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; reviewed"})
+        allowed = result.get("continue") is True and "decision" not in result
+        check(label, allowed is expect, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+with tempfile.TemporaryDirectory(prefix="cwg_marks_") as tree:
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        target = os.path.join(tree, "src", "app.py")
+        os.makedirs(os.path.dirname(target))
+        for content in ("print('a')\n", "print('b')\n", "print('a')\n"):
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write(content)
+            run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                            "cwd": tree, "tool_input": {"file_path": target}})
+        marks = (cwg.read_json(marker) or {}).get("content_marks") or []
+        check("the marker fingerprints the lasting paths at every durable change",
+              len(marks) == 3 and marks[0]["fp"] == marks[2]["fp"] != marks[1]["fp"]
+              and all(isinstance(m["fp"], str) and len(m["fp"]) == 64 for m in marks), marks)
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        marks = (cwg.read_json(marker) or {}).get("content_marks") or []
+        check("an edit that changed nothing adds no mark", len(marks) == 3, marks)
+    finally:
+        cleanup(sid)
+
 # --- a notification absorbed mid-turn is read from the queue records the harness leaves
 sid = session()
 try:
@@ -1152,11 +1211,19 @@ finally:
     cleanup(sid, locals().get("transcript"))
 
 # --- the packet the launch fed in names the session among several running at once
-for label, packet_on_disk, expect_bound in (
+def capture_launch(sid, call_id, command):
+    """What the marker hook does before a Codex launch runs: keep the packet it feeds."""
+    run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_use_id": call_id, "cwd": AGENT_HOME, "tool_input": {"command": command}})
+
+
+for label, packet_on_disk, rewrite_after, expect_bound in (
     ("the session given this launch's packet is the one bound, another session alongside notwithstanding",
-     "Round 1 packet for the auth candidate", True),
-    ("a packet rewritten after the launch matches no session and binds nothing",
-     "Round 1 packet rewritten afterwards", False),
+     "Round 1 packet for the auth candidate", None, True),
+    ("a packet rewritten after the launch still binds the session the launch fed",
+     "Round 1 packet for the auth candidate", "Round 1 packet for another chat's candidate", True),
+    ("a packet naming no session binds nothing",
+     "Round 1 packet rewritten before the launch", None, False),
 ):
     sid = session()
     try:
@@ -1174,6 +1241,10 @@ for label, packet_on_disk, expect_bound in (
         if expect_bound and re.match(r"^[A-Za-z]:/", shell_path):
             shell_path = "/" + shell_path[0].lower() + shell_path[2:]
         command = 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(shell_path)
+        capture_launch(sid, "codex-" + task_id, command)
+        if rewrite_after:
+            with open(packet_file, "w", encoding="utf-8") as stream:
+                stream.write(reviewer_role_text() + "\n\n" + rewrite_after)
         events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
         events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
         events.append(notification(now - 600, task_id, out_file, "completed"))
@@ -1187,6 +1258,29 @@ for label, packet_on_disk, expect_bound in (
         check(label, bound is expect_bound, result)
     finally:
         cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bnocap" + uuid.uuid4().hex[:4]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    command = 'helper < /c/tmp/other.md && codex exec - < /c/tmp/missing-packet.md  # CODE_WORK_GATE_REVIEW'
+    events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a launch that fed a packet but left no capture binds nothing, whatever else spoke",
+          result.get("decision") == "block", result)
+    check("the stdin redirect is read from the codex segment, not the first redirect on the line",
+          marker_hook.codex_packet_path(command).replace(chr(92), "/").endswith("missing-packet.md"), marker_hook.codex_packet_path(command))
+finally:
+    cleanup(sid, locals().get("transcript"))
 
 # --- a background lane's verdict is what the rollout log says, not what the output file says
 for label, file_text, logged, expect_bound in (
@@ -1393,7 +1487,7 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
     events = [skill_use(now - 890, "development-verification", "skill-dev")]
     simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
-    events.append(bash_use(now - 700, "codex-lim", CODEX_CLI_COMMAND + " 2>" + err_path.replace("\\", "/"),
+    events.append(bash_use(now - 700, "codex-lim", CODEX_BG_COMMAND + " 2>" + err_path.replace("\\", "/"),
                            run_in_background=True))
     events.append(tool_result(now - 699, "codex-lim", DETACHED_ACK.format(id=task_id, out=out_file)))
     events.append(notification(now - 600, task_id, out_file, "failed"))
@@ -1410,9 +1504,9 @@ finally:
     cleanup(sid, locals().get("transcript"))
 
 # --- an anomaly report closes a blocked candidate UNVERIFIED, and nothing less than a report does
-def inbox(*args, stdin=None):
+def inbox(*args, stdin=None, env=None):
     proc = subprocess.run([sys.executable, GATE_INBOX] + list(args), input=stdin, text=True,
-                          encoding="utf-8", capture_output=True, check=False)
+                          encoding="utf-8", capture_output=True, check=False, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -1559,7 +1653,7 @@ try:
     err_path = os.path.join(AGENT_HOME, "codex-report-limit.err")
     with open(err_path, "w", encoding="utf-8") as stream:
         stream.write("ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 4:24 PM." + chr(10))
-    events.append(bash_use(now - 500, "codex-rl", CODEX_CLI_COMMAND + " 2>" + err_path.replace(chr(92), "/"), run_in_background=True))
+    events.append(bash_use(now - 500, "codex-rl", CODEX_BG_COMMAND + " 2>" + err_path.replace(chr(92), "/"), run_in_background=True))
     events.append(tool_result(now - 499, "codex-rl", DETACHED_ACK.format(id=limited, out=os.path.join(tasks_dir, limited + ".output"))))
     events.append(notification(now - 400, limited, os.path.join(tasks_dir, limited + ".output"), "failed"))
     transcript = write_transcript(events)
@@ -1589,13 +1683,21 @@ check("a report names the registered session and the messaging tool",
       code == 0 and 'session_id "ops-session-1"' in out and "mcp__ccd_session_mgmt__send_message" in out
       and 'SendMessage to "in-50 [915105]"' in out and "did: continued" in out and "show:" in out, out)
 inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
-with open(registry, "w", encoding="utf-8") as stream:
-    stream.write("[1, 2]")
-code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
-check("a corrupt registry means no gate-ops session, not a crash",
-      code == 0 and "No gate-ops session is registered" in out, err)
-inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+for corrupt in ("[1, 2]", '{"session_id": "   "}', '{"session_id": 5}', "not json"):
+    with open(registry, "w", encoding="utf-8") as stream:
+        stream.write(corrupt)
+    code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
+    check("a registry naming no session ({!r}) means no gate-ops session, not a crash".format(corrupt[:12]),
+          code == 0 and "No gate-ops session is registered" in out, err or out)
+    inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
 os.remove(registry)
+with tempfile.TemporaryDirectory(prefix="cwg_fresh_home_") as fresh_home:
+    fresh_env = dict(os.environ, CLAUDE_CONFIG_DIR=fresh_home)
+    code, out, err = inbox("register", "--session", "ops-fresh", env=fresh_env)
+    check("register works first thing on a fresh configuration home",
+          code == 0 and os.path.exists(os.path.join(fresh_home, "state", "gate-ops-session.json")), err)
+    code, out, err = inbox("register", env=fresh_env)
+    check("register without the session id says what to pass", code == 2 and "get_session self" in err, err)
 cleanup(sid)
 
 # --- the inbox digest reaches only a session started in the config home; the scan derives ledger anomalies
@@ -1711,8 +1813,12 @@ for command, expected in (
     ("RIPGREP_CONFIG_PATH=./evil rg foo", True),
     ("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/x.md", True),
     ("gh pr edit 2 --body-file /c/tmp/x.md && gh pr view 2 --json url", False),
+    ("gh -R o/r pr view 2 && gh --repo=o/r api repos/o/r", False),
     ("gh pr checkout 7", True),
+    ("gh --repo o/r pr checkout 7", True),
+    ("gh co 7", True),
     ("gh repo clone o/r", True),
+    ("gh extension install o/x", True),
     ("", False),
 ):
     check("write-capable: {!r} -> {}".format(command[:50], expected),
