@@ -37,22 +37,22 @@ MAX_BLOCKS_PER_CANDIDATE = 3
 # waiting stops before the ordinary block applies again.
 BACKGROUND_WAIT_LIMIT = 2 * 3600.0
 MAX_BACKGROUND_WAITS = 8
-# The harness's own acknowledgement envelopes, anchored at the start of the result: a review
-# that merely mentions a background task is still a review.
+# The harness's own acknowledgement envelopes, matched whole: a result that says anything more
+# — a review that opens by mentioning a background task — is not an acknowledgement.
 DETACHED_ACK_RE = re.compile(
-    r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\.\s*"
-    r"Output is being written to: ([^\n]+?\.output)"
+    r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\. "
+    r"Output is being written to: [^\n]+?\.output\. You will be notified when it completes\."
+    r"(?: To check interim output, use Read on that file path\.)?\s*$"
 )
 MOVED_ACK_RE = re.compile(
     r"^\s*Command did not complete within its \d+s timeout and was moved to the background "
-    r"\(ID: ?([A-Za-z0-9_-]+)\)\.\s*Output is being written to: ([^\n]+?\.output)"
+    r"\(ID: ?([A-Za-z0-9_-]+)\)\. Output is being written to: [^\n]+?\.output\. "
+    r"You will be notified when it completes\."
+    r"(?: To check interim output, use Read on that file path\.)?\s*$"
 )
 AGENT_BG_RE = re.compile(
     r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"
 )
-# A background task's output file stops changing when the task ends; one written after the
-# completion notification is no longer the harness's record of what the task printed.
-OUTPUT_SETTLE_SLACK = 15.0
 # Raw-line tokens without which a pre-candidate transcript line can contribute nothing: a skill
 # timestamp, or the background bookkeeping that spans the whole session.
 PRE_CANDIDATE_TOKENS = (
@@ -61,10 +61,6 @@ PRE_CANDIDATE_TOKENS = (
 )
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
-NOTIFICATION_FILE_RE = re.compile(r"<output-file>([^<]+)</output-file>")
-# How much of a background review's output file is read back for its verdict: the review
-# itself is a few kilobytes and the verdict is its last line.
-OUTPUT_TAIL_BYTES = 256 * 1024
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
@@ -334,7 +330,7 @@ def session_records(path, mtime_ns, size, started, finished):
     # Only what the session said after it was briefed counts, and normalizing is deferred until
     # then: an errand's output is discarded whole, which on these logs is the common case.
     _CODEX_SAID[key] = [] if briefed_at is None else [
-        (at, normalized(text)) for at, text in said if at >= briefed_at
+        (at, normalized(text), text) for at, text in said if at >= briefed_at
     ]
     return _CODEX_SAID[key]
 
@@ -411,7 +407,7 @@ def session_said(path, mtime_ns, size, started, finished, excerpt):
     """
     return any(
         started <= stamp <= finished + CODEX_RUN_SLACK and excerpt in spoken
-        for stamp, spoken in session_records(path, mtime_ns, size, started, finished)
+        for stamp, spoken, _ in session_records(path, mtime_ns, size, started, finished)
     )
 
 
@@ -452,6 +448,37 @@ def codex_produced(text, started, finished, since):
         session_said(path, mtime_ns, size, started, finished, excerpt)
         for _, path, mtime_ns, size in candidates
     )
+
+
+def rollout_verdict(started, finished, since):
+    """The verdict one briefed Codex session stated between a background launch and its notification.
+
+    The task's output file is the harness's copy of what Codex printed, and nothing keeps it that
+    way afterwards, so it is not evidence: the verdict is read from the rollout log Codex wrote
+    itself, from records stamped inside the launch-to-notification window. Exactly one briefed
+    session may have spoken there — two are ambiguous, and an ambiguous verdict binds to
+    nothing, which is the safe direction.
+    """
+    verdicts = {}
+    for path, _ in codex_run_files(since):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if stat.st_mtime < started:
+            continue
+        for stamp, _, spoken in session_records(
+            path, stat.st_mtime_ns, stat.st_size, started, finished
+        ):
+            if not started <= stamp <= finished + CODEX_RUN_SLACK:
+                continue
+            control = reviewer_control(spoken)
+            if control[0] in ("ordinary", "closure"):
+                # The session's last stated verdict inside the window is its answer.
+                verdicts[path] = control
+    if len(verdicts) != 1:
+        return None
+    return next(iter(verdicts.values()))
 
 
 def record_control(evidence, stamp, control, malformed=False):
@@ -529,8 +556,6 @@ def transcript_evidence(path, since, skill_since=None):
                     if "<task-notification>" in text:
                         status_match = NOTIFICATION_STATUS_RE.search(text)
                         status = (status_match.group(1) if status_match else "?").strip().lower()
-                        file_match = NOTIFICATION_FILE_RE.search(text)
-                        output_file = file_match.group(1).strip() if file_match else ""
                         for task_id in NOTIFICATION_ID_RE.findall(text):
                             if task_id.startswith("__orphan"):
                                 continue
@@ -538,15 +563,14 @@ def transcript_evidence(path, since, skill_since=None):
                             call = background_calls.pop(task_id, None)
                             if not call or stamp + 1 < since:
                                 continue
-                            # A backgrounded review lane reports through its output file.
-                            text_out = output_evidence(
-                                output_file or call.get("output_file") or "", stamp
+                            # A backgrounded review lane is judged from the rollout log Codex
+                            # wrote between the launch and this notification; its output file
+                            # is for the parent to read, not evidence.
+                            control = (
+                                rollout_verdict(call["started"], stamp, skill_since)
+                                if status == "completed" else None
                             )
-                            control = reviewer_control(text_out)
-                            stated = control[0] in ("ordinary", "closure")
-                            bound = stated and status == "completed" and codex_produced(
-                                text_out, call["started"], stamp, skill_since
-                            )
+                            bound = control is not None
                             evidence["external_results"].append(
                                 (stamp, call["call_id"], call["required"],
                                  "success" if bound else "failure")
@@ -561,7 +585,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 record_control(evidence, stamp, ("unbound", None), malformed=True)
                                 cwg.log_event("review", engine="codex-background",
                                               verdict=None, task=task_id, status=status,
-                                              reason="no bound verdict in the task output")
+                                              reason="no single briefed Codex verdict between "
+                                                     "launch and notification")
                     continue
                 if stamp and stamp + 1 < skill_since:
                     continue
@@ -667,16 +692,15 @@ def transcript_evidence(path, since, skill_since=None):
                     # the candidate opened is still this session's running work, so the harness's
                     # acknowledgement is read even for a call the scan did not register.
                     if call is None or call["kind"] == "external":
-                        ack = background_ack(text, None if call is None else call["foreground"])
-                        if ack:
-                            task_id, output_file = ack
+                        task_id = background_ack(text, None if call is None else call["foreground"])
+                        if task_id:
                             evidence["background"][task_id] = {
                                 "started": stamp, "kind": "shell",
                                 "label": call.get("label", "") if call else "",
                                 "review": bool(call and call.get("marked")),
                             }
                             if call and call.get("marked"):
-                                background_calls[task_id] = dict(call, output_file=output_file)
+                                background_calls[task_id] = call
                             continue
                     if call is None or (call["kind"] != "external" and not call["foreground"]):
                         launched = AGENT_BG_RE.match(text)
@@ -768,49 +792,22 @@ def user_text(entry):
     return ""
 
 
-def output_tail(path):
-    """The end of a background task's output file, or empty when it cannot be read."""
-    try:
-        with open(path, "rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            size = stream.tell()
-            stream.seek(max(0, size - OUTPUT_TAIL_BYTES))
-            return stream.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
 def background_ack(text, foreground=None):
-    """(task id, output file) when a shell result is the harness's own background envelope.
+    """The task id when a shell result is, whole, the harness's own background envelope.
 
     A detached launch acknowledges as running and a foreground call only as moved at its
     timeout, so each envelope is accepted for its own polarity; `foreground=None` — a call the
-    scan did not register — accepts either. Both are anchored at the start of the result.
+    scan did not register — accepts either. The result has to be the envelope and nothing else.
     """
     if foreground is not True:
         match = DETACHED_ACK_RE.match(text)
         if match:
-            return match.group(1), match.group(2).strip()
+            return match.group(1)
     if foreground is not False:
         match = MOVED_ACK_RE.match(text)
         if match:
-            return match.group(1), match.group(2).strip()
+            return match.group(1)
     return None
-
-
-def output_evidence(path, notified_at):
-    """The tail of a background task's output file, or empty when it cannot vouch for the task.
-
-    The file is the harness's record of what the task printed and it stops changing when the
-    task ends: one written after the completion notification is no longer that record, whatever
-    it says now. The rollout log still has to vouch for the content.
-    """
-    try:
-        if os.stat(path).st_mtime > notified_at + OUTPUT_SETTLE_SLACK:
-            return ""
-    except OSError:
-        return ""
-    return output_tail(path)
 
 
 def in_flight(evidence, now=None):

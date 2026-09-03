@@ -197,15 +197,15 @@ independent defects, all fixed in this addendum's change set.
 
 | Finding | Evidence | Fix |
 |---|---|---|
-| Codex reviews launched with `run_in_background: true`, or moved to the background by the Bash timeout, left only a launch acknowledgement in the transcript; the gate never saw a verdict. | 34 background launches with 0 verdicts across the history, ~13 auto-backgrounded, 14 ack-sized results of 222 marked calls; in `08244b4e` every Codex round but one. | The Stop hook binds a backgrounded marked call at its `<task-notification>`: tail of the output file → verdict → rollout log written between launch and notification. `/adversarial-review` now launches in the background by design. |
+| Codex reviews launched with `run_in_background: true`, or moved to the background by the Bash timeout, left only a launch acknowledgement in the transcript; the gate never saw a verdict. | 34 background launches with 0 verdicts across the history, ~13 auto-backgrounded, 14 ack-sized results of 222 marked calls; in `08244b4e` every Codex round but one. | The Stop hook binds a backgrounded marked call at its `<task-notification>` to the verdict one briefed Codex session stated in the rollout log between launch and notification; the output file is not evidence, and two sessions speaking in the window bind nothing. `/adversarial-review` now launches in the background by design. |
 | The model polled the running lane instead of ending the turn: `tail`/`sleep`/`Monitor`/`TaskOutput` calls, each a full-context request. | 364 polling calls in `08244b4e`. | The Stop hook lets a turn end while this session's own background task is in flight (own launches only, `MAX_BACKGROUND_WAITS = 8` per candidate, `BACKGROUND_WAIT_LIMIT = 2 h` per task, `TaskStop`/`failed` counted as failed activity). Skills and the command say: end the turn, never poll. |
 | The one foreground APPROVED was expired 7 s later by `git status --porcelain \| wc -l && git rev-parse --short HEAD` (an unresolved shell mutation on a durable candidate), which produced block #3 and a needless native round. | Marker `last_durable_ts` 14:03:41 vs verdict 14:03:34; the replay does not reproduce the snapshot failure, so the unresolved branch was taken. | Expiry through an unresolved snapshot now requires a write-capable command, meaning anything not proven read-only: an allowlist per pipeline segment (`ls`, `cat`, `grep`, `wc`, git's reading subcommands…), with any redirect other than a discarded or merged stderr, a substitution, a heredoc or a script block counting as writing. Read-only pipelines keep the candidate open but never expire a verdict. |
 
 Also added: `state/gate-events.jsonl`, an append-only ledger of gate decisions, so the next
 question of this kind is answered from one file instead of a transcript replay.
-`test_gate.py` grew from 813 to 899 assertions (both acknowledgement shapes bound, pending wait
+`test_gate.py` grew from 813 to 922 assertions (both acknowledgement shapes bound, pending wait
 allowed and capped, stale task blocks, stopped or failed lane → draft-blocked, a required lane
-bound in the background, an output file rewritten after its notification binds nothing, a
+bound in the background, the verdict read from the rollout rather than the output file, a
 foreground review that mentions a background task is still a review, a task launched before the
 candidate is tracked, ledger line, write-capable tables for Bash and PowerShell, quiet pipeline
 keeps the verdict).

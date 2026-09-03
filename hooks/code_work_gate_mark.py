@@ -107,8 +107,8 @@ SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNO
 # 2026-09-03 and cost the session a native review round it did not need; nothing that command
 # can do touches a lasting artifact, while `tee`, `truncate` or `1>` plainly can.
 READ_ONLY_COMMANDS = frozenset("""
-    cd ls dir cat head tail less more grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
-    stat file du df pwd echo printf date true false test [ type which where whoami hostname
+    cd ls dir cat head tail grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
+    stat file du df pwd echo printf date true false test [ type which where whoami
     printenv jq column nl tac basename dirname realpath readlink md5sum sha1sum sha256sum tree
     ps tasklist nproc uname sleep
     get-childitem get-content get-item get-command select-string select-object measure-object
@@ -126,6 +126,20 @@ GIT_LISTING_RE = re.compile(
     r"^(?:(?:branch|tag|remote|worktree|config)\b(?:\s+(?:list|-l|--list|-a|-v|-vv|--all|"
     r"--show-current|--merged|--no-merged|--contains\s+\S+|--get(?:-all|-regexp)?\s+\S+))*"
     r"|stash\s+(?:list|show)\b[^\r\n]*)\s*$"
+)
+# Arguments that turn a listed command into a writer or a command runner. A command absent
+# here can only write through a redirect, which is caught separately.
+MUTATING_ARGS = {
+    "find": re.compile(r"(?:^|\s)-(?:delete|exec(?:dir)?|ok(?:dir)?|fprint0?|fprintf|fls)\b"),
+    "fd": re.compile(r"(?:^|\s)(?:-x|-X|--exec(?:-batch)?)\b"),
+    "rg": re.compile(r"(?:^|\s)--pre\b"),
+    "sort": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
+    "tree": re.compile(r"(?:^|\s)-o\b"),
+    "date": re.compile(r"(?:^|\s)(?:-s\b|--set\b)"),
+    "git": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
+}
+GIT_GLOBAL_OPTIONS_RE = re.compile(
+    r"^(?:(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+|-c\s+\S+)\s+)+"
 )
 # Only a discarded or merged stderr is not a file the command may have written into.
 HARMLESS_REDIRECT_RE = re.compile(r"2>\s*(?:/dev/null|\$null|nul\b)|2>&1|1>&2|>&2")
@@ -167,14 +181,35 @@ def command_head(segment):
     return token, (words[1] if len(words) > 1 else "")
 
 
+SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.+-]{0,39}$")
+
+
 def command_label(command):
-    """What the ledger keeps of a command: its first executable, never its arguments."""
+    """What the ledger keeps of a command: its first executable's name, or nothing recognizable.
+
+    A first token that is not a plain executable name — a PowerShell assignment such as
+    `$token='…'`, a quoted path with spaces — is not copied at all, so no value it carries can
+    reach the ledger.
+    """
     first = SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0] if command else ""
-    return command_head(first)[0][:40]
+    head = command_head(first)[0]
+    return head if SAFE_LABEL_RE.match(head) else "(unrecognized)"
+
+
+def git_read_only(arguments):
+    """Whether a git invocation only reads: a reading subcommand, a listing form, no output file."""
+    arguments = GIT_GLOBAL_OPTIONS_RE.sub("", arguments.strip())
+    if MUTATING_ARGS["git"].search(arguments):
+        return False
+    words = arguments.split()
+    subcommand = words[0].lower() if words else ""
+    if subcommand == "reflog":
+        return len(words) == 1 or words[1] == "show"
+    return subcommand in GIT_READ_SUBCOMMANDS or bool(GIT_LISTING_RE.match(arguments))
 
 
 def read_only_pipeline(command):
-    """Whether every segment of the command is a command proven not to write."""
+    """Whether every segment of the command is a command proven not to write, arguments included."""
     if "$(" in command or "`" in command or "<<" in command or "{" in command:
         return False
     # A merged stderr (`2>&1`) is dropped before splitting, or its `&` would cut the pipeline.
@@ -186,11 +221,16 @@ def read_only_pipeline(command):
             continue
         head, rest = command_head(segment)
         if head == "git":
-            words = rest.split()
-            if (words and words[0].lower() in GIT_READ_SUBCOMMANDS) or GIT_LISTING_RE.match(rest):
+            if git_read_only(rest):
                 continue
             return False
         if head not in READ_ONLY_COMMANDS:
+            return False
+        guard = MUTATING_ARGS.get(head)
+        if guard and guard.search(rest):
+            return False
+        # `uniq input output` writes its second operand.
+        if head == "uniq" and len([w for w in rest.split() if not w.startswith("-")]) > 1:
             return False
     return True
 

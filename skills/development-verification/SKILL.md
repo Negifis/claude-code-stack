@@ -119,8 +119,8 @@ For HIGH risk on a lasting artifact, or when the user explicitly requests it, ru
 review lane per round, chosen in this order:
 
 1. **Codex** through `/adversarial-review`, launched into the background
-   (`run_in_background: true`) and judged at its completion notification from the task's
-   output file, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
+   (`run_in_background: true`) and judged at its completion notification from the rollout log
+   Codex wrote in between, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
    judgment is worth more than a second opinion from the model that wrote the code. Run
    `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
    at capacity) means the lane is skipped for this round, not retried.
@@ -130,8 +130,8 @@ review lane per round, chosen in this order:
    reviewed and why when it was not Codex.
 
 Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict must be
-observable in the transcript — the native lane as a foreground result, the Codex lane as the
-output file bound at its notification — never as a summary you wrote. One ledger and one round
+observable — the native lane as a foreground result, the Codex lane as the rollout log bound at
+its notification — never as a summary you wrote. One ledger and one round
 budget span the lanes: switching engines continues the review, never restarts it. Add at most one specialist
 only for a named non-overlapping risk; the lane that owns the verdict keeps it.
 

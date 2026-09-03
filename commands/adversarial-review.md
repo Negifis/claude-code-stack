@@ -34,8 +34,9 @@ takes ten to forty minutes, longer than a foreground Bash call may run (the harn
 call to the background at its timeout anyway), and the gate judges a backgrounded lane from
 what the harness records for it: the launch acknowledgement names the task id and the output
 file, the completion notification (`<task-notification>` carrying that task id) resumes the
-work, and the Stop hook then reads the tail of that output file and binds it to the rollout log
-Codex wrote between launch and notification. So do not poll: no `sleep`/`tail` loops on the
+work, and the Stop hook then reads the verdict from the rollout log Codex wrote between the
+launch and the notification — exactly one briefed session may speak in that window; the output
+file is for you to read, not evidence. So do not poll: no `sleep`/`tail` loops on the
 stderr capture, no `Monitor`, no `TaskOutput` — each poll is a full-context request that buys
 nothing, and the Stop hook lets a turn end while this session's own review is still running.
 Read the output file and `codex-<id>.err` only after the notification, to report the findings.
@@ -44,11 +45,10 @@ the launch a review lane rather than an errand, so a review that ran but could n
 attributed still counts as an unresolved lane instead of vanishing. The result must end with
 its `VERDICT:` line; require that verdict in the packet.
 
-The verdict counts because Codex's own session log shows it saying that text between the
-launch and the notification. So the output file has to *be* the review as Codex printed it —
-a command that filters or summarizes the output leaves nothing the log can vouch for — and a
-review that ran but could not be attributed stands as an unresolved lane rather than being
-restated by you. `TaskStop` on the task, or a `failed` notification, is failed lane activity
+The verdict is what Codex's own session log shows it saying between the launch and the
+notification, and only when one briefed session spoke in that window: a second review run
+alongside makes the round ambiguous and binds nothing, and a review that ran but could not be
+attributed stands as an unresolved lane rather than being restated by you. `TaskStop` on the task, or a `failed` notification, is failed lane activity
 for this candidate: it reopens an earlier approval and counts toward draft-blocked.
 
 When the user explicitly requires cross-engine evidence, `--required` is mandatory: include the
@@ -85,8 +85,8 @@ timeout 3600 codex exec --ignore-user-config \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
 
-No `--json` here, and that is the load-bearing part: the gate reads the tail of the task's
-output file, so that file has to *be* the review. With the hooks disabled nothing appends a
+No `--json` here: plain mode leaves the output file readable as the review itself, which is
+what you report from, and it is what a foreground result would have to be. With the hooks disabled nothing appends a
 trailer and plain mode prints the final message alone — verified: a lean run asked for two lines
 returned exactly those two, the verdict last. A JSONL stream ends in `turn.completed` instead,
 which parses as malformed however good the review was. Keep stderr aside for diagnostics; the

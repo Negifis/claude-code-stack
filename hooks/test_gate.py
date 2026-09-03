@@ -1024,7 +1024,7 @@ try:
     task_id = "bpend" + uuid.uuid4().hex[:5]
     out_file = os.path.join(tasks_dir, task_id + ".output")
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
-    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
     transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify=False))
     payload = {"session_id": sid, "transcript_path": transcript,
                "last_assistant_message": "Waiting for the review.\n[gate] verified: HIGH; pending"}
@@ -1052,7 +1052,7 @@ try:
     events = [skill_use(old - 190, "development-verification", "skill-dev")]
     simplify_wave(events, old - 180, "simplify", SIMPLIFY_LENSES)
     events.append(bash_use(old, "codex-dead", CODEX_CLI_COMMAND, run_in_background=True))
-    events.append(tool_result(old + 1, "codex-dead", "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)))
+    events.append(tool_result(old + 1, "codex-dead", DETACHED_ACK.format(id=task_id, out=out_file)))
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                              "last_assistant_message": "[gate] verified: HIGH; still waiting"})
@@ -1067,7 +1067,7 @@ try:
     task_id = "bfail" + uuid.uuid4().hex[:5]
     out_file = os.path.join(tasks_dir, task_id + ".output")
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
-    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
     transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify_status="failed"))
     result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                              "last_assistant_message": "[gate] draft-blocked: the background Codex lane failed"})
@@ -1082,7 +1082,7 @@ try:
     task_id = "bstop" + uuid.uuid4().hex[:5]
     out_file = os.path.join(tasks_dir, task_id + ".output")
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
-    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
     events = background_review_events(now, task_id, out_file, ack, notify=False)
     events.append(entry(now - 500, "assistant", [{
         "type": "tool_use", "id": "stop-1", "name": "TaskStop", "input": {"task_id": task_id},
@@ -1099,23 +1099,35 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
-# --- a background lane's evidence has to be the harness's record, and it serves --required too
-sid = session()
-try:
-    now = time.time()
-    task_id = "brew" + uuid.uuid4().hex[:5]
-    out_file = os.path.join(tasks_dir, task_id + ".output")
-    write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 100)
-    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
-    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
-    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
-    transcript = write_transcript(events)
-    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
-                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
-    check("an output file rewritten after the notification binds nothing",
-          result.get("decision") == "block" and "systemMessage" not in result, result)
-finally:
-    cleanup(sid, locals().get("transcript"))
+# --- a background lane's verdict is what the rollout log says, not what the output file says
+for label, file_text, logged, expect_bound in (
+    ("the rollout, not the output file, states the verdict",
+     codex_cli_output(review_text("APPROVED")), [codex_cli_output(review_text("REVISE"))], False),
+    ("a missing output file costs the lane nothing",
+     None, [codex_cli_output(review_text("APPROVED"))], True),
+    ("two briefed sessions speaking in the window are ambiguous and bind nothing",
+     codex_cli_output(review_text("APPROVED")),
+     [codex_cli_output(review_text("APPROVED")),
+      codex_cli_output(review_text("APPROVED", subject="an unrelated candidate"))], False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "broll" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        if file_text is not None:
+            write_review_output(out_file, file_text, now - 601)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
+        for text in logged:
+            log_codex_run(now - 650, text)
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound and "background work" not in result.get("systemMessage", ""), result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
 
 sid = session()
 try:
@@ -1168,14 +1180,15 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
     events = [skill_use(now - 890, "development-verification", "skill-dev")]
     simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
-    spoken = ("Command running in background with ID: example. Output is being written to: "
-              "C:/tmp/example.output. That earlier run is unrelated to this verdict.\n"
+    spoken = ("Command did not complete within its 120s timeout and was moved to the background "
+              "(ID: example). Output is being written to: C:/tmp/example.output. You will be "
+              "notified when it completes. To check interim output, use Read on that file path.\n"
               + review_text("APPROVED"))
     add_codex_review(events, now - 700, "codex-fg", CODEX_CLI_COMMAND, codex_cli_output(spoken))
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                              "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the foreground"})
-    check("a foreground result starting with the launch wording is judged as a review",
+    check("a foreground result that opens with the whole moved-to-background envelope is still a review",
           result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
 finally:
     cleanup(sid, locals().get("transcript"))
@@ -1244,6 +1257,22 @@ for command, expected in (
     ("curl -sL https://example.org | head", True),
     ("ls $(pwd)", True),
     ('PYTHONIOENCODING=utf-8 timeout 30 "C:/tools/python.exe" -c pass', True),
+    ("find . -name '*.py' -delete", True),
+    ("find . -name '*.py' | head", False),
+    ("find . -name '*.py' -exec rm {} \\;", True),
+    ("sort -o reviewed.py reviewed.py", True),
+    ("sort --output=reviewed.py reviewed.py", True),
+    ("uniq input reviewed.py", True),
+    ("uniq -c input", False),
+    ("tree -o out.txt", True),
+    ("git diff --output=reviewed.py", True),
+    ("git -C C:/repo log --oneline -3", False),
+    ("git --no-pager diff HEAD~1 --stat", False),
+    ("git reflog expire --all", True),
+    ("git reflog", False),
+    ("rg --pre cat foo", True),
+    ("date -s '2020-01-01'", True),
+    ("hostname newname", True),
     ("", False),
 ):
     check("write-capable: {!r} -> {}".format(command[:50], expected),
@@ -1263,6 +1292,11 @@ check("the ledger keeps only the executable of a command",
       marker_hook.command_label('cd "C:/repo" && python deploy.py --token=SECRET') == "cd"
       and marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h") == "curl",
       marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h"))
+check("a PowerShell assignment never reaches the ledger",
+      marker_hook.command_label("$token='SECRET'; Get-Content x") == "(unrecognized)"
+      and marker_hook.command_label("$env:API_KEY='SECRET'; git status") == "(unrecognized)"
+      and marker_hook.command_label('"C:/tools/python.exe" script.py') == "python",
+      marker_hook.command_label("$token='SECRET'; Get-Content x"))
 
 with tempfile.TemporaryDirectory(prefix="cwg_quiet_") as outside:
     sid = session()
