@@ -4,6 +4,7 @@ import datetime
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,7 @@ os.makedirs(AGENT_HOME, exist_ok=True)
 os.environ["USERPROFILE"] = AGENT_HOME
 os.environ["HOME"] = AGENT_HOME
 MARK_HOOK = os.path.join(HERE, "code_work_gate_mark.py")
+GATE_INBOX = os.path.join(HERE, "gate_inbox.py")
 def _discard_fixtures():
     """Leave nothing of this run behind.
 
@@ -1319,6 +1321,116 @@ try:
     codex_lane.clear_state()
 finally:
     cleanup(sid, locals().get("transcript"))
+
+# --- an anomaly report closes a blocked candidate UNVERIFIED, and nothing less than a report does
+def inbox(*args, stdin=None):
+    proc = subprocess.run([sys.executable, GATE_INBOX] + list(args), input=stdin, text=True,
+                          encoding="utf-8", capture_output=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def file_report(sid, block_reason, facts="the transcript shows the evidence"):
+    code, out, err = inbox("report", "--session", sid, "--block", block_reason, "--facts", facts)
+    check("gate_inbox report exits zero", code == 0, err)
+    match = re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out)
+    check("gate_inbox report prints an id", bool(match), out)
+    return match.group(1)
+
+
+def block_reason_of(result):
+    match = re.search(r"Cannot finalize this candidate: (.*?)\.\n", result.get("reason") or "", re.S)
+    return match.group(1) if match else ""
+
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    payload = {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: 0badc0de; the hook is wrong"}
+    result = run(STOP_HOOK, payload)
+    check("an anomaly receipt before any block is refused",
+          result.get("decision") == "block" and "only available after the gate has blocked" in result["reason"], result)
+    check("the block reminder offers the report command with the session id",
+          "gate_inbox.py" in result["reason"] and sid in result["reason"], result)
+    result = run(STOP_HOOK, payload)
+    check("an anomaly receipt naming no report is refused",
+          result.get("decision") == "block" and "names no report" in result["reason"], result)
+    wrong = file_report(sid, "some other reason entirely")
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(wrong)})
+    check("a report that does not quote the block's reason is refused",
+          result.get("decision") == "block" and "does not quote" in result["reason"], result)
+    report_id = file_report(sid, block_reason_of(result), "APPROVED at 12:00 from a foreground lane after the last edit at 11:58")
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(report_id)})
+    check("a report filed after the block, quoting its reason, closes the candidate as anomaly-reported",
+          result.get("continue") is True and "anomaly-reported" in result.get("systemMessage", "") and "UNVERIFIED" in result.get("systemMessage", ""), result)
+    check("the anomaly closure retires the candidate", not os.path.exists(gate_paths(sid)[0]) or (cwg.read_json(gate_paths(sid)[0]) or {}).get("closed"), gate_paths(sid)[0])
+    ledger_lines = open(cwg.event_log_path(), encoding="utf-8").read().splitlines()
+    check("the ledger records the anomaly closure with its report id",
+          any('"receipt": "anomaly-reported"' in line and report_id in line and sid in line for line in ledger_lines), report_id)
+    code, out, _ = inbox("show", report_id)
+    shown = json.loads(out)
+    check("the report carries the marker, the state and the hook's own view",
+          shown.get("session") == cwg.session_key(sid) and shown["state"].get("blocks") == 3
+          and shown["marker"].get("paths") == 1 and "hook_view" in shown, shown.get("state"))
+    code, out, _ = inbox("list")
+    check("the report is listed until acknowledged", report_id in out and wrong in out, out)
+    code, out, _ = inbox("ack", report_id, "--note", "fixed in the hook")
+    inbox("ack", wrong)
+    code, out, _ = inbox("list")
+    check("an acknowledged report leaves the list", code == 0 and report_id not in out and wrong not in out, out)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    first = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    second = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    check("a repeated block says so",
+          second.get("decision") == "block" and "Same reason as the previous block" in second["reason"]
+          and "Same reason" not in first["reason"], second)
+    report_id = file_report(sid, block_reason_of(second), "the transcript holds the evidence the hook denies")
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the transcript holds the evidence".format(report_id)})
+    check("a substantive block can be answered with a report",
+          result.get("continue") is True and "UNVERIFIED" in result.get("systemMessage", ""), result)
+    inbox("ack", report_id)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    early = file_report(sid, "HIGH candidate lacks a current APPROVED verdict")
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(early)})
+    check("a report filed before the block cannot close the candidate",
+          result.get("decision") == "block" and "predates the last block" in result["reason"], result)
+    inbox("ack", early)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- the inbox digest reaches only a session started in the config home; the scan derives ledger anomalies
+pending = file_report(session(), "HIGH candidate lacks a current APPROVED verdict")
+code, out, _ = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR, "hook_event_name": "SessionStart"}))
+check("the digest names unresolved reports for a gate-ops session",
+      code == 0 and pending in out and "additionalContext" in out, out)
+code, out, _ = inbox("digest", stdin=json.dumps({"cwd": AGENT_HOME, "hook_event_name": "SessionStart"}))
+check("the digest stays silent elsewhere", code == 0 and out.strip() == "", out)
+inbox("ack", pending)
+with open(cwg.event_log_path(), "a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"ts": time.time(), "kind": "exhausted", "session": "scan-test", "reason": "x"}) + "\n")
+    stream.write(json.dumps({"ts": time.time() - 30, "kind": "review", "session": "scan-test-2", "at": time.time() - 30, "engine": "codex", "verdict": "APPROVED"}) + "\n")
+    stream.write(json.dumps({"ts": time.time() - 20, "kind": "durable", "session": "scan-test-2", "reason": "unresolved-write-capable", "command": "git"}) + "\n")
+    for offset in (10, 5):
+        stream.write(json.dumps({"ts": time.time() - offset, "kind": "review", "session": "scan-test-3", "engine": "codex-background", "verdict": None, "task": "btask-same"}) + "\n")
+code, out, _ = inbox("scan")
+check("the scan derives anomalies from the ledger", code == 0 and re.search(r"GATE_SCAN: [1-9]", out), out)
+code, listed, _ = inbox("list")
+check("the scan reports exhaustion and a verdict expired right after a review",
+      "auto:exhausted" in listed and "auto:verdict-expired-after-review" in listed, listed)
+check("one unbound review task re-read by several Stop runs is one anomaly",
+      sum(1 for line in listed.splitlines() if "scan-tes" in line and "unbound-background-review" in line) == 1, listed)
+code, out, _ = inbox("scan")
+check("a second scan adds nothing", "GATE_SCAN: 0 new" in out, out)
 
 # --- the ledger records the decision
 sid = session()

@@ -46,6 +46,16 @@
             "statusMessage": "Checking working tree for other sessions..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C://Users//in//AppData//Local//Programs//Python//Python312//python.exe\" \"C://Users//in//.claude//hooks//gate_inbox.py digest",
+            "timeout": 5,
+            "statusMessage": "Gate inbox: checking anomaly reports..."
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

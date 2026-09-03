@@ -79,9 +79,12 @@ SIMPLIFY_REVIEWERS = {
     "simplify-efficiency-reviewer",
 }
 TERMINAL_RE = re.compile(
-    r"^\[gate\]\s*(verified|operational|no-change|pr-ready|draft-blocked)\s*:\s*(\S.*)$",
+    r"^\[gate\]\s*(verified|operational|no-change|pr-ready|draft-blocked|anomaly-reported)"
+    r"\s*:\s*(\S.*)$",
     re.IGNORECASE,
 )
+# `[gate] anomaly-reported: <report id>; <the verifiable contradiction>`
+ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
 VERIFIED_REASON_RE = re.compile(r"^(LOW|STANDARD|HIGH)\s*;\s*\S", re.IGNORECASE)
 OPERATIONAL_RECEIPTS = {"operational", "no-change"}
 VERDICT_LINE_RE = re.compile(
@@ -113,6 +116,8 @@ CODEX_HEAD_BYTES = 4 * 1024 * 1024
 CODEX_TAIL_BYTES = 8 * 1024 * 1024
 _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
+# The session being judged, for the ledger lines written from inside the transcript scan.
+_SESSION = {"key": ""}
 REQUIRED_EXTERNAL_TOKEN = "CODE_WORK_GATE_REQUIRED"
 # Declared intent, never proof, and it governs one case only: whether a result that cannot be
 # attributed is heard as failed review activity. A verdict itself is heard because a briefed
@@ -586,12 +591,12 @@ def transcript_evidence(path, since, skill_since=None):
                             evidence["background_judged"].append(call["call_id"])
                             if bound:
                                 record_control(evidence, call["started"], control)
-                                cwg.log_event("review", engine="codex-background",
+                                cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
                                               verdict=control[1], task=task_id)
                             else:
                                 evidence["review_failures"].append(stamp)
                                 record_control(evidence, stamp, ("unbound", None), malformed=True)
-                                cwg.log_event("review", engine="codex-background",
+                                cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
                                               verdict=None, task=task_id, status=status,
                                               reason="no single briefed Codex verdict between "
                                                      "launch and notification")
@@ -642,7 +647,7 @@ def transcript_evidence(path, since, skill_since=None):
                                     evidence["review_failures"].append(stamp)
                                     record_control(evidence, stamp, ("unbound", None),
                                                    malformed=True)
-                                    cwg.log_event("review", engine="codex-background",
+                                    cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
                                                   verdict=None, task=stopped,
                                                   status="stopped",
                                                   reason="the review task was stopped")
@@ -755,6 +760,8 @@ def transcript_evidence(path, since, skill_since=None):
                         )
                         if judged:
                             record_control(evidence, stamp, control)
+                            cwg.log_event("review", session=_SESSION["key"], at=stamp,
+                                          engine="codex", verdict=control[1])
                         elif bound or (stated and call["marked"]):
                             # An unattributable verdict is never filed as one, but dropping it
                             # would leave an earlier approval as the last word — so a call that
@@ -782,7 +789,11 @@ def transcript_evidence(path, since, skill_since=None):
                             (stamp, "failure", None)
                         )
                         continue
-                    record_control(evidence, stamp, reviewer_control(text), malformed=True)
+                    control = reviewer_control(text)
+                    record_control(evidence, stamp, control, malformed=True)
+                    if control[0] in ("ordinary", "closure"):
+                        cwg.log_event("review", session=_SESSION["key"], at=stamp,
+                                      engine="native", verdict=control[1])
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
         # record: an approval early in the cycle would otherwise outlive the REVISE that
@@ -1019,6 +1030,34 @@ def candidate_class(entry):
     if seen in RISK_ORDER and RISK_ORDER[seen] > RISK_ORDER["LOW"]:
         return cwg.WORK_PERSISTENT
     return cwg.work_class(marker_paths(entry))
+
+
+def anomaly_closure(receipt, state, key):
+    """Whether an anomaly receipt is backed by a report this session filed after its last block.
+
+    The report is evidence for whoever maintains the gate, never a key that opens it: the
+    candidate closes UNVERIFIED, the receipt is available only once the hook has spoken, and the
+    report has to be newer than that block and quote its reason, so the two sides of the
+    disagreement are on record together.
+    """
+    match = ANOMALY_REASON_RE.match(receipt[1])
+    if not match:
+        return False, "anomaly-reported needs `<report id>; <the verifiable contradiction>`"
+    if int(state.get("blocks") or 0) < 1:
+        return False, "anomaly-reported is only available after the gate has blocked this candidate"
+    try:
+        import gate_inbox
+        report = gate_inbox.find_report(match.group(1), key)
+    except Exception:
+        report = None
+    if report is None:
+        return False, "anomaly-reported names no report filed by this session (gate_inbox.py report)"
+    if float(report.get("ts") or 0) < float(state.get("last_block_ts") or 0):
+        return False, "the anomaly report predates the last block"
+    last = normalized(state.get("last_block_reason"))
+    if not last or last not in normalized(report.get("block_reason")):
+        return False, "the anomaly report does not quote the last block's reason"
+    return True, match.group(1)
 
 
 def receipt_preflight(receipt, entry):
@@ -1306,7 +1345,7 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     return cwg.write_json(marker, current)
 
 
-def reminder(reason, block_number, operational):
+def reminder(reason, block_number, operational, session_id="", repeated=False):
     if operational:
         contract = (
             "This candidate changed no lasting artifact: it ran commands or a throwaway "
@@ -1330,13 +1369,22 @@ def reminder(reason, block_number, operational):
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
         )
+    inbox = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate_inbox.py")
     return (
-        "[Code Work Gate] Cannot finalize this candidate: {}.\n{}\n"
+        "[Code Work Gate] Cannot finalize this candidate: {reason}.\n{contract}\n"
         "A turn may end while this session's own background task (a review, a test run, a "
         "server) is still running: the completion notification resumes the work, so wait for "
         "it instead of polling. "
-        "This is finite enforcement block {}/{} for the unchanged candidate."
-    ).format(reason, contract, block_number, MAX_BLOCKS_PER_CANDIDATE)
+        "This is finite enforcement block {n}/{cap} for the unchanged candidate.{repeat} "
+        "If this block contradicts facts you can verify in the transcript — the evidence exists "
+        "in the shape required, or the hook asks to repeat a lane that already ran — do not "
+        "re-run lanes or poll: file `python \"{inbox}\" report --session {sid} --block "
+        "\"{reason}\" --facts \"<what the transcript shows>\" --did \"<what you did instead>\"` "
+        "and end with `[gate] anomaly-reported: <id>; <fact>`, which closes this candidate "
+        "UNVERIFIED with the report attached (development-verification section 10)."
+    ).format(reason=reason, contract=contract, n=block_number, cap=MAX_BLOCKS_PER_CANDIDATE,
+             repeat=" Same reason as the previous block." if repeated else "",
+             inbox=inbox, sid=session_id or "<session id>")
 
 
 def waiting_note(running, waits):
@@ -1367,6 +1415,7 @@ def main():
 
     try:
         key = cwg.session_key(data.get("session_id"))
+        _SESSION["key"] = key
         marker = cwg.marker_path(key)
         state_file = cwg.state_path(key)
         if not os.path.exists(marker):
@@ -1388,7 +1437,19 @@ def main():
         state["candidate_ts"] = candidate_ts
 
         receipt = receipt_of(data.get("last_assistant_message"))
-        preflight_ok, reason = receipt_preflight(receipt, entry)
+        if receipt and receipt[0] == "anomaly-reported":
+            accepted, note = anomaly_closure(receipt, state, key)
+            if accepted:
+                if close_cycle(marker, state_file, state, candidate_ts, receipt, key):
+                    cwg.log_event("close", session=key, receipt="anomaly-reported", report=note)
+                    allow("Code Work Gate recorded terminal state: anomaly-reported "
+                          "(UNVERIFIED, report {})".format(note))
+                else:
+                    allow("Code Work Gate could not retire its state and is failing open.")
+                return
+            preflight_ok, reason = False, note
+        else:
+            preflight_ok, reason = receipt_preflight(receipt, entry)
         # The transcript is read once whatever the receipt looked like: the same scan answers
         # whether this session still has background work running.
         evidence = transcript_evidence(
@@ -1419,6 +1480,7 @@ def main():
         blocks = int(state.get("blocks") or 0)
         if blocks >= MAX_BLOCKS_PER_CANDIDATE:
             exhausted = ("enforcement-exhausted", reason, None)
+            cwg.log_event("exhausted", session=key, reason=reason)
             note = (
                 "Code Work Gate exhausted its finite block budget for this unchanged candidate. "
                 "The task is ending UNVERIFIED: {}."
@@ -1428,8 +1490,10 @@ def main():
             allow(note)
             return
 
+        repeated = blocks >= 1 and state.get("last_block_reason") == reason
         state["blocks"] = blocks + 1
         state["last_block_ts"] = time.time()
+        state["last_block_reason"] = reason
         if not cwg.write_json(state_file, state):
             allow("Code Work Gate state is unavailable and enforcement is failing open.")
             return
@@ -1438,12 +1502,15 @@ def main():
         emit({
             "decision": "block",
             "reason": reminder(
-                reason,
-                blocks + 1,
-                candidate_class(entry) == cwg.WORK_OPERATIONAL,
+                reason, blocks + 1, candidate_class(entry) == cwg.WORK_OPERATIONAL,
+                session_id=str(data.get("session_id") or ""), repeated=repeated,
             ),
         })
-    except Exception:
+    except Exception as error:
+        # Failing open is the contract; failing silently is not — the ledger keeps the class
+        # of the failure so the inbox scan can surface it.
+        cwg.log_event("hook_error", hook="stop", error=type(error).__name__,
+                      session=cwg.session_key(data.get("session_id")))
         allow()
 
 

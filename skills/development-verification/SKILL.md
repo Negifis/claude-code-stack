@@ -228,6 +228,7 @@ End implementation work with exactly one factual receipt as the final non-empty 
 [gate] no-change: <why nothing was modified>
 [gate] pr-ready: <PR URL, or branch plus exact publication handoff>
 [gate] draft-blocked: <draft PR URL, or exact external publication blocker>
+[gate] anomaly-reported: <report id>; <the verifiable contradiction>
 ```
 
 The receipt is one line of evidence — the candidate and the check, verdict or blocker that
@@ -236,10 +237,36 @@ passed as expected need no prose elsewhere; a failure of any kind is stated unde
 regardless. `verified` states the risk of a lasting artifact; `operational` carries both
 halves; `no-change` closes an inspection-only step with its reason as a clause; edits made and
 then reverted close as `verified` at the path floor, stating the worktree was restored.
-`pr-ready` and `draft-blocked` follow the autonomous closure only. Never emit
-`[gate] escalated`. A closing message without a receipt is blocked by the Stop hook at most
+`pr-ready` and `draft-blocked` follow the autonomous closure only; `anomaly-reported` closes
+UNVERIFIED with a report (section 10). Never emit `[gate] escalated`. A closing message without a receipt is blocked by the Stop hook at most
 three times per unchanged candidate; the receipt records evidence and never substitutes for
 running the work.
+
+## 10. When the hook is wrong
+
+The Stop hook is right by default: a missing or misplaced receipt, a `REVISE`, an edit after the
+approval, a lane launched in the wrong mode are your mistakes, not the hook's. An anomaly is a
+block that contradicts facts you can verify in the transcript: the required evidence exists in
+the required shape (a foreground APPROVED after the last lasting edit, the simplify lane's
+result), the hook demands a lane this skill forbids repeating, the same block returns after its
+demand was met exactly, the marker names files you never touched, the hook failed or timed out,
+or its advice contradicts the breaker or this skill.
+
+Order: check the three facts once — the receipt is the last line and well-formed, the last
+lasting edit precedes the verdict, the lanes ran in the foreground — and fix what is yours. If
+the block still stands, do not re-run lanes, do not poll, do not argue with the hook: file the
+report and finish honestly.
+
+```
+python "~/.claude/hooks/gate_inbox.py" report --block "<the block reason, verbatim>" \
+  --facts "<what the transcript shows, with timestamps or tool ids>" --did "<what you did instead>"
+```
+
+It prints an id; end with `[gate] anomaly-reported: <id>; <the contradiction in one line>`. The
+hook accepts that receipt only after it has blocked this candidate, for a report filed after
+that block and quoting its reason, and closes the candidate UNVERIFIED with the report attached
+— once per candidate, never as `verified`. The report reaches the gate-ops session, which fixes
+the hook or this skill; overuse shows up there as a pattern and is treated as one.
 
 ## Incident hotfix order
 

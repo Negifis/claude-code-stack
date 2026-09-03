@@ -213,3 +213,16 @@ keeps the verdict).
 Residual for that session: its gate state already holds three blocks for the unchanged
 candidate, so its next Stop ends `UNVERIFIED` unless the candidate changes; the fix applies to
 new turns and new sessions.
+
+## 10. Addendum 2026-09-03: gate anomaly inbox
+
+Agents in any session can now disagree with a block on the record instead of re-running lanes
+or polling: `hooks/gate_inbox.py report` files the block reason, the verifiable facts, what was
+done instead, the marker and state, the session's ledger tail and the Stop hook's own view of
+the transcript into `state/gate-anomalies.jsonl`; the receipt `[gate] anomaly-reported: <id>;
+<fact>` closes the candidate UNVERIFIED, and only after a block, for a report filed after it and
+quoting its reason (development-verification section 10). `gate_inbox.py scan` derives
+anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
+review, a verdict expired within a minute of a review, a hook failure — the Stop hook now logs
+`hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 987.
