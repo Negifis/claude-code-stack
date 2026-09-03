@@ -1221,6 +1221,36 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a background lane that hit the usage limit trips the breaker at its notification
+sid = session()
+try:
+    import codex_lane
+    codex_lane.clear_state()
+    now = time.time()
+    task_id = "blim" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    err_path = os.path.join(AGENT_HOME, "codex-bg-limit.err")
+    with open(err_path, "w", encoding="utf-8") as stream:
+        stream.write("ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 4:24 PM.\n")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-lim", CODEX_CLI_COMMAND + " 2>" + err_path.replace("\\", "/"),
+                           run_in_background=True))
+    events.append(tool_result(now - 699, "codex-lim", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the Codex lane hit its usage limit"})
+    check("a failed background lane still closes draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+    available, message = codex_lane.status()
+    check("the breaker learns a background lane's outage from its stderr capture",
+          available is False and "usage limit" in message, message)
+    codex_lane.clear_state()
+finally:
+    cleanup(sid, locals().get("transcript"))
+
 # --- the ledger records the decision
 sid = session()
 try:

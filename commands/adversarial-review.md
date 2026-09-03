@@ -23,8 +23,9 @@ python "C:\Users\in\.claude\hooks\codex_lane.py" check
 `CODEX_LANE: available` — continue below. `CODEX_LANE: unavailable until …` — the CLI itself
 refused an earlier launch (usage limit, model at capacity) and named when to retry; do not
 launch Codex for this round, hand the round to `/adversarial-review-internal` at once and say
-that the native engine reviewed because Codex is out until that time. The record is written by
-the PostToolUse hook from the CLI's own error text and expires on its own. In August 2026, 132
+that the native engine reviewed because Codex is out until that time. The record is written from
+the CLI's own error text — by the PostToolUse hook for a foreground call, by the Stop hook at a
+background lane's notification — and expires on its own. In August 2026, 132
 of 222 Codex review launches returned no verdict, most of them for exactly these two reasons,
 and every one of them cost the parent several full-context turns before the native lane ran
 anyway.

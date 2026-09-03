@@ -203,7 +203,7 @@ independent defects, all fixed in this addendum's change set.
 
 Also added: `state/gate-events.jsonl`, an append-only ledger of gate decisions, so the next
 question of this kind is answered from one file instead of a transcript replay.
-`test_gate.py` grew from 813 to 922 assertions (both acknowledgement shapes bound, pending wait
+`test_gate.py` grew from 813 to 926 assertions (both acknowledgement shapes bound, pending wait
 allowed and capped, stale task blocks, stopped or failed lane → draft-blocked, a required lane
 bound in the background, the verdict read from the rollout rather than the output file, a
 foreground review that mentions a background task is still a review, a task launched before the

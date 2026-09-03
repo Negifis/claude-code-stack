@@ -587,6 +587,11 @@ def transcript_evidence(path, since, skill_since=None):
                                               verdict=None, task=task_id, status=status,
                                               reason="no single briefed Codex verdict between "
                                                      "launch and notification")
+                                # The marker hook reads a foreground call's stderr when it
+                                # returns; a background lane returns at launch, so its outage
+                                # (usage limit, capacity) is only readable here, from the
+                                # capture the command named.
+                                record_background_outage(call)
                     continue
                 if stamp and stamp + 1 < skill_since:
                     continue
@@ -653,6 +658,7 @@ def transcript_evidence(path, since, skill_since=None):
                                 "started": stamp,
                                 "marked": required or REVIEW_INTENT_TOKEN in command,
                                 "call_id": call_id,
+                                "command": command,
                                 "label": command.strip().splitlines()[0][:80] if command.strip() else "",
                             }
                             evidence["external_calls"].append(
@@ -790,6 +796,15 @@ def user_text(entry):
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return ""
+
+
+def record_background_outage(call):
+    """Let the Codex lane breaker read a background launch's stderr capture, never raising."""
+    try:
+        import codex_lane
+        codex_lane.record_from_command(call.get("command", ""), "", started=call.get("started"))
+    except Exception:
+        pass
 
 
 def background_ack(text, foreground=None):
