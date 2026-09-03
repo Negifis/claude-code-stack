@@ -231,6 +231,8 @@ def register(args):
         print("GATE_OPS: pass --session <sessionId from mcp__ccd_session_mgmt__get_session self>",
               file=sys.stderr)
         return 2
+    # `session_id` and `name` are what `delivery` reads; the rest is for a person opening the
+    # file to see which chat this was and when it registered.
     record = {"session_id": session_id, "name": (args.name or "").strip(),
               "title": (args.title or "").strip(), "registered_at": time.time(),
               "cwd": os.getcwd()}

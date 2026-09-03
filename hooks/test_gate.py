@@ -1169,7 +1169,11 @@ for label, packet_on_disk, expect_bound in (
         seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
         events = [skill_use(now - 890, "development-verification", "skill-dev")]
         simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
-        command = 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(packet_file.replace(chr(92), "/"))
+        # The launch names the packet the way the shell does: a Git-Bash path for one case.
+        shell_path = packet_file.replace(chr(92), "/")
+        if expect_bound and re.match(r"^[A-Za-z]:/", shell_path):
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        command = 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(shell_path)
         events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
         events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
         events.append(notification(now - 600, task_id, out_file, "completed"))

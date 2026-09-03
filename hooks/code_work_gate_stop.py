@@ -118,6 +118,8 @@ CODEX_HEAD_BYTES = 4 * 1024 * 1024
 CODEX_TAIL_BYTES = 8 * 1024 * 1024
 _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
+# What each session was given inside the same window, from the same scan.
+_CODEX_GIVEN = {}
 # The session being judged, for the ledger lines written from inside the transcript scan — and
 # whether they are written at all: the inbox runs the same scan for inspection only.
 _SESSION = {"key": "", "effects": True}
@@ -319,7 +321,7 @@ def session_records(path, mtime_ns, size, started, finished):
         return _CODEX_SAID[key]
     role = reviewer_role()
     briefed_at = None
-    said = []
+    said, given = [], []
     try:
         with open(path, "rb") as raw:
             for line in read_span(raw, 0, min(size, CODEX_HEAD_BYTES)):
@@ -336,13 +338,19 @@ def session_records(path, mtime_ns, size, started, finished):
                 spoken = logged_output(record)
                 if spoken:
                     said.append((stamp, spoken))
-                elif role and role in normalized(logged_input(record)):
-                    # A resumed round is briefed again, right before it answers.
-                    briefed_at = stamp if briefed_at is None else min(briefed_at, stamp)
+                    continue
+                heard = logged_input(record)
+                if heard:
+                    heard = normalized(heard)
+                    given.append(heard)
+                    if role and role in heard:
+                        # A resumed round is briefed again, right before it answers.
+                        briefed_at = stamp if briefed_at is None else min(briefed_at, stamp)
     except OSError:
         pass
     # Only what the session said after it was briefed counts, and normalizing is deferred until
     # then: an errand's output is discarded whole, which on these logs is the common case.
+    _CODEX_GIVEN[key] = given
     _CODEX_SAID[key] = [] if briefed_at is None else [
         (at, normalized(text), text) for at, text in said if at >= briefed_at
     ]
@@ -477,33 +485,25 @@ def packet_text_of(command):
     match = PACKET_REDIRECT_RE.search(str(command or ""))
     if not match:
         return ""
-    path = match.group(1)
-    if re.match(r"^/[A-Za-z]/", path):
-        path = path[1] + ":" + path[2:]
     try:
+        import codex_lane
+        path = codex_lane.windows_path(match.group(1))
         with open(path, encoding="utf-8", errors="replace") as stream:
             return normalized(stream.read())
-    except OSError:
+    except (OSError, ImportError):
         return ""
 
 
 def session_given(path, mtime_ns, size, started, finished, packet):
-    """Whether this session was given the packet inside the call's window."""
+    """Whether this session was given the packet inside the call's window.
+
+    Read from the same scan that produced the session's records, so the shared read budget is
+    charged once per log, not once more per candidate.
+    """
     if not packet:
         return False
-    try:
-        with open(path, "rb") as raw:
-            for line in read_span(raw, max(0, seek_time(raw, size, started) - 1), size):
-                record = json_record(line)
-                stamp = parse_ts(record.get("timestamp"))
-                if stamp > finished + CODEX_RUN_SLACK:
-                    break
-                given = logged_input(record)
-                if given and packet in normalized(given):
-                    return True
-    except OSError:
-        pass
-    return False
+    session_records(path, mtime_ns, size, started, finished)
+    return any(packet in heard for heard in _CODEX_GIVEN.get((path, mtime_ns, size, started, finished), ()))
 
 
 def rollout_verdict(started, finished, since, command=""):
