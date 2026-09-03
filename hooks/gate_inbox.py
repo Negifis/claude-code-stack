@@ -7,6 +7,7 @@ the gate's own ledger by fixed rules. The gate-ops session reads the unresolved 
 
   gate_inbox.py report --block "<block reason, verbatim>" --facts "<what the transcript shows>"
                        [--did "<what was done instead>"] [--kind <label>] [--session <id>]
+                       [--transcript <path>]
   gate_inbox.py list | show <id> | ack <id> [--note "<what fixed it>"] | scan | digest
 
 A report is evidence for the person who maintains the gate, never a key that opens it: the Stop
@@ -38,24 +39,29 @@ def inbox_path():
     return os.path.join(cwg.config_home(), "state", "gate-anomalies.jsonl")
 
 
-def read_records():
-    """(reports, acks) from the inbox; a line that cannot be read is skipped, not fatal."""
-    reports, acks = [], {}
+def read_jsonl(path):
+    """The dict records of a JSONL file; a line that cannot be read, or a missing file, is skipped."""
     try:
-        with open(inbox_path(), encoding="utf-8", errors="replace") as stream:
+        with open(path, encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     record = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(record, dict):
-                    continue
-                if record.get("ack"):
-                    acks[str(record["ack"])] = record
-                elif record.get("id"):
-                    reports.append(record)
+                if isinstance(record, dict):
+                    yield record
     except OSError:
-        pass
+        return
+
+
+def read_records():
+    """(reports, acks) from the inbox."""
+    reports, acks = [], {}
+    for record in read_jsonl(inbox_path()):
+        if record.get("ack"):
+            acks[str(record["ack"])] = record
+        elif record.get("id"):
+            reports.append(record)
     return reports, acks
 
 
@@ -80,19 +86,7 @@ def unresolved():
 
 
 def ledger_events():
-    events = []
-    try:
-        with open(cwg.event_log_path(), encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(event, dict):
-                    events.append(event)
-    except OSError:
-        pass
-    return events
+    return list(read_jsonl(cwg.event_log_path()))
 
 
 def find_transcript(session_id):
@@ -100,12 +94,17 @@ def find_transcript(session_id):
     return max(hits, key=os.path.getmtime) if hits else ""
 
 
-def hook_view(transcript, marker):
-    """What the Stop hook's own scan sees in this transcript — the other side of the report."""
+def hook_view(transcript, marker, key):
+    """What the Stop hook's own scan sees in this transcript — the other side of the report.
+
+    The scan is the hook's own code, run here for inspection only: its ledger lines are switched
+    off so filing a report writes nothing the Stop hook would not have written itself.
+    """
     if not transcript:
         return {"available": False, "reason": "transcript not found"}
     try:
         import code_work_gate_stop as gate
+        gate._SESSION.update(key=key, ledger=False)
         first_ts = float(marker.get("first_ts") or marker.get("last_ts") or 0.0)
         evidence = gate.transcript_evidence(transcript, first_ts, skill_since=0.0)
         return {
@@ -132,7 +131,7 @@ def report(args):
     key = cwg.session_key(session_id)
     marker = cwg.read_json(cwg.marker_path(key)) or {}
     state = cwg.read_json(cwg.state_path(key)) or {}
-    transcript = find_transcript(session_id)
+    transcript = args.transcript or find_transcript(session_id)
     try:
         shape = cwg.candidate_shape(marker) if marker else None
     except Exception:
@@ -148,16 +147,18 @@ def report(args):
         "block_reason": args.block.strip(),
         "facts": args.facts.strip(),
         "did": (args.did or "").strip(),
-        "marker": dict(
-            {name: marker.get(name) for name in (
-                "first_ts", "last_ts", "last_durable_ts", "edits", "minimum_risk_seen",
-                "path_overflow", "unattributed_durable")},
-            paths=len(marker.get("paths") or []), shape=shape,
-        ),
+        "marker": {
+            "first_ts": marker.get("first_ts"), "last_ts": marker.get("last_ts"),
+            "last_durable_ts": marker.get("last_durable_ts"), "edits": marker.get("edits"),
+            "minimum_risk_seen": marker.get("minimum_risk_seen"),
+            "path_overflow": marker.get("path_overflow"),
+            "unattributed_durable": marker.get("unattributed_durable"),
+            "paths": len(marker.get("paths") or []), "shape": shape,
+        },
         "state": {name: state.get(name) for name in (
             "blocks", "waits", "last_block_ts", "last_block_reason", "candidate_key")},
         "ledger": [event for event in ledger_events() if event.get("session") == key][-LEDGER_TAIL:],
-        "hook_view": hook_view(transcript, marker),
+        "hook_view": hook_view(transcript, marker, key),
     }
     append(record)
     print("GATE_ANOMALY: {}".format(record["id"]))
@@ -281,6 +282,7 @@ def main(argv):
     filing.add_argument("--did", default="", help="what was done instead of obeying")
     filing.add_argument("--kind", default="agent", help="a short label for the anomaly")
     filing.add_argument("--session", default="", help="session id (default: CLAUDE_CODE_SESSION_ID)")
+    filing.add_argument("--transcript", default="", help="transcript path (default: found by session id)")
     filing.set_defaults(run=report)
     commands.add_parser("list").set_defaults(run=list_reports)
     showing = commands.add_parser("show")

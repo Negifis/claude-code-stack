@@ -1388,6 +1388,9 @@ try:
     check("a repeated block says so",
           second.get("decision") == "block" and "Same reason as the previous block" in second["reason"]
           and "Same reason" not in first["reason"], second)
+    third = run(STOP_HOOK, {"session_id": sid, "transcript_path": "C:/x/session.jsonl", "last_assistant_message": "done"})
+    check("the block reminder names the transcript when the hook was given one",
+          '--transcript "C:/x/session.jsonl"' in third["reason"], third["reason"][-400:])
     report_id = file_report(sid, block_reason_of(second), "the transcript holds the evidence the hook denies")
     result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the transcript holds the evidence".format(report_id)})
     check("a substantive block can be answered with a report",
@@ -1405,6 +1408,27 @@ try:
     check("a report filed before the block cannot close the candidate",
           result.get("decision") == "block" and "predates the last block" in result["reason"], result)
     inbox("ack", early)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- filing a report inspects the transcript without writing the hook's ledger lines
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    add_review(events, now - 700, "rev-quiet", review_text("APPROVED"))
+    transcript = write_transcript(events)
+    run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript, "last_assistant_message": "done"})
+    before = open(cwg.event_log_path(), encoding="utf-8").read().count(chr(10))
+    code, out, err = inbox("report", "--session", sid, "--transcript", transcript, "--block", "x", "--facts", "y")
+    after = open(cwg.event_log_path(), encoding="utf-8").read().count(chr(10))
+    check("filing a report writes no ledger lines", code == 0 and after == before, (before, after, err))
+    shown = json.loads(inbox("show", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))[1])
+    check("the report still carries the hook's view of the transcript",
+          shown["hook_view"].get("available") is True and shown["hook_view"].get("review_events"), shown["hook_view"])
+    inbox("ack", shown["id"])
 finally:
     cleanup(sid, locals().get("transcript"))
 

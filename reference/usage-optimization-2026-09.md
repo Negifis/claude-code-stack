@@ -225,4 +225,4 @@ quoting its reason (development-verification section 10). `gate_inbox.py scan` d
 anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
 review, a verdict expired within a minute of a review, a hook failure — the Stop hook now logs
 `hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
-the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 987.
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 993.

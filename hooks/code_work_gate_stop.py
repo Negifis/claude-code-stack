@@ -116,8 +116,14 @@ CODEX_HEAD_BYTES = 4 * 1024 * 1024
 CODEX_TAIL_BYTES = 8 * 1024 * 1024
 _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
-# The session being judged, for the ledger lines written from inside the transcript scan.
-_SESSION = {"key": ""}
+# The session being judged, for the ledger lines written from inside the transcript scan — and
+# whether they are written at all: the inbox runs the same scan for inspection only.
+_SESSION = {"key": "", "ledger": True}
+
+
+def review_note(**fields):
+    if _SESSION["ledger"]:
+        cwg.log_event("review", session=_SESSION["key"], **fields)
 REQUIRED_EXTERNAL_TOKEN = "CODE_WORK_GATE_REQUIRED"
 # Declared intent, never proof, and it governs one case only: whether a result that cannot be
 # attributed is heard as failed review activity. A verdict itself is heard because a briefed
@@ -591,12 +597,12 @@ def transcript_evidence(path, since, skill_since=None):
                             evidence["background_judged"].append(call["call_id"])
                             if bound:
                                 record_control(evidence, call["started"], control)
-                                cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
+                                review_note(at=stamp, engine="codex-background",
                                               verdict=control[1], task=task_id)
                             else:
                                 evidence["review_failures"].append(stamp)
                                 record_control(evidence, stamp, ("unbound", None), malformed=True)
-                                cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
+                                review_note(at=stamp, engine="codex-background",
                                               verdict=None, task=task_id, status=status,
                                               reason="no single briefed Codex verdict between "
                                                      "launch and notification")
@@ -647,7 +653,7 @@ def transcript_evidence(path, since, skill_since=None):
                                     evidence["review_failures"].append(stamp)
                                     record_control(evidence, stamp, ("unbound", None),
                                                    malformed=True)
-                                    cwg.log_event("review", session=_SESSION["key"], at=stamp, engine="codex-background",
+                                    review_note(at=stamp, engine="codex-background",
                                                   verdict=None, task=stopped,
                                                   status="stopped",
                                                   reason="the review task was stopped")
@@ -760,7 +766,7 @@ def transcript_evidence(path, since, skill_since=None):
                         )
                         if judged:
                             record_control(evidence, stamp, control)
-                            cwg.log_event("review", session=_SESSION["key"], at=stamp,
+                            review_note(at=stamp,
                                           engine="codex", verdict=control[1])
                         elif bound or (stated and call["marked"]):
                             # An unattributable verdict is never filed as one, but dropping it
@@ -792,7 +798,7 @@ def transcript_evidence(path, since, skill_since=None):
                     control = reviewer_control(text)
                     record_control(evidence, stamp, control, malformed=True)
                     if control[0] in ("ordinary", "closure"):
-                        cwg.log_event("review", session=_SESSION["key"], at=stamp,
+                        review_note(at=stamp,
                                       engine="native", verdict=control[1])
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
@@ -1345,7 +1351,7 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     return cwg.write_json(marker, current)
 
 
-def reminder(reason, block_number, operational, session_id="", repeated=False):
+def reminder(reason, block_number, operational, session_id="", repeated=False, transcript=""):
     if operational:
         contract = (
             "This candidate changed no lasting artifact: it ran commands or a throwaway "
@@ -1378,13 +1384,14 @@ def reminder(reason, block_number, operational, session_id="", repeated=False):
         "This is finite enforcement block {n}/{cap} for the unchanged candidate.{repeat} "
         "If this block contradicts facts you can verify in the transcript — the evidence exists "
         "in the shape required, or the hook asks to repeat a lane that already ran — do not "
-        "re-run lanes or poll: file `python \"{inbox}\" report --session {sid} --block "
+        "re-run lanes or poll: file `python \"{inbox}\" report --session {sid}{transcript} --block "
         "\"{reason}\" --facts \"<what the transcript shows>\" --did \"<what you did instead>\"` "
         "and end with `[gate] anomaly-reported: <id>; <fact>`, which closes this candidate "
         "UNVERIFIED with the report attached (development-verification section 10)."
     ).format(reason=reason, contract=contract, n=block_number, cap=MAX_BLOCKS_PER_CANDIDATE,
              repeat=" Same reason as the previous block." if repeated else "",
-             inbox=inbox, sid=session_id or "<session id>")
+             inbox=inbox, sid=session_id or "<session id>",
+             transcript=' --transcript \"{}\"'.format(transcript) if transcript else "")
 
 
 def waiting_note(running, waits):
@@ -1504,6 +1511,7 @@ def main():
             "reason": reminder(
                 reason, blocks + 1, candidate_class(entry) == cwg.WORK_OPERATIONAL,
                 session_id=str(data.get("session_id") or ""), repeated=repeated,
+                transcript=str(data.get("transcript_path") or ""),
             ),
         })
     except Exception as error:

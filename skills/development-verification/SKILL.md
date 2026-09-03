@@ -258,11 +258,13 @@ the block still stands, do not re-run lanes, do not poll, do not argue with the 
 report and finish honestly.
 
 ```
-python "~/.claude/hooks/gate_inbox.py" report --block "<the block reason, verbatim>" \
+python "~/.claude/hooks/gate_inbox.py" report --session <session id> \
+  --block "<the block reason, verbatim>" \
   --facts "<what the transcript shows, with timestamps or tool ids>" --did "<what you did instead>"
 ```
 
-It prints an id; end with `[gate] anomaly-reported: <id>; <the contradiction in one line>`. The
+The block text carries this command with the session id filled in (`CLAUDE_CODE_SESSION_ID` in
+the shell environment fills it in too). It prints an id; end with `[gate] anomaly-reported: <id>; <the contradiction in one line>`. The
 hook accepts that receipt only after it has blocked this candidate, for a report filed after
 that block and quoting its reason, and closes the candidate UNVERIFIED with the report attached
 — once per candidate, never as `verified`. The report reaches the gate-ops session, which fixes
