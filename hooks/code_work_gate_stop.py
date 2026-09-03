@@ -59,6 +59,7 @@ PRE_CANDIDATE_TOKENS = (
     '"Skill"', '"SlashCommand"', '"TaskStop"',
     "in background with ID", "moved to the background", "Async agent launched",
 )
+NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
 MAX_REVIEW_ROUNDS = 3
@@ -552,11 +553,13 @@ def transcript_evidence(path, since, skill_since=None):
                     continue
                 stamp = parse_ts(entry.get("timestamp"))
                 if entry.get("type") == "user" and "task-notification" in raw:
-                    text = user_text(entry)
-                    if "<task-notification>" in text:
-                        status_match = NOTIFICATION_STATUS_RE.search(text)
+                    # Only the harness's own notification record is handled here; a tool
+                    # result that merely mentions the word is ordinary evidence below.
+                    notices = NOTIFICATION_RE.findall(user_text(entry))
+                    for notice in notices:
+                        status_match = NOTIFICATION_STATUS_RE.search(notice)
                         status = (status_match.group(1) if status_match else "?").strip().lower()
-                        for task_id in NOTIFICATION_ID_RE.findall(text):
+                        for task_id in NOTIFICATION_ID_RE.findall(notice):
                             if task_id.startswith("__orphan"):
                                 continue
                             evidence["background_done"][task_id] = (stamp, status)
@@ -571,13 +574,18 @@ def transcript_evidence(path, since, skill_since=None):
                                 if status == "completed" else None
                             )
                             bound = control is not None
+                            # The verdict covers the candidate as it was when the review was
+                            # launched — nothing edited after the launch was in the packet —
+                            # so a bound verdict is filed at the launch, and a durable edit
+                            # since then expires it exactly as it would a foreground one. A
+                            # failure is filed when it became known.
                             evidence["external_results"].append(
-                                (stamp, call["call_id"], call["required"],
-                                 "success" if bound else "failure")
+                                (call["started"] if bound else stamp, call["call_id"],
+                                 call["required"], "success" if bound else "failure")
                             )
                             evidence["background_judged"].append(call["call_id"])
                             if bound:
-                                record_control(evidence, stamp, control)
+                                record_control(evidence, call["started"], control)
                                 cwg.log_event("review", engine="codex-background",
                                               verdict=control[1], task=task_id)
                             else:
@@ -592,7 +600,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 # (usage limit, capacity) is only readable here, from the
                                 # capture the command named.
                                 record_background_outage(call)
-                    continue
+                    if notices:
+                        continue
                 if stamp and stamp + 1 < skill_since:
                     continue
                 before_candidate = bool(stamp) and stamp + 1 < since

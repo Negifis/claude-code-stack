@@ -41,6 +41,9 @@ file is for you to read, not evidence. So do not poll: no `sleep`/`tail` loops o
 stderr capture, no `Monitor`, no `TaskOutput` — each poll is a full-context request that buys
 nothing, and the Stop hook lets a turn end while this session's own review is still running.
 Read the output file and `codex-<id>.err` only after the notification, to report the findings.
+Launch the review last: the verdict is filed at the launch, because the packet froze the
+candidate then, so an edit to a lasting file after the launch expires it exactly as it would a
+foreground verdict.
 Carry the literal marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is what makes
 the launch a review lane rather than an errand, so a review that ran but could not be
 attributed still counts as an unresolved lane instead of vanishing. The result must end with

@@ -1221,6 +1221,75 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a background verdict covers the candidate as launched, not as notified
+sid = session()
+try:
+    now = time.time()
+    task_id = "bedit" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    # The lasting edit lands after the launch and after Codex spoke, before the notification.
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 620, durable_ts=now - 620)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a durable edit after the launch expires a background verdict delivered later",
+          result.get("decision") == "block" and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- lane results that mention task notifications are still lane results
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    events.append(entry(now - 880, "assistant", [{
+        "type": "tool_use", "id": "simp-note", "name": "Agent",
+        "input": {"subagent_type": "simplify-reviewer", "run_in_background": False,
+                  "description": "simplify"},
+    }]))
+    events.append(tool_result(now - 870, "simp-note",
+                              "Checked the task-notification parsing and the <task-notification> handling: no findings."))
+    events.append(entry(now - 700, "assistant", [{
+        "type": "tool_use", "id": "rev-note", "name": "Agent",
+        "input": {"subagent_type": "adversarial-reviewer", "run_in_background": False,
+                  "description": "review"},
+    }]))
+    events.append(tool_result(now - 690, "rev-note",
+                              "The task-notification branch is sound.\n" + review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; native review of the notification parser"})
+    check("lane results mentioning task notifications are read as lane results",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- one notification record may carry several tasks, each with its own status
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmix" + uuid.uuid4().hex[:5]
+    other_id = "bmixo" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    mixed = (
+        "<task-notification>\n<task-id>{}</task-id>\n<status>completed</status>\n</task-notification>\n"
+        "<task-notification>\n<task-id>{}</task-id>\n<status>failed</status>\n</task-notification>"
+    ).format(other_id, task_id)
+    events.append(entry(now - 600, "user", [{"type": "text", "text": mixed}]))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a failed task in a batched notification is not judged by its neighbour's status",
+          result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
 # --- a background lane that hit the usage limit trips the breaker at its notification
 sid = session()
 try:
@@ -1303,6 +1372,15 @@ for command, expected in (
     ("rg --pre cat foo", True),
     ("date -s '2020-01-01'", True),
     ("hostname newname", True),
+    ("cat <(rm -f hooks/x.py)", True),
+    ("diff <(git show HEAD:a) <(cat a)", True),
+    ("sort -uo reviewed.py reviewed.py", True),
+    ("sort -oreviewed.py input", True),
+    ("sort --ignore-case input | head", False),
+    ("GIT_EXTERNAL_DIFF=./evil.sh git diff", True),
+    ("git -c diff.external=./evil.sh diff", True),
+    ("git -c core.fsmonitor=./evil.sh status", True),
+    ("RIPGREP_CONFIG_PATH=./evil rg foo", True),
     ("", False),
 ):
     check("write-capable: {!r} -> {}".format(command[:50], expected),
@@ -1314,6 +1392,8 @@ for command, expected in (
     ("Get-ChildItem -Recurse | Where-Object { $_.Length -gt 5MB }", True),
     ("Set-Content x.py 'y'", True),
     ("git status --porcelain | Measure-Object -Line", False),
+    ("Write-Output ([IO.File]::WriteAllText('C:/x/auth.py','evil'))", True),
+    ("Get-Content x.py | Select-Object -First 3", False),
 ):
     check("write-capable (PowerShell): {!r} -> {}".format(command[:50], expected),
           marker_hook.write_capable({"tool_name": "PowerShell", "tool_input": {"command": command}}) is expected,

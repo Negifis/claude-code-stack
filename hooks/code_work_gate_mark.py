@@ -133,14 +133,20 @@ MUTATING_ARGS = {
     "find": re.compile(r"(?:^|\s)-(?:delete|exec(?:dir)?|ok(?:dir)?|fprint0?|fprintf|fls)\b"),
     "fd": re.compile(r"(?:^|\s)(?:-x|-X|--exec(?:-batch)?)\b"),
     "rg": re.compile(r"(?:^|\s)--pre\b"),
-    "sort": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
-    "tree": re.compile(r"(?:^|\s)-o\b"),
+    # `-o` also inside a single-dash cluster or attached to its operand: `-uo f f`, `-ofile`.
+    "sort": re.compile(r"(?:^|\s)(?:-(?!-)\w*o|--output\b)"),
+    "tree": re.compile(r"(?:^|\s)-(?!-)\w*o"),
     "date": re.compile(r"(?:^|\s)(?:-s\b|--set\b)"),
     "git": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
 }
+# `-c key=value` is not skipped: it can point a reading subcommand at an external program
+# (`diff.external`, `core.fsmonitor`), and so falls through as an unknown subcommand.
 GIT_GLOBAL_OPTIONS_RE = re.compile(
-    r"^(?:(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+|-c\s+\S+)\s+)+"
+    r"^(?:(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+)\s+)+"
 )
+# Argument shapes that execute something whatever the command: a sub-expression or type
+# accessor in PowerShell, a bracket expression or grouping in either shell.
+EXECUTING_ARGUMENT_RE = re.compile(r"[(\[]|::")
 # Only a discarded or merged stderr is not a file the command may have written into.
 HARMLESS_REDIRECT_RE = re.compile(r"2>\s*(?:/dev/null|\$null|nul\b)|2>&1|1>&2|>&2")
 SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\r\n]")
@@ -210,7 +216,7 @@ def git_read_only(arguments):
 
 def read_only_pipeline(command):
     """Whether every segment of the command is a command proven not to write, arguments included."""
-    if "$(" in command or "`" in command or "<<" in command or "{" in command:
+    if any(token in command for token in ("$(", "<(", ">(", "`", "<<", "{")):
         return False
     # A merged stderr (`2>&1`) is dropped before splitting, or its `&` would cut the pipeline.
     cleaned = HARMLESS_REDIRECT_RE.sub(" ", command)
@@ -219,7 +225,13 @@ def read_only_pipeline(command):
     for segment in SEGMENT_SPLIT_RE.split(cleaned):
         if not segment.strip():
             continue
+        # An environment assignment can redirect a reading command to an external program
+        # (`GIT_EXTERNAL_DIFF`, `RIPGREP_CONFIG_PATH`), so a prefixed segment is not proven.
+        if ENV_ASSIGNMENT_RE.match(segment.strip().lstrip("({!").strip()):
+            return False
         head, rest = command_head(segment)
+        if EXECUTING_ARGUMENT_RE.search(rest):
+            return False
         if head == "git":
             if git_read_only(rest):
                 continue
