@@ -91,6 +91,12 @@ so the receipt shape is never a surprise.
   failures. State the exact limitation; do not expand the task to repair the baseline.
 - Keep tool output out of context: tail or grep a log, run a suite with a failures-only
   reporter, read a fragment rather than a file, and never paste a diff twice.
+- Work that outlasts a foreground call — a Codex review, a broad suite, a server — is
+  launched into the background and the turn ends; its completion notification resumes the
+  work. Never poll a background task (`sleep`/`tail` loops, `Monitor`, `TaskOutput`): the
+  Stop hook lets a turn end while this session's own task is in flight, bounded to eight
+  such stops per candidate and two hours per task, and a task that was stopped or reported
+  `failed` is recorded as failed lane activity.
 
 ## 5. Bounded simplify
 
@@ -112,8 +118,9 @@ control-flow, type/error, resource, or efficiency concern).
 For HIGH risk on a lasting artifact, or when the user explicitly requests it, run exactly one
 review lane per round, chosen in this order:
 
-1. **Codex** through `/adversarial-review`, in the foreground, the packet opening on the
-   contents of `agents/adversarial-reviewer.md`, the review returned verbatim. Cross-engine
+1. **Codex** through `/adversarial-review`, launched into the background
+   (`run_in_background: true`) and judged at its completion notification from the task's
+   output file, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
    judgment is worth more than a second opinion from the model that wrote the code. Run
    `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
    at capacity) means the lane is skipped for this round, not retried.
@@ -122,9 +129,10 @@ review lane per round, chosen in this order:
    fails before a verdict on its one allowed resume, or the user declines it. Say which engine
    reviewed and why when it was not Codex.
 
-Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict-bearing
-call must return as an observable foreground result. One ledger and one round budget span the
-lanes: switching engines continues the review, never restarts it. Add at most one specialist
+Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict must be
+observable in the transcript — the native lane as a foreground result, the Codex lane as the
+output file bound at its notification — never as a summary you wrote. One ledger and one round
+budget span the lanes: switching engines continues the review, never restarts it. Add at most one specialist
 only for a named non-overlapping risk; the lane that owns the verdict keeps it.
 
 Obtain the verdict as the last step. Editing a lasting artifact after an approval invalidates

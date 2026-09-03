@@ -30,6 +30,24 @@ import code_work_gate_common as cwg  # noqa: E402
 cwg.configure_utf8_streams()
 
 MAX_BLOCKS_PER_CANDIDATE = 3
+# A turn may end without a receipt while this session's own background work is still running:
+# the harness resumes the session with the task's completion notification, and blocking here
+# only made the parent poll the task in a loop (364 polling calls in one session on 2026-09-02).
+# Bounded twice: a task older than this is treated as dead, and a candidate gets this many
+# waiting stops before the ordinary block applies again.
+BACKGROUND_WAIT_LIMIT = 2 * 3600.0
+MAX_BACKGROUND_WAITS = 8
+BACKGROUND_ACK_RE = re.compile(
+    r"(?:running in background with ID|moved to the background \(ID): ?([A-Za-z0-9_-]+)"
+)
+AGENT_BG_RE = re.compile(r"Async agent launched[^\n]*\n?agentId: ([A-Za-z0-9_-]+)")
+OUTPUT_FILE_RE = re.compile(r"Output is being written to: ([^\n]+?\.output)")
+NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
+NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
+NOTIFICATION_FILE_RE = re.compile(r"<output-file>([^<]+)</output-file>")
+# How much of a background review's output file is read back for its verdict: the review
+# itself is a few kilobytes and the verdict is its last line.
+OUTPUT_TAIL_BYTES = 256 * 1024
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
@@ -145,10 +163,7 @@ def skill_name(block):
 
 
 def codex_sessions_root():
-    home = os.environ.get("CODEX_HOME") or os.path.join(
-        os.path.expanduser("~"), ".codex"
-    )
-    return os.path.join(home, "sessions")
+    return os.path.join(cwg.codex_home(), "sessions")
 
 
 def codex_run_files(since):
@@ -460,12 +475,18 @@ def transcript_evidence(path, since, skill_since=None):
         "review_events": [],
         "external_calls": [],
         "external_results": [],
+        "background": {},
+        "background_done": {},
         "scan_failed": False,
     }
     if not path or not os.path.isfile(path):
         return evidence
 
     calls = {}
+    # Background launches keyed by task id, so the completion notification can be matched to
+    # the call that started it. A marked Codex launch that went to the background is judged
+    # when its notification arrives, from the output file the harness wrote for it.
+    background_calls = {}
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
             for raw in stream:
@@ -473,6 +494,7 @@ def transcript_evidence(path, since, skill_since=None):
                     '"tool_use"' not in raw
                     and '"tool_result"' not in raw
                     and '"name"' not in raw
+                    and "task-notification" not in raw
                 ):
                     continue
                 try:
@@ -484,6 +506,42 @@ def transcript_evidence(path, since, skill_since=None):
                     evidence["scan_failed"] = True
                     continue
                 stamp = parse_ts(entry.get("timestamp"))
+                if entry.get("type") == "user" and "task-notification" in raw:
+                    text = user_text(entry)
+                    if "<task-notification>" in text:
+                        status_match = NOTIFICATION_STATUS_RE.search(text)
+                        status = (status_match.group(1) if status_match else "?").strip().lower()
+                        file_match = NOTIFICATION_FILE_RE.search(text)
+                        output_file = file_match.group(1).strip() if file_match else ""
+                        for task_id in NOTIFICATION_ID_RE.findall(text):
+                            if task_id.startswith("__orphan"):
+                                continue
+                            evidence["background_done"][task_id] = (stamp, status)
+                            call = background_calls.pop(task_id, None)
+                            if not call or stamp + 1 < since:
+                                continue
+                            # A backgrounded review lane reports through its output file.
+                            text_out = output_tail(output_file or call.get("output_file") or "")
+                            control = reviewer_control(text_out)
+                            stated = control[0] in ("ordinary", "closure")
+                            bound = stated and status == "completed" and codex_produced(
+                                text_out, call["started"], stamp, skill_since
+                            )
+                            evidence["external_results"].append(
+                                (stamp, call["call_id"], call["required"],
+                                 "success" if bound else "failure")
+                            )
+                            if bound:
+                                record_control(evidence, stamp, control)
+                                cwg.log_event("review", engine="codex-background",
+                                              verdict=control[1], task=task_id)
+                            else:
+                                evidence["review_failures"].append(stamp)
+                                record_control(evidence, stamp, ("unbound", None), malformed=True)
+                                cwg.log_event("review", engine="codex-background",
+                                              verdict=None, task=task_id, status=status,
+                                              reason="no bound verdict in the task output")
+                    continue
                 if stamp and stamp + 1 < skill_since:
                     continue
                 before_candidate = bool(stamp) and stamp + 1 < since
@@ -509,6 +567,26 @@ def transcript_evidence(path, since, skill_since=None):
                         if not isinstance(payload, dict):
                             continue
                         call_id = block.get("id")
+                        if tool_name == "TaskStop":
+                            stopped = str(payload.get("task_id") or "")
+                            if stopped:
+                                evidence["background_done"][stopped] = (stamp, "stopped")
+                                call = background_calls.pop(stopped, None)
+                                if call:
+                                    # A review lane stopped by hand is failed lane activity,
+                                    # exactly like a failed notification: it reopens an
+                                    # earlier approval rather than leaving it the last word.
+                                    evidence["external_results"].append(
+                                        (stamp, call["call_id"], call["required"], "failure")
+                                    )
+                                    evidence["review_failures"].append(stamp)
+                                    record_control(evidence, stamp, ("unbound", None),
+                                                   malformed=True)
+                                    cwg.log_event("review", engine="codex-background",
+                                                  verdict=None, task=stopped,
+                                                  status="stopped",
+                                                  reason="the review task was stopped")
+                            continue
                         if tool_name in cwg.SHELL_TOOLS and call_id:
                             command = str(payload.get("command") or "")
                             required = REQUIRED_EXTERNAL_TOKEN in command
@@ -516,7 +594,9 @@ def transcript_evidence(path, since, skill_since=None):
                             # detached — the harness omits the field entirely for the ordinary
                             # case, so demanding an explicit false here made every real Codex
                             # result invisible and left the native lane as the only one that
-                            # could satisfy a HIGH candidate.
+                            # could satisfy a HIGH candidate. A detached launch, or a foreground
+                            # one the harness moved to the background at its timeout, is judged
+                            # later from its completion notification and output file.
                             foreground = payload.get("run_in_background") is not True
                             calls[call_id] = {
                                 "kind": "external",
@@ -524,6 +604,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 "foreground": foreground,
                                 "started": stamp,
                                 "marked": required or REVIEW_INTENT_TOKEN in command,
+                                "call_id": call_id,
+                                "label": command.strip().splitlines()[0][:80] if command.strip() else "",
                             }
                             evidence["external_calls"].append(
                                 (stamp, call_id, required, foreground)
@@ -541,26 +623,51 @@ def transcript_evidence(path, since, skill_since=None):
                         # polarity of the shell check above is deliberate: the two tools carry
                         # opposite defaults, and unifying them would blind one lane.
                         foreground = payload.get("run_in_background") is False
+                        agent_call = {
+                            "kind": "agent",
+                            "subtype": subtype,
+                            "foreground": foreground,
+                            "started": stamp,
+                            "label": str(payload.get("description") or subtype)[:80],
+                        }
                         if subtype in SIMPLIFY_REVIEWERS:
-                            calls[call_id] = {
-                                "kind": "simplify",
-                                "subtype": subtype,
-                                "foreground": foreground,
-                            }
+                            agent_call["kind"] = "simplify"
                         elif "adversarial-reviewer" in subtype:
-                            calls[call_id] = {
-                                "kind": "review",
-                                "subtype": subtype,
-                                "foreground": foreground,
-                            }
+                            agent_call["kind"] = "review"
+                        calls[call_id] = agent_call
 
-                    if before_candidate or block.get("type") != "tool_result":
+                    if block.get("type") != "tool_result":
                         continue
                     call = calls.get(block.get("tool_use_id"))
-                    if not call or not call["foreground"]:
+                    if not call:
+                        continue
+                    text = result_text(block)
+                    # Background bookkeeping spans the whole transcript: a server started
+                    # before the candidate opened is still this session's running work.
+                    ack = BACKGROUND_ACK_RE.search(text) if call["kind"] == "external" else None
+                    if ack:
+                        task_id = ack.group(1)
+                        file_match = OUTPUT_FILE_RE.search(text)
+                        evidence["background"][task_id] = {
+                            "started": stamp, "kind": "shell", "label": call.get("label", ""),
+                            "review": bool(call.get("marked")),
+                        }
+                        if call.get("marked"):
+                            background_calls[task_id] = dict(
+                                call, output_file=(file_match.group(1).strip() if file_match else "")
+                            )
+                        continue
+                    if call["kind"] in ("agent", "simplify", "review") and not call["foreground"]:
+                        launched = AGENT_BG_RE.search(text)
+                        if launched:
+                            evidence["background"][launched.group(1)] = {
+                                "started": stamp, "kind": "agent", "label": call.get("label", ""),
+                                "review": call["kind"] == "review",
+                            }
+                        continue
+                    if before_candidate or call["kind"] == "agent" or not call["foreground"]:
                         continue
                     failed = bool(block.get("is_error"))
-                    text = result_text(block)
                     if call["kind"] == "external":
                         # A review round is a terminal control line the session log shows a Codex
                         # run producing while the call was open — text alone can be printed by
@@ -619,6 +726,48 @@ def transcript_evidence(path, since, skill_since=None):
         # followed it. A lasting artifact cannot be signed off on a partial scan.
         evidence["scan_failed"] = True
     return evidence
+
+
+def user_text(entry):
+    """The plain text of a user record: a string body, or its text blocks joined."""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def output_tail(path):
+    """The end of a background task's output file, or empty when it cannot be read."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - OUTPUT_TAIL_BYTES))
+            return stream.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def in_flight(evidence, now=None):
+    """Background tasks this session started that have not reported back and are not stale."""
+    now = time.time() if now is None else now
+    running = []
+    for task_id, task in evidence.get("background", {}).items():
+        if task_id in evidence.get("background_done", {}):
+            continue
+        if now - task["started"] > BACKGROUND_WAIT_LIMIT:
+            continue
+        running.append(dict(task, id=task_id))
+    running.sort(key=lambda task: task["started"])
+    return running
 
 
 marker_paths = cwg.marker_paths
@@ -1103,8 +1252,31 @@ def reminder(reason, block_number, operational):
         )
     return (
         "[Code Work Gate] Cannot finalize this candidate: {}.\n{}\n"
+        "A turn may end while this session's own background task (a review, a test run, a "
+        "server) is still running: the completion notification resumes the work, so wait for "
+        "it instead of polling. "
         "This is finite enforcement block {}/{} for the unchanged candidate."
     ).format(reason, contract, block_number, MAX_BLOCKS_PER_CANDIDATE)
+
+
+def waiting_note(running, waits):
+    """What the parent sees when a stop is allowed only because background work is running."""
+    kinds = {"shell": "shell command", "agent": "background agent"}
+    named = ", ".join(
+        "{} ({}{}{})".format(
+            task["id"], kinds.get(task["kind"], task["kind"]),
+            ", review lane" if task.get("review") else "",
+            ": " + task["label"] if task.get("label") else "",
+        )
+        for task in running[:4]
+    )
+    more = "" if len(running) <= 4 else " and {} more".format(len(running) - 4)
+    return (
+        "[Code Work Gate] The candidate is still open, but this session's background work is "
+        "running: {}{}. The turn may end now; the completion notification resumes it. Do not "
+        "poll the task. When the work is done, finish with the terminal receipt. "
+        "(background wait {}/{} for this candidate)"
+    ).format(named, more, waits, MAX_BACKGROUND_WAITS)
 
 
 def main():
@@ -1132,23 +1304,37 @@ def main():
         if state.get("candidate_key") != key_now:
             state["candidate_key"] = key_now
             state["blocks"] = 0
+            state["waits"] = 0
         state["candidate_ts"] = candidate_ts
 
         receipt = receipt_of(data.get("last_assistant_message"))
         preflight_ok, reason = receipt_preflight(receipt, entry)
+        # The transcript is read once whatever the receipt looked like: the same scan answers
+        # whether this session still has background work running.
+        evidence = transcript_evidence(
+            data.get("transcript_path"), first_ts, skill_since=0.0
+        )
         if preflight_ok:
-            evidence = transcript_evidence(
-                data.get("transcript_path"), first_ts, skill_since=0.0
-            )
             valid, reason = evaluate_receipt(receipt, entry, evidence)
         else:
             valid = False
         if valid:
             if close_cycle(marker, state_file, state, candidate_ts, receipt, key):
+                cwg.log_event("close", session=key, receipt=receipt[0], risk=receipt[2])
                 allow("Code Work Gate recorded terminal state: {}".format(receipt[0]))
             else:
                 allow("Code Work Gate could not retire its state and is failing open.")
             return
+
+        running = in_flight(evidence)
+        waits = int(state.get("waits") or 0)
+        if running and waits < MAX_BACKGROUND_WAITS:
+            state["waits"] = waits + 1
+            if cwg.write_json(state_file, state):
+                cwg.log_event("wait", session=key, reason=reason, waits=waits + 1,
+                              tasks=[task["id"] for task in running][:8])
+                allow(waiting_note(running, waits + 1))
+                return
 
         blocks = int(state.get("blocks") or 0)
         if blocks >= MAX_BLOCKS_PER_CANDIDATE:
@@ -1167,6 +1353,8 @@ def main():
         if not cwg.write_json(state_file, state):
             allow("Code Work Gate state is unavailable and enforcement is failing open.")
             return
+        cwg.log_event("block", session=key, reason=reason, block=blocks + 1,
+                      candidate_class=candidate_class(entry))
         emit({
             "decision": "block",
             "reason": reminder(

@@ -99,6 +99,22 @@ AGENT_CONFIG_LIMIT = 8192
 # copy, not the session's work; the sources they are copied from are watched in the homes above.
 # Attribution only, like the skip list: an edit made through Edit/Write is still gated by path.
 SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNORECASE)
+# Commands that could rewrite a file even though the snapshot could not see it: an interpreter
+# running code or a script, an in-place editor, a redirect into a file, a VCS operation that
+# moves the working tree. The review verdict expires on an unresolved shell mutation only for
+# these. `git status --porcelain | wc -l` seven seconds after a Codex approval expired that
+# approval on 2026-09-03 and cost the session a native review round it did not need; nothing
+# that command can do touches a lasting artifact.
+WRITE_CAPABLE_RE = re.compile(
+    r"(?im)("
+    r"\b(?:python3?|py|node|deno|bun|ruby|perl|php|pwsh|powershell(?:\.exe)?|bash|sh|zsh|cmd(?:\.exe)?)\b"
+    r"(?![^\r\n]*\b(?:--version|-V\b|codex_lane\.py check))|"
+    r"(?<![0-9&<])(?:&>|>>?)\s*(?!/dev/null|nul\b|&)|"
+    r"<<-?\s*['\"]?\w|"
+    r"\bgit\s+(?:checkout|switch|merge|rebase|stash|reset|cherry-pick|pull|am|restore|revert|clean)\b|"
+    r"\b(?:cp|install|patch|dd|mkdir|touch|chmod|unzip|tar)\b"
+    r")"
+)
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
 SHELL_UNKNOWN = "UNKNOWN_OR_MUTATING"
@@ -114,6 +130,24 @@ def shell_write(data):
         return False
     command = str((data.get("tool_input") or {}).get("command") or "")
     return bool(SHELL_WRITE_RE.search(command))
+
+
+def write_capable(data):
+    """Whether this shell command could have rewritten a file the snapshot did not see.
+
+    Broader than `shell_write`, which names the shapes that definitely write and therefore keep
+    their whole delta in `own_delta`; this one only decides whether an unresolved mutation may
+    expire a review verdict. A validation command is deliberately outside it: reruns of the
+    checks the skill asks for never edit source.
+    """
+    if str(data.get("tool_name") or "") not in cwg.SHELL_TOOLS:
+        return False
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    if shell_write(data):
+        return True
+    if VALIDATION_SHELL_RE.match(command) and "$(" not in command:
+        return False
+    return bool(WRITE_CAPABLE_RE.search(command))
 
 
 def shell_policy(data):
@@ -222,11 +256,10 @@ def git_snapshot(cwd):
 
 def agent_config_roots():
     """The agent-configuration homes, honouring the environment overrides the tools read."""
-    home = os.path.expanduser("~")
     return (
-        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"),
-        os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"),
-        os.path.join(home, ".agents"),
+        cwg.config_home(),
+        cwg.codex_home(),
+        os.path.join(os.path.expanduser("~"), ".agents"),
     )
 
 
@@ -618,7 +651,7 @@ def outside_snapshot(paths, roots, watched=()):
 
 
 def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
-                 watched_roots=(), unattributed_risk=None):
+                 watched_roots=(), unattributed_risk=None, write_capable_command=True):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
     `unattributed_risk` is the grade of a lasting change seen during this command that no
@@ -659,7 +692,13 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     # edit forced a fresh review round for work the verdict already covered. An unresolved
     # mutation is the exception: it could have edited source through the shell, so once the
     # cycle holds durable paths it must expire the verdict the same way a named edit would.
-    expired = unresolved or outside_snapshot(paths, snapshot_roots, watched_roots)
+    # Only a command that could actually write expires a verdict on the strength of what the
+    # snapshot could not see; the snapshot's own evidence (a durable path in `incoming`) always
+    # does. A read-only pipeline the policy regex does not recognise, or a git failure under
+    # load, must not cost a review round.
+    expired = write_capable_command and (
+        unresolved or bool(outside_snapshot(paths, snapshot_roots, watched_roots))
+    )
     # An unattributable durable change anchors freshness too, even though its path is not
     # recorded: without an anchor such a candidate keeps last_durable_ts at zero, the Stop hook
     # falls back to the whole-cycle timestamp, and every later command then expires the very
@@ -671,6 +710,15 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
+    if last_durable_ts == now:
+        cwg.log_event(
+            "durable", session=cwg.session_key(data.get("session_id")),
+            reason=("edit" if cwg.durable_paths(incoming) else
+                    "unattributed" if unattributed_risk else "unresolved-write-capable"),
+            paths=[p for p in cwg.durable_paths(incoming)][:5],
+            tool=str(data.get("tool_name") or ""),
+            command=str((data.get("tool_input") or {}).get("command") or "")[:160],
+        )
     return cwg.write_json(marker, {
         "first_ts": cycle["first_ts"],
         "last_ts": now,
@@ -832,7 +880,8 @@ def main():
                 if shell_paths:
                     cwg.publish_claims(session, paths=shell_paths, cwd=cwd)
                     record_paths(data, shell_paths, snapshot_roots=snapshot_roots,
-                                 watched_roots=watched_roots, unattributed_risk=floor)
+                                 watched_roots=watched_roots, unattributed_risk=floor,
+                                 write_capable_command=write_capable(data))
                 elif observed or not home_ground or policy == SHELL_UNKNOWN:
                     # An empty delta is not proof of no write: ignored files, and paths
                     # outside both the repository and the configuration homes, are invisible
@@ -850,6 +899,7 @@ def main():
                         snapshot_roots=snapshot_roots,
                         watched_roots=watched_roots,
                         unattributed_risk=floor,
+                        write_capable_command=write_capable(data),
                     )
         finally:
             # Closed on every path out of this block, and deliberately not before it: closing

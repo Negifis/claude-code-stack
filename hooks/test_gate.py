@@ -960,6 +960,189 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- background work: a review lane that went to the background, and turns that may end
+def notification(stamp, task_id, output_file, status="completed"):
+    text = (
+        "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n"
+        "<output-file>{}</output-file>\n<status>{}</status>\n"
+        "<summary>Background command \"review\" {}</summary>\n</task-notification>"
+    ).format(task_id, output_file, status, "completed (exit code 0)" if status == "completed" else status)
+    return entry(stamp, "user", [{"type": "text", "text": text}])
+
+
+def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-" + task_id, CODEX_CLI_COMMAND,
+                           run_in_background=(True if "running in background" in ack_text else None)))
+    events.append(tool_result(now - 699, "codex-" + task_id, ack_text))
+    if notify:
+        events.append(notification(now - 600, task_id, out_file, notify_status))
+    return events
+
+
+tasks_dir = os.path.join(AGENT_HOME, "tasks")
+os.makedirs(tasks_dir, exist_ok=True)
+for label, ack in (
+    ("a detached launch",
+     "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."),
+    ("a foreground launch the harness moved to the background",
+     "Command did not complete within its 120s timeout and was moved to the background (ID: {id}). Output is being written to: {out}. You will be notified when it completes."),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "btask" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        with open(out_file, "w", encoding="utf-8") as stream:
+            stream.write(codex_cli_output(review_text("APPROVED")))
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = background_review_events(now, task_id, out_file, ack.format(id=task_id, out=out_file))
+        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {
+            "session_id": sid, "transcript_path": transcript,
+            "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background",
+        })
+        check("{} is bound through its completion notification".format(label),
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bpend" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify=False))
+    payload = {"session_id": sid, "transcript_path": transcript,
+               "last_assistant_message": "Waiting for the review.\n[gate] verified: HIGH; pending"}
+    result = run(STOP_HOOK, payload)
+    check("a pending background review lets the turn end",
+          result.get("continue") is True and "decision" not in result, result)
+    check("the waiting note names the task and forbids polling",
+          task_id in result.get("systemMessage", "") and "Do not poll" in result.get("systemMessage", ""), result)
+    state = cwg.read_json(gate_paths(sid)[1]) or {}
+    check("a waiting stop is not a block", state.get("blocks", 0) == 0 and state.get("waits") == 1, state)
+    for _ in range(gate.MAX_BACKGROUND_WAITS - 1):
+        run(STOP_HOOK, payload)
+    result = run(STOP_HOOK, payload)
+    check("waiting stops are bounded per candidate", result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bdead" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    old = now - 4 * 3600
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=old - 200, last_ts=old - 100, durable_ts=old - 100)
+    events = [skill_use(old - 190, "development-verification", "skill-dev")]
+    simplify_wave(events, old - 180, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(old, "codex-dead", CODEX_CLI_COMMAND, run_in_background=True))
+    events.append(tool_result(old + 1, "codex-dead", "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a background task older than the wait limit no longer holds the gate open",
+          result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bfail" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify_status="failed"))
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the background Codex lane failed"})
+    check("a failed background review lane is current failure evidence for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bstop" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = "Command running in background with ID: {}. Output is being written to: {}.".format(task_id, out_file)
+    events = background_review_events(now, task_id, out_file, ack, notify=False)
+    events.append(entry(now - 500, "assistant", [{
+        "type": "tool_use", "id": "stop-1", "name": "TaskStop", "input": {"task_id": task_id},
+    }]))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a stopped background review is no longer in flight",
+          result.get("decision") == "block" and "systemMessage" not in result, result)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the background Codex lane was stopped"})
+    check("a stopped background review lane is current failure evidence for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- the ledger records the decision
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    ledger = cwg.event_log_path()
+    lines = open(ledger, encoding="utf-8").read().splitlines() if os.path.exists(ledger) else []
+    check("a block is written to the gate event ledger",
+          any('"kind": "block"' in line and sid in line for line in lines), ledger)
+finally:
+    cleanup(sid)
+
+# --- write-capable commands are the only ones that expire a verdict through an unresolved mutation
+for command, expected in (
+    ('cd "C:/repo" && git status --porcelain | wc -l && git rev-parse --short HEAD', False),
+    ("ls ~/.codex/sessions | tail -3", False),
+    ("npm test -- --runInBand", False),
+    ("python -c rewrite_source", True),
+    ("python - <<'PY'\nimport io\nPY", True),
+    ("ls > out.txt", True),
+    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err", False),
+    ("git merge --no-ff chip/x", True),
+    ("git commit -m x && git push", False),
+    ("sed -i 's/a/b/' file.py", True),
+):
+    check("write-capable: {!r} -> {}".format(command[:50], expected),
+          marker_hook.write_capable({"tool_name": "Bash", "tool_input": {"command": command}}) is expected,
+          command)
+
+with tempfile.TemporaryDirectory(prefix="cwg_quiet_") as outside:
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        run(MARK_HOOK, {
+            "session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write",
+            "cwd": outside, "tool_input": {"file_path": os.path.join(outside, "src", "app.py")},
+        })
+        approved_at = (cwg.read_json(marker) or {}).get("last_durable_ts")
+        payload = {
+            "session_id": sid, "tool_name": "Bash", "tool_use_id": "quiet-shell",
+            "cwd": outside,
+            "tool_input": {"command": 'cd "%s" && git status --porcelain | wc -l && git rev-parse --short HEAD' % outside},
+        }
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+        data = cwg.read_json(marker) or {}
+        check("an unresolved read-only pipeline does not expire the verdict",
+              cwg.valid_ts(approved_at) and data.get("last_durable_ts") == approved_at, data)
+        check("the quiet command still keeps the candidate open",
+              cwg.SHELL_MUTATION_PATH in (data.get("paths") or []), data)
+    finally:
+        cleanup(sid)
+
 # --- candidate_shape reads a marker exactly as the Stop hook's own classification does
 for label, marker_entry in (
     ("plain source", {"first_ts": 100.0, "last_ts": 110.0, "paths": ["c:/repo/src/app.py"], "minimum_risk_seen": "STANDARD"}),

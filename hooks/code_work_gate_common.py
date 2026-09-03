@@ -219,6 +219,41 @@ def candidate_shape(entry):
     }
 
 
+# One line per gate decision, so a verdict that "expired" or a block that surprised the parent
+# can be read back instead of reconstructed from a transcript. Bounded: rotated once at this size.
+EVENT_LOG_LIMIT = 1024 * 1024
+
+
+def config_home():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def event_log_path():
+    return os.path.join(config_home(), "state", "gate-events.jsonl")
+
+
+def log_event(kind, **fields):
+    """Append one gate event; never raises, never blocks a hook on its own bookkeeping."""
+    try:
+        path = event_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > EVENT_LOG_LIMIT:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        record = {"ts": time.time(), "kind": kind}
+        record.update(fields)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def receipt_requirements(floor):
     """The evidence a persistent candidate at this floor must carry, in one clause."""
     return {
