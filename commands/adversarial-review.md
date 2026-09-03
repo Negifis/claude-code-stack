@@ -47,7 +47,9 @@ foreground verdict.
 Feed the packet from a file on stdin (`- < /c/tmp/codex-packet-<id>.md`), never from a heredoc:
 the marker hook keeps a copy of that file at the launch, and the Stop hook binds the verdict to
 the Codex session that was given exactly that text — which is what keeps two reviews running at
-once from different chats apart.
+once from different chats apart. Write the packet in its own shell call and launch Codex in
+the next one: the copy is taken before the launch command runs, so a packet composed by the
+same command as the launch is not there yet and the verdict binds nothing.
 Carry the literal marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is what makes
 the launch a review lane rather than an errand, so a review that ran but could not be
 attributed still counts as an unresolved lane instead of vanishing. The result must end with

@@ -522,6 +522,11 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
     """
     fed, packet = packet_of_launch(command, call_id)
     if fed and not packet:
+        # The usual cause: the packet was written by the same shell command that launched
+        # Codex, so nothing existed when the marker hook looked before the command ran.
+        review_note(at=finished, engine="codex-background", verdict=None,
+                    reason="packet fed on stdin but no usable capture at launch; write the "
+                           "packet in its own call before launching")
         return None
     verdicts = {}
     for path, _ in codex_run_files(since):
