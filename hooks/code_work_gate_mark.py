@@ -110,7 +110,7 @@ READ_ONLY_COMMANDS = frozenset("""
     cd ls dir cat head tail grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
     stat file du df pwd echo printf date true false test [ type which where whoami
     printenv jq column nl tac basename dirname realpath readlink md5sum sha1sum sha256sum tree
-    ps tasklist nproc uname sleep
+    ps tasklist nproc uname sleep gh
     get-childitem get-content get-item get-command select-string select-object measure-object
     format-table format-list out-string write-output write-host test-path resolve-path
     get-process get-location get-date sort-object gci gc gi sls findstr
@@ -138,6 +138,9 @@ MUTATING_ARGS = {
     "tree": re.compile(r"(?:^|\s)-(?!-)\w*o"),
     "date": re.compile(r"(?:^|\s)(?:-s\b|--set\b)"),
     "git": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
+    # gh talks to GitHub; only these forms touch the working tree or the local clone.
+    "gh": re.compile(r"^\s*(?:pr\s+(?:checkout|merge)|repo\s+(?:clone|sync|fork|create)|"
+                     r"release\s+download|run\s+download|gist\s+clone|codespace|auth)\b"),
 }
 # `-c key=value` is not skipped: it can point a reading subcommand at an external program
 # (`diff.external`, `core.fsmonitor`), and so falls through as an unknown subcommand.

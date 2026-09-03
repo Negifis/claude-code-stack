@@ -464,15 +464,59 @@ def codex_produced(text, started, finished, since):
     )
 
 
-def rollout_verdict(started, finished, since):
+PACKET_REDIRECT_RE = re.compile(r"<\s*\"?([^\s\"<>|;&]+\.md)\"?")
+
+
+def packet_text_of(command):
+    """The normalized text of the packet a launch fed to Codex on stdin, or empty.
+
+    The packet is what the session was given, and Codex logs it verbatim, so it names the one
+    session among several that this launch started. A packet the model rewrote after the launch
+    no longer matches what was logged and binds nothing, which is the right direction too.
+    """
+    match = PACKET_REDIRECT_RE.search(str(command or ""))
+    if not match:
+        return ""
+    path = match.group(1)
+    if re.match(r"^/[A-Za-z]/", path):
+        path = path[1] + ":" + path[2:]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            return normalized(stream.read())
+    except OSError:
+        return ""
+
+
+def session_given(path, mtime_ns, size, started, finished, packet):
+    """Whether this session was given the packet inside the call's window."""
+    if not packet:
+        return False
+    try:
+        with open(path, "rb") as raw:
+            for line in read_span(raw, max(0, seek_time(raw, size, started) - 1), size):
+                record = json_record(line)
+                stamp = parse_ts(record.get("timestamp"))
+                if stamp > finished + CODEX_RUN_SLACK:
+                    break
+                given = logged_input(record)
+                if given and packet in normalized(given):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def rollout_verdict(started, finished, since, command=""):
     """The verdict one briefed Codex session stated between a background launch and its notification.
 
     The task's output file is the harness's copy of what Codex printed, and nothing keeps it that
     way afterwards, so it is not evidence: the verdict is read from the rollout log Codex wrote
-    itself, from records stamped inside the launch-to-notification window. Exactly one briefed
-    session may have spoken there — two are ambiguous, and an ambiguous verdict binds to
-    nothing, which is the safe direction.
+    itself, from records stamped inside the launch-to-notification window. When the launch fed a
+    packet on stdin, the session that was given that packet is the one; otherwise exactly one
+    briefed session may have spoken there — two are ambiguous, and an ambiguous verdict binds
+    to nothing, which is the safe direction.
     """
+    packet = packet_text_of(command)
     verdicts = {}
     for path, _ in codex_run_files(since):
         try:
@@ -489,10 +533,15 @@ def rollout_verdict(started, finished, since):
             control = reviewer_control(spoken)
             if control[0] in ("ordinary", "closure"):
                 # The session's last stated verdict inside the window is its answer.
-                verdicts[path] = control
+                verdicts[path] = (control, stat)
+    if packet:
+        verdicts = {
+            path: value for path, value in verdicts.items()
+            if session_given(path, value[1].st_mtime_ns, value[1].st_size, started, finished, packet)
+        }
     if len(verdicts) != 1:
         return None
-    return next(iter(verdicts.values()))
+    return next(iter(verdicts.values()))[0]
 
 
 def record_control(evidence, stamp, control, malformed=False):
@@ -565,10 +614,10 @@ def transcript_evidence(path, since, skill_since=None):
                     evidence["scan_failed"] = True
                     continue
                 stamp = parse_ts(entry.get("timestamp"))
-                if entry.get("type") == "user" and "task-notification" in raw:
+                if "task-notification" in raw and entry.get("type") in NOTIFICATION_RECORDS:
                     # Only the harness's own notification record is handled here; a tool
                     # result that merely mentions the word is ordinary evidence below.
-                    notices = NOTIFICATION_RE.findall(user_text(entry))
+                    notices = NOTIFICATION_RE.findall(notification_text(entry))
                     for notice in notices:
                         status_match = NOTIFICATION_STATUS_RE.search(notice)
                         status = (status_match.group(1) if status_match else "?").strip().lower()
@@ -583,7 +632,8 @@ def transcript_evidence(path, since, skill_since=None):
                             # wrote between the launch and this notification; its output file
                             # is for the parent to read, not evidence.
                             control = (
-                                rollout_verdict(call["started"], stamp, skill_since)
+                                rollout_verdict(call["started"], stamp, skill_since,
+                                                call.get("command", ""))
                                 if status == "completed" else None
                             )
                             bound = control is not None
@@ -809,6 +859,32 @@ def transcript_evidence(path, since, skill_since=None):
         # followed it. A lasting artifact cannot be signed off on a partial scan.
         evidence["scan_failed"] = True
     return evidence
+
+
+# Where the harness records a task notification: as a user turn when the session was idle,
+# and only as the queued command it absorbed mid-turn otherwise.
+NOTIFICATION_RECORDS = ("user", "queue-operation", "attachment")
+
+
+def notification_text(entry):
+    """The text of a record the harness wrote for a task notification, whichever shape it took.
+
+    A notification that arrives while the turn is running never becomes a user record: it is
+    enqueued (`queue-operation`, the text as `content`) and absorbed as a queued command
+    (`attachment` of type `queued_command`, the text as `prompt`). Reading both shapes is what
+    keeps a task that finished mid-turn from being counted as still running.
+    """
+    kind = entry.get("type")
+    if kind == "user":
+        return user_text(entry)
+    if kind == "queue-operation":
+        content = entry.get("content")
+        return content if isinstance(content, str) else ""
+    attachment = entry.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("commandMode") == "task-notification":
+        prompt = attachment.get("prompt")
+        return prompt if isinstance(prompt, str) else ""
+    return ""
 
 
 def user_text(entry):

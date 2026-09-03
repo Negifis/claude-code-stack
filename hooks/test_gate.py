@@ -310,7 +310,8 @@ def reviewer_role_text():
 
 
 def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True,
-                  partial_role=False, briefed_at=None, filler_bytes=0, earlier=None):
+                  partial_role=False, briefed_at=None, filler_bytes=0, earlier=None,
+                  packet="Round 1 packet."):
     """One Codex rollout log in the CLI's own shape.
 
     `logged` is what the session said, and only an assistant record stamped inside the call's
@@ -333,7 +334,7 @@ def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True
                 "payload": {"type": "message", "role": "developer",
                             "content": [{"type": "input_text",
                                          "text": (given[:300] if partial_role else given)
-                                                 + "\n\nRound 1 packet."}]},
+                                                 + "\n\n" + packet}]},
             }) + "\n")
         for at, text in earlier or ():
             # Earlier rounds of the same session, behind the bulk that follows them.
@@ -963,13 +964,28 @@ finally:
     cleanup(sid, locals().get("transcript"))
 
 # --- background work: a review lane that went to the background, and turns that may end
-def notification(stamp, task_id, output_file, status="completed"):
-    text = (
+def notification_text_for(task_id, output_file, status="completed"):
+    return (
         "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n"
         "<output-file>{}</output-file>\n<status>{}</status>\n"
         "<summary>Background command \"review\" {}</summary>\n</task-notification>"
     ).format(task_id, output_file, status, "completed (exit code 0)" if status == "completed" else status)
-    return entry(stamp, "user", [{"type": "text", "text": text}])
+
+
+def notification(stamp, task_id, output_file, status="completed"):
+    return entry(stamp, "user", [{"type": "text", "text": notification_text_for(task_id, output_file, status)}])
+
+
+def midturn_notification(stamp, task_id, output_file, status="completed"):
+    """A notification absorbed while the turn was running: queued, attached, never a user turn."""
+    text = notification_text_for(task_id, output_file, status)
+    return [
+        {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(stamp), "content": text},
+        {"type": "attachment", "timestamp": iso(stamp),
+         "attachment": {"type": "queued_command", "prompt": text, "commandMode": "task-notification"}},
+        {"type": "queue-operation", "operation": "remove", "timestamp": iso(stamp + 0.3), "content": text,
+         "reason": "absorbed_mid_turn"},
+    ]
 
 
 def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
@@ -1100,6 +1116,73 @@ try:
           result.get("continue") is True and "decision" not in result, result)
 finally:
     cleanup(sid, locals().get("transcript"))
+
+# --- a notification absorbed mid-turn is read from the queue records the harness leaves
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmid" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    events.extend(midturn_notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a review whose notification was absorbed mid-turn is bound all the same",
+          result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmidf" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    events.extend(midturn_notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a task that failed mid-turn is no longer in flight",
+          result.get("decision") == "block" and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- the packet the launch fed in names the session among several running at once
+for label, packet_on_disk, expect_bound in (
+    ("the session given this launch's packet is the one bound, another session alongside notwithstanding",
+     "Round 1 packet for the auth candidate", True),
+    ("a packet rewritten after the launch matches no session and binds nothing",
+     "Round 1 packet rewritten afterwards", False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "bpkt" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        packet_file = os.path.join(AGENT_HOME, "packet-" + task_id + ".md")
+        with open(packet_file, "w", encoding="utf-8") as stream:
+            stream.write(reviewer_role_text() + "\n\n" + packet_on_disk)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = [skill_use(now - 890, "development-verification", "skill-dev")]
+        simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+        command = 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(packet_file.replace(chr(92), "/"))
+        events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(now - 600, task_id, out_file, "completed"))
+        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")), packet="Round 1 packet for the auth candidate")
+        log_codex_run(now - 640, codex_cli_output(review_text("APPROVED", subject="another chat's candidate")),
+                      packet="Round 1 packet for another chat's candidate")
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
 
 # --- a background lane's verdict is what the rollout log says, not what the output file says
 for label, file_text, logged, expect_bound in (
@@ -1622,6 +1705,10 @@ for command, expected in (
     ("git -c diff.external=./evil.sh diff", True),
     ("git -c core.fsmonitor=./evil.sh status", True),
     ("RIPGREP_CONFIG_PATH=./evil rg foo", True),
+    ("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/x.md", True),
+    ("gh pr edit 2 --body-file /c/tmp/x.md && gh pr view 2 --json url", False),
+    ("gh pr checkout 7", True),
+    ("gh repo clone o/r", True),
     ("", False),
 ):
     check("write-capable: {!r} -> {}".format(command[:50], expected),

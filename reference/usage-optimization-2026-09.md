@@ -225,4 +225,12 @@ that block minted and quoting its reason (development-verification section 10). 
 anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
 review, an approval expired by a durable edit within a minute of being stated, a hook failure — the Stop hook now logs
 `hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
-the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1014.
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1030.
+
+Three more findings from this session's own ledger, fixed in the same change set: a task
+notification absorbed while the turn was running never becomes a user record (only the
+`queue-operation` and `attachment` records the harness leaves), so the Stop hook now reads
+those too; two Codex reviews running at once from different chats made the rollout binding
+ambiguous, so a background launch that fed a packet on stdin is now bound to the session that
+was given that packet; and `gh pr edit` run outside a repository expired a verdict, so `gh` is
+read-only unless it touches the tree (`pr checkout`, `pr merge`, `repo clone`…).
