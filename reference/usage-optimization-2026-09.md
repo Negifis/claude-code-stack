@@ -225,4 +225,4 @@ that block minted and quoting its reason (development-verification section 10). 
 anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
 review, an approval expired by a durable edit within a minute of being stated, a hook failure — the Stop hook now logs
 `hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
-the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1008.
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1010.

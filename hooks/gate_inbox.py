@@ -34,6 +34,7 @@ DIGEST_LIMIT = 10
 # needless native round on 2026-09-03.
 EXPIRY_WINDOW = 60.0
 SUMMARY_CHARS = 100
+RULE_ALIASES = {"verdict-expired-after-review": "verdict-expired-after-approval"}
 
 
 def inbox_path():
@@ -175,11 +176,19 @@ def report(args):
     return 0
 
 
+def when(stamp):
+    """A timestamp as `MM-DD HH:MM`, or a blank for one the platform clock cannot render."""
+    try:
+        return time.strftime("%m-%d %H:%M", time.localtime(number(stamp)))
+    except (OverflowError, OSError, ValueError):
+        return "??-?? ??:??"
+
+
 def summary(record):
-    when = time.strftime("%m-%d %H:%M", time.localtime(number(record.get("ts"))))
+    when_filed = when(record.get("ts"))
     text = str(record.get("block_reason") or record.get("rule") or "")
     return "{} {} {} {}: {}".format(
-        record["id"], when, str(record.get("kind") or "?"), record["session"][:8],
+        record["id"], when_filed, str(record.get("kind") or "?"), record["session"][:8],
         text[:SUMMARY_CHARS],
     )
 
@@ -225,7 +234,9 @@ def scan(args):
     """
     import code_work_gate_stop as gate
     reports, _ = read_records()
-    seen = {(r.get("session"), r.get("rule"), r.get("event_at")) for r in reports if r.get("auto")}
+    # A rule renamed between versions still names the same incident.
+    seen = {(r.get("session"), RULE_ALIASES.get(r.get("rule"), r.get("rule")), r.get("event_at"))
+            for r in reports if r.get("auto")}
     per_session = {}
     for event in ledger_events():
         per_session.setdefault(str(event.get("session") or "?"), []).append(event)

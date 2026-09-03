@@ -1496,10 +1496,13 @@ check("the digest stays silent elsewhere", code == 0 and out.strip() == "", out)
 with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
     stream.write('{"id": ["x"]}' + chr(10) + "not json" + chr(10) + '{"ack": 5}' + chr(10)
                  + json.dumps({"id": "deadbeef", "session": "s", "ts": "soon", "kind": 7, "block_reason": None}) + chr(10))
+    stream.write(json.dumps({"id": "cafe0001", "session": "s", "ts": 1e300, "kind": "agent", "block_reason": "huge clock"}) + chr(10))
 code, out, err = inbox("digest", stdin="[]")
 check("the digest survives a list payload and malformed inbox lines", code == 0 and out.strip() == "", err)
 code, out, err = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR}))
 check("malformed inbox lines are skipped, real ones still shown", code == 0 and pending in out and "deadbeef" in out, err or out)
+check("a timestamp beyond the platform clock is rendered blank, not raised", "cafe0001 ??-?? ??:??" in out, out)
+inbox("ack", "cafe0001")
 code, out, err = inbox("list")
 check("the list survives malformed lines", code == 0 and pending in out, err)
 inbox("ack", "deadbeef")
@@ -1512,11 +1515,22 @@ with open(cwg.event_log_path(), "a", encoding="utf-8") as stream:
     stream.write(json.dumps({"ts": time.time() - 5, "kind": "review", "session": "scan-test-2", "at": time.time() - 30, "engine": "codex", "verdict": "APPROVED"}) + "\n")
     for offset in (10, 5):
         stream.write(json.dumps({"ts": time.time() - offset, "kind": "review", "session": "scan-test-3", "engine": "codex-background", "verdict": None, "task": "btask-same"}) + "\n")
+    edited_at = time.time() - 40
+    stream.write(json.dumps({"ts": edited_at, "kind": "durable", "session": "scan-test-4", "reason": "edit"}) + chr(10))
+    stream.write(json.dumps({"ts": time.time() - 3, "kind": "review", "session": "scan-test-4", "at": edited_at - 10, "engine": "native", "verdict": "APPROVED"}) + chr(10))
+with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+    # An incident a previous version recorded under the rule's old name.
+    stream.write(json.dumps({"id": "0ldru1e0", "session": "scan-test-4", "ts": time.time(), "auto": True,
+                             "kind": "auto:verdict-expired-after-review", "rule": "verdict-expired-after-review",
+                             "event_at": edited_at}) + chr(10))
 code, out, _ = inbox("scan")
 check("the scan derives anomalies from the ledger", code == 0 and re.search(r"GATE_SCAN: [1-9]", out), out)
 code, listed, _ = inbox("list")
 check("the scan reports exhaustion and an approval expired right after it was stated",
       "auto:exhausted" in listed and "auto:verdict-expired-after-approval" in listed, listed)
+expired_records = [json.loads(line) for line in open(gate_inbox_path(), encoding="utf-8") if '"scan-test-4"' in line]
+check("an incident recorded under a rule's old name is not derived again under the new one",
+      len([r for r in expired_records if "verdict-expired" in str(r.get("rule"))]) == 1, expired_records)
 check("one unbound review task re-read by several Stop runs is one anomaly",
       sum(1 for line in listed.splitlines() if "scan-tes" in line and "unbound-background-review" in line) == 1, listed)
 code, out, _ = inbox("scan")
