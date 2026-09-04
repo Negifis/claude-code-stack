@@ -1414,8 +1414,21 @@ with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
     subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
     with open(a, "w", encoding="utf-8") as stream:
         stream.write("print('a')" + chr(10))
-    check("the index is part of the record: the same bytes on disk with a different staged blob differ",
+    check("a staged blob that matches neither HEAD nor the disk is part of the record",
           marker_hook.content_fingerprint([a]) != staged_a, staged_a)
+    subprocess.run(["git", "-C", tree, "checkout", "-q", "--", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "reset", "-q"], check=False, capture_output=True)
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('reviewed')" + chr(10))
+    reviewed = marker_hook.content_fingerprint([a])
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    added = marker_hook.content_fingerprint([a])
+    subprocess.run(["git", "-C", tree, "config", "user.email", "t@example.com"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.name", "t"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "reviewed"], check=False, capture_output=True)
+    committed = marker_hook.content_fingerprint([a])
+    check("staging and committing the reviewed bytes change nothing",
+          reviewed == added == committed and reviewed is not None, (reviewed, added, committed))
 
 # --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
 def marker_with_marks(sid, marks):

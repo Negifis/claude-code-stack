@@ -1033,8 +1033,10 @@ def content_fingerprint(paths):
     Every record is domain-separated and length-prefixed — kind, path, mode, bytes or link
     target — so no content can imitate another record. A path that no longer exists contributes
     nothing: the candidate is what is on disk, so an add that was deleted again is no change,
-    while a file the approval covered going missing is one. Inside a repository the index entry
-    (mode and blob) is part of the record, because the commit is made from the index.
+    while a file the approval covered going missing is one. Inside a repository a staged blob
+    that matches neither HEAD nor the file on disk is part of the record — something was put in
+    the index that nobody reviewed — while staging or committing the reviewed bytes changes
+    nothing: `git add` and `git commit` after an approval are not edits.
     """
     durable = sorted(set(cwg.durable_paths(paths)))
     if not durable or len(durable) > FINGERPRINT_MAX_FILES:
@@ -1064,19 +1066,49 @@ def content_fingerprint(paths):
             with open(path, "rb") as stream:
                 content = stream.read()
             add(b"F", path, os.stat(path).st_mode & 0o777, content)
-            by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
+            by_dir.setdefault(os.path.dirname(path), []).append((os.path.basename(path), content))
         except OSError:
             return None
-    for directory, names in sorted(by_dir.items()):
-        add(b"I", directory, index_entries(directory, names))
+    for directory, entries in sorted(by_dir.items()):
+        for name, oid in staged_divergences(directory, entries):
+            add(b"S", os.path.join(directory, name), oid)
     return digest.hexdigest()
 
 
-def index_entries(directory, names):
-    """`git ls-files -s` for these files: empty outside a repository or on any failure."""
-    return cwg.git_text(
-        directory, ["ls-files", "-s", "--"] + [":(icase)" + name for name in sorted(names)], timeout=10
-    ) or ""
+def staged_divergences(directory, entries):
+    """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk.
+
+    The disk blob is what git itself would store for the file (`hash-object` applies the same
+    line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. Empty
+    outside a repository; when git cannot answer inside one, every file counts as divergent,
+    which can only cost a review round, never hide one.
+    """
+    names = sorted(name for name, _ in entries)
+    specs = [":(icase)" + name for name in names]
+    staged = cwg.git_text(directory, ["ls-files", "-s", "--"] + specs, timeout=10) or ""
+    if not staged.strip():
+        return []
+    committed = cwg.git_text(directory, ["ls-tree", "HEAD", "--"] + specs, timeout=10) or ""
+    on_disk = cwg.git_text(directory, ["hash-object", "--"] + names, timeout=10)
+    disk_by_name = dict(zip(names, on_disk.split())) if on_disk is not None else {}
+
+    def oids(listing, oid_field):
+        found = {}
+        for line in listing.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4:
+                found[parts[3].strip().rsplit("/", 1)[-1].lower()] = parts[oid_field]
+        return found
+
+    staged_by_name = oids(staged, 1)
+    head_by_name = oids(committed, 2)
+    divergent = []
+    for name in names:
+        key = name.lower()
+        oid = staged_by_name.get(key)
+        if oid and oid != head_by_name.get(key) and oid != disk_by_name.get(name, "unreadable"):
+            divergent.append((name, oid))
+    return divergent
 
 
 def content_marks_after(marks, now, fingerprint):
