@@ -697,10 +697,8 @@ def continues_cycle(existing, now, identity, incoming):
         return False
     named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
     recorded = set(existing.get("paths") or [])
-    resumed = (
-        identity and existing.get("identity") == identity
-        and any(path in recorded for path in named)
-    )
+    touches_recorded = any(path in recorded for path in named)
+    resumed = identity and existing.get("identity") == identity and touches_recorded
     last_ts = existing.get("last_ts")
     # The idle limit is a backstop for a candidate abandoned on its branch, not a clock on
     # honest work: the same branch touching a file the cycle already holds is the same
@@ -724,7 +722,7 @@ def continues_cycle(existing, now, identity, incoming):
     # this way — restart the window and drop the evidence of the work being published.
     if not named:
         return True
-    return any(path in recorded for path in named)
+    return touches_recorded
 
 
 def cycle_start(marker, now, identity, incoming):
@@ -978,13 +976,13 @@ def on_home_ground(path, cwd, snapshot_roots, data):
     path = cwg.normalize_path(path)
     grounds = [cwg.normalize_path(root) for root in snapshot_roots if root]
     grounds.append(cwg.normalize_path(cwd))
-    if any(path == ground or path.startswith(ground.rstrip("/") + "/") for ground in grounds if ground):
+    if any(covers(ground, path) for ground in grounds if ground):
         return True
     command = str((data.get("tool_input") or {}).get("command") or "")
     if not command:
         return False
-    home = cwg.normalize_path(cwg.config_home())
-    if home and home in cwg.normalize_path(command):
+    spelled = cwg.normalize_path(command)
+    if any(home and home in spelled for home in map(cwg.normalize_path, agent_config_roots())):
         return True
     return bool(HOME_REFERENCE_RE.search(command))
 
