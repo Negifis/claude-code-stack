@@ -238,8 +238,7 @@ def codex_run_files(since):
     return files
 
 
-def normalized(text):
-    return " ".join(str(text or "").split()).lower()
+normalized = cwg.normalized
 
 
 def reviewer_role():
@@ -303,6 +302,11 @@ def logged_output(record):
     return ""
 
 
+def codex_cache_key(path, mtime_ns, size, started, finished):
+    """What one parse of a rollout log is keyed by: the file's state and the call's window."""
+    return (path, mtime_ns, size, started, finished)
+
+
 def session_records(path, mtime_ns, size, started, finished):
     """(when, what) for everything one session said, read once per state of the log.
 
@@ -317,7 +321,7 @@ def session_records(path, mtime_ns, size, started, finished):
     afforded proves nothing — the safe direction. An unreadable line only costs its own record:
     unlike the transcript, this log cannot hide a stale approval, only fail to support a claim.
     """
-    key = (path, mtime_ns, size, started, finished)
+    key = codex_cache_key(path, mtime_ns, size, started, finished)
     if key in _CODEX_SAID:
         return _CODEX_SAID[key]
     role = reviewer_role()
@@ -516,7 +520,8 @@ def session_given(path, mtime_ns, size, started, finished, packet):
     if not packet:
         return False
     session_records(path, mtime_ns, size, started, finished)
-    return any(packet in heard for heard in _CODEX_GIVEN.get((path, mtime_ns, size, started, finished), ()))
+    key = codex_cache_key(path, mtime_ns, size, started, finished)
+    return any(packet in heard for heard in _CODEX_GIVEN.get(key, ()))
 
 
 def rollout_verdict(started, finished, since, command="", call_id=""):
@@ -1219,7 +1224,7 @@ def content_at(entry, stamp):
     return current if isinstance(current, str) else None
 
 
-def covers(entry, stamp, durable_ts):
+def content_covers(entry, stamp, durable_ts):
     """Whether evidence stated at this moment still describes the candidate on disk.
 
     Freshness is measured against content, not against edit events: a verdict given before an
@@ -1285,7 +1290,7 @@ def evaluate_receipt(receipt, entry, evidence):
     if not cwg.valid_ts(durable_ts):
         durable_ts = last_ts
 
-    current = lambda stamp: covers(entry, stamp, durable_ts)  # noqa: E731
+    current = lambda stamp: content_covers(entry, stamp, durable_ts)  # noqa: E731
     review_start = active_review_start(evidence, lambda stamp: not current(stamp))
     ordinary_reviews = [
         item for item in evidence["ordinary_reviews"] if item[0] > review_start

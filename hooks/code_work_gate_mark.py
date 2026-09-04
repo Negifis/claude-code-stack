@@ -19,6 +19,7 @@ import hashlib
 import glob
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -935,16 +936,16 @@ def capture_packet(data, session):
     if not path or not data.get("tool_use_id"):
         return
     forget_stale_captures(session)
-    import hashlib
     try:
         with open(path, "rb") as stream:
             raw = stream.read(PACKET_KEEP_BYTES + 1)
     except OSError:
         raw = b""
     text = cwg.normalized(raw[:PACKET_KEEP_BYTES].decode("utf-8", "replace"))
+    # `text` and `truncated` are what the Stop hook reads; `path` and `ts` are for a person
+    # opening the capture to see which launch it belonged to.
     cwg.write_json(cwg.packet_capture_path(session, str(data.get("tool_use_id"))), {
         "path": path, "ts": time.time(), "text": text,
-        "digest": hashlib.sha256(raw).hexdigest() if raw else "",
         "truncated": len(raw) > PACKET_KEEP_BYTES,
     })
 
@@ -958,8 +959,6 @@ def content_fingerprint(paths):
     while a file the approval covered going missing is one. Inside a repository the index entry
     (mode and blob) is part of the record, because the commit is made from the index.
     """
-    import hashlib
-    import struct
     durable = sorted(set(cwg.durable_paths(paths)))
     if not durable or len(durable) > FINGERPRINT_MAX_FILES:
         return None
