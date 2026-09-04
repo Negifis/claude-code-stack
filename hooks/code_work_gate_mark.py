@@ -1070,44 +1070,69 @@ def content_fingerprint(paths):
         except OSError:
             return None
     for directory, names in sorted(by_dir.items()):
-        for name, oid in staged_divergences(directory, names):
+        divergences = staged_divergences(directory, names)
+        if divergences is None:
+            return None
+        for name, oid in divergences:
             add(b"S", os.path.join(directory, name), oid)
     return digest.hexdigest()
 
 
 def staged_divergences(directory, names):
-    """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk.
+    """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk, and
+    (name, "deleted") for a file on disk and in HEAD that the index no longer holds.
 
     The disk blob is what git itself would store for the file (`hash-object` applies the same
-    line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. Empty
-    outside a repository; when git cannot answer inside one, every file counts as divergent,
-    which can only cost a review round, never hide one.
+    line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. The
+    listings are read NUL-separated, so a name git would quote (non-ASCII, a tab) keys like any
+    other, and keyed by Python's own lower-casing, the same one the marker uses. Outside a
+    repository nothing is recorded; a listing git could not give inside one returns None, so
+    the caller records an unknown fingerprint rather than a false one.
     """
     names = sorted(names)
-    specs = [":(icase)" + name for name in names]
-    staged = cwg.git_text(directory, ["ls-files", "-s", "--"] + specs, timeout=10) or ""
-    if not staged.strip():
+    inside = cwg.git_run(directory, ["rev-parse", "--is-inside-work-tree"], timeout=5)
+    if inside is None or inside[0] != 0 or inside[1].strip() != "true":
         return []
-    committed = cwg.git_text(directory, ["ls-tree", "HEAD", "--"] + specs, timeout=10) or ""
-    # `hash-object` takes paths on disk, not pathspecs, so the icase wrapper does not apply.
-    on_disk = cwg.git_text(directory, ["hash-object", "--"] + names, timeout=10)
-    disk_by_name = dict(zip(names, on_disk.split())) if on_disk is not None else {}
+    staged = cwg.git_text(directory, ["ls-files", "-s", "-z"], timeout=10)
+    if staged is None:
+        return None
+    born = cwg.git_run(directory, ["rev-parse", "--verify", "-q", "HEAD"], timeout=5)
+    if born is None:
+        return None
+    committed = ""
+    if born[0] == 0:
+        committed = cwg.git_text(directory, ["ls-tree", "-z", "HEAD"], timeout=10)
+        if committed is None:
+            return None
+    present = [name for name in names if os.path.isfile(os.path.join(directory, name))]
+    # `hash-object` takes paths on disk, not pathspecs; one missing path fails the whole call,
+    # and every file then counts as divergent, which can only cost a review round.
+    on_disk = cwg.git_text(directory, ["hash-object", "--"] + present, timeout=10) if present else ""
+    disk_by_name = (
+        dict(zip(present, on_disk.split())) if on_disk is not None else {}
+    )
 
-    def oids(listing, oid_field):
+    def entries(listing, oid_field):
+        # `ls-files -s -z`: "<mode> <oid> <stage>\t<path>"; `ls-tree -z`: "<mode> <type> <oid>\t<path>".
         found = {}
-        for line in listing.splitlines():
-            parts = line.split(None, 3)
-            if len(parts) == 4:
-                found[parts[3].strip().rsplit("/", 1)[-1].lower()] = parts[oid_field]
+        for record in listing.split("\0"):
+            head, _, path = record.partition("\t")
+            parts = head.split()
+            if len(parts) == 3 and path and "/" not in path:
+                found[path.lower()] = parts[oid_field]
         return found
 
-    staged_by_name = oids(staged, 1)
-    head_by_name = oids(committed, 2)
+    staged_by_name = entries(staged, 1)
+    head_by_name = entries(committed, 2)
     divergent = []
     for name in names:
         key = name.lower()
         oid = staged_by_name.get(key)
-        if oid and oid != head_by_name.get(key) and oid != disk_by_name.get(name, "unreadable"):
+        if oid is None:
+            if key in head_by_name and name in present:
+                divergent.append((name, "deleted"))
+            continue
+        if oid != head_by_name.get(key) and oid != disk_by_name.get(name, "unreadable"):
             divergent.append((name, oid))
     return divergent
 

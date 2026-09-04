@@ -1430,6 +1430,66 @@ with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
     check("staging and committing the reviewed bytes change nothing",
           reviewed == added == committed and reviewed is not None, (reviewed, added, committed))
 
+    def git(*args):
+        return subprocess.run(["git", "-C", tree] + list(args), check=False, capture_output=True, text=True, encoding="utf-8")
+
+    # A tracked file: edit, stage, commit — the fingerprint of the reviewed bytes never moves.
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('tracked edit')" + chr(10))
+    edited = marker_hook.content_fingerprint([a])
+    git("add", ".")
+    staged = marker_hook.content_fingerprint([a])
+    git("commit", "-q", "-m", "tracked edit")
+    landed = marker_hook.content_fingerprint([a])
+    check("a tracked file's fingerprint survives staging and committing its reviewed bytes",
+          edited == staged == landed and edited is not None, (edited, staged, landed))
+
+    # A stale index committed: the reviewer saw Q on disk, P was staged and got committed.
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('P')" + chr(10))
+    git("add", ".")
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('Q')" + chr(10))
+    at_review = marker_hook.content_fingerprint([a])
+    git("commit", "-q", "-m", "stale index")
+    check("committing a stale index changes the fingerprint the reviewer's bytes had",
+          marker_hook.content_fingerprint([a]) != at_review, at_review)
+    git("checkout", "-q", "--", ".")
+
+    # A staged deletion of a file still on disk is a divergence.
+    before_rm = marker_hook.content_fingerprint([a])
+    git("rm", "-q", "--cached", "src/a.py")
+    check("a staged deletion of a file still on disk changes the fingerprint",
+          marker_hook.content_fingerprint([a]) != before_rm, before_rm)
+    git("add", ".")
+
+    # A non-ASCII name keys like any other.
+    cyr = os.path.join(tree, "src", "\u0437\u0430\u043c\u0435\u0442\u043a\u0438.md")
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("one" + chr(10))
+    git("add", ".")
+    git("commit", "-q", "-m", "cyrillic")
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("two" + chr(10))
+    cyr_edited = marker_hook.content_fingerprint([cyr])
+    git("add", ".")
+    cyr_staged = marker_hook.content_fingerprint([cyr])
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("three" + chr(10))
+    check("a non-ASCII file name is keyed, staged and diverged like any other",
+          cyr_edited == cyr_staged and marker_hook.content_fingerprint([cyr]) != cyr_staged, (cyr_edited, cyr_staged))
+    git("checkout", "-q", "--", ".")
+
+with tempfile.TemporaryDirectory(prefix="cwg_unborn_") as unborn:
+    subprocess.run(["git", "-C", unborn, "init", "-q"], check=False, capture_output=True)
+    fresh = os.path.join(unborn, "new.py")
+    with open(fresh, "w", encoding="utf-8") as stream:
+        stream.write("print('new')" + chr(10))
+    first = marker_hook.content_fingerprint([fresh])
+    subprocess.run(["git", "-C", unborn, "add", "."], check=False, capture_output=True)
+    check("a repository without a commit yet stages without changing the fingerprint",
+          first == marker_hook.content_fingerprint([fresh]) and first is not None, first)
+
 # --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
 def marker_with_marks(sid, marks):
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=marks[-1][0], durable_ts=marks[-1][0])

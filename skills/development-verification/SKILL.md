@@ -147,7 +147,8 @@ Obtain the verdict as the last step. Editing a lasting artifact after an approva
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
 scope); reruns of a throwaway script or a maintenance command do not, and neither does an edit
 reverted byte for byte, nor does staging or committing the approved bytes — the gate measures
-content, not edit events. A clean merge or rebase
+content, not edit events (a file still in conflict when reviewed is the exception: `git add` is
+its resolution step, so resolve and stage before the review). A clean merge or rebase
 of an approved candidate needs nothing; one resolved by hand is a delta candidate whose
 resolution diff gets the delta lane and a delta round.
 
