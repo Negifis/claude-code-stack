@@ -1066,16 +1066,16 @@ def content_fingerprint(paths):
             with open(path, "rb") as stream:
                 content = stream.read()
             add(b"F", path, os.stat(path).st_mode & 0o777, content)
-            by_dir.setdefault(os.path.dirname(path), []).append((os.path.basename(path), content))
+            by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
         except OSError:
             return None
-    for directory, entries in sorted(by_dir.items()):
-        for name, oid in staged_divergences(directory, entries):
+    for directory, names in sorted(by_dir.items()):
+        for name, oid in staged_divergences(directory, names):
             add(b"S", os.path.join(directory, name), oid)
     return digest.hexdigest()
 
 
-def staged_divergences(directory, entries):
+def staged_divergences(directory, names):
     """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk.
 
     The disk blob is what git itself would store for the file (`hash-object` applies the same
@@ -1083,12 +1083,13 @@ def staged_divergences(directory, entries):
     outside a repository; when git cannot answer inside one, every file counts as divergent,
     which can only cost a review round, never hide one.
     """
-    names = sorted(name for name, _ in entries)
+    names = sorted(names)
     specs = [":(icase)" + name for name in names]
     staged = cwg.git_text(directory, ["ls-files", "-s", "--"] + specs, timeout=10) or ""
     if not staged.strip():
         return []
     committed = cwg.git_text(directory, ["ls-tree", "HEAD", "--"] + specs, timeout=10) or ""
+    # `hash-object` takes paths on disk, not pathspecs, so the icase wrapper does not apply.
     on_disk = cwg.git_text(directory, ["hash-object", "--"] + names, timeout=10)
     disk_by_name = dict(zip(names, on_disk.split())) if on_disk is not None else {}
 
