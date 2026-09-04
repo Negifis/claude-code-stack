@@ -111,7 +111,9 @@ control-flow, type/error, resource, or efficiency concern).
 - Maximum two runs of the lane per candidate: the second only as a delta confirmation after
   accepted edits on broad or high-risk work. A lane result that already exists for this
   candidate is the completed pass; never re-run it for bookkeeping, and never after review
-  approval.
+  approval. A candidate ends with its receipt: edits made after a closed cycle — remediation
+  after a rebase, a follow-up on the same branch — are a new candidate, and a lane result from
+  the closed one does not carry over; run the lane once on the new delta.
 
 ## 6. Finite independent review
 
@@ -251,7 +253,9 @@ block that contradicts facts you can verify in the transcript: the required evid
 the required shape (a foreground APPROVED after the last lasting edit, the simplify lane's
 result), the hook demands a lane this skill forbids repeating, the same block returns after its
 demand was met exactly, the marker names files you never touched, the hook failed or timed out,
-or its advice contradicts the breaker or this skill.
+or its advice contradicts the breaker or this skill. Not an anomaly: a lane result that
+belongs to a candidate already closed by a receipt — the block names the candidate that
+opened afterwards, and that one needs its own delta pass.
 
 Order: check the three facts once — the receipt is the last line and well-formed, the last
 lasting edit precedes the verdict, the lanes ran in the foreground — and fix what is yours. If
