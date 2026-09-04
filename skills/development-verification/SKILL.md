@@ -144,7 +144,9 @@ only for a named non-overlapping risk; the lane that owns the verdict keeps it.
 Obtain the verdict as the last step. Editing a lasting artifact after an approval invalidates
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
 scope); reruns of a throwaway script or a maintenance command do not, and neither does an edit
-reverted byte for byte — the gate measures content, not edit events.
+reverted byte for byte — the gate measures content, not edit events. A clean merge or rebase
+of an approved candidate needs nothing; one resolved by hand is a delta candidate whose
+resolution diff gets the delta lane and a delta round.
 
 ```
 MAX_REVIEW_ROUNDS = 3
