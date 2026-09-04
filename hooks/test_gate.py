@@ -1130,10 +1130,38 @@ check("an idle cycle still ends when a different file is touched",
       marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is False, stale)
 check("an idle cycle still ends when the branch changed",
       marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/next", ["c:/repo/src/app.py"]) is False, stale)
-check("an idle cycle still ends on an opaque shell mark",
-      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", [cwg.SHELL_MUTATION_PATH]) is False, stale)
+check("an idle cycle continues on an opaque shell mark on the same branch",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", [cwg.SHELL_MUTATION_PATH]) is True, stale)
+check("an idle cycle ends when the identity is unknown",
+      marker_hook.continues_cycle(stale, day_later, None, ["c:/repo/src/app.py"]) is False, stale)
 check("within the idle limit the cycle continues as before",
       marker_hook.continues_cycle(stale, 200.0 + 3600, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is True, stale)
+
+# --- every way a command names a configuration home counts, and none of them is a false one
+home_norm = cwg.normalize_path(CLAUDE_CONFIG_DIR).rstrip("/")
+home_gitbash = "/" + home_norm[0] + home_norm[2:] if re.match(r"^[a-z]:/", home_norm) else home_norm
+changed = os.path.join(CLAUDE_CONFIG_DIR, "hooks", "x.py")
+for command, expect in (
+    ("cd $HOME/.claude && python hooks/patch.py", True),
+    ("cd {} && python hooks/patch.py".format(home_gitbash), True),
+    ('cd "{}" && python hooks/patch.py'.format(CLAUDE_CONFIG_DIR), True),
+    ("cd %USERPROFILE%\\.claude && python hooks/patch.py", True),
+    ("cd $HOME/.codex; python x.py", True),
+    ('python "$CLAUDE_CONFIG_DIR/hooks/patch.py"', True),
+    ("python ${CODEX_HOME}/skills/sync.py", True),
+    ("for M in 477 478; do glab api projects/1/merge_requests/$M; done", False),
+    ("echo claudette", False),
+    ("", False),
+):
+    got = marker_hook.on_home_ground(changed, "C:/tmp/worktree", ["C:/tmp/worktree"],
+                                     {"tool_input": {"command": command}})
+    check("on_home_ground {!r} -> {}".format(command[:44], expect), got is expect, command)
+check("a command run inside a configuration home without a repository snapshot is on home ground",
+      marker_hook.on_home_ground(changed, os.path.join(CLAUDE_CONFIG_DIR, "skills"), [], {"tool_input": {"command": "python sync.py"}}) is True, changed)
+check("a trailing slash on the working directory does not lose the ground",
+      marker_hook.on_home_ground("C:/tmp/worktree/src/a.py", "C:/tmp/worktree/", [], {"tool_input": {"command": "python x.py"}}) is True, "trailing slash")
+check("on_home_ground survives malformed input",
+      marker_hook.on_home_ground(changed, "", [None], {}) is False and marker_hook.on_home_ground(changed, None, [], {"tool_input": None}) is False, "malformed")
 
 # --- another session's change under the shared configuration home is not this command's floor
 for label, command, expect_high in (

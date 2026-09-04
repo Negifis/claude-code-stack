@@ -698,7 +698,9 @@ def continues_cycle(existing, now, identity, incoming):
     named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
     recorded = set(existing.get("paths") or [])
     touches_recorded = any(path in recorded for path in named)
-    resumed = identity and existing.get("identity") == identity and touches_recorded
+    # An opaque shell mark on the same branch resumes too: the morning's first `git push`
+    # names no file, and restarting on it would discard the rounds the same way.
+    resumed = identity and existing.get("identity") == identity and (touches_recorded or not named)
     last_ts = existing.get("last_ts")
     # The idle limit is a backstop for a candidate abandoned on its branch, not a clock on
     # honest work: the same branch touching a file the cycle already holds is the same
@@ -962,28 +964,40 @@ def capture_packet(data, session):
 
 # How a command names a configuration home it might write to: the home's own path, its
 # shell spellings, or the environment variable that points at it.
-HOME_REFERENCE_RE = re.compile(r"(?i)(?:^|[\s\"'=:/\\])(?:~[/\\]\.(?:claude|codex|agents)|\.(?:claude|codex|agents)[/\\]|claude_config_dir|codex_home)")
+HOME_REFERENCE_RE = re.compile(r"(?i)(?:\.(?:claude|codex|agents)(?=$|[\s\"'/\\;&|)])|claude_config_dir|codex_home)")
 
 
 def on_home_ground(path, cwd, snapshot_roots, data):
     """Whether an unattributed change at this path can be this command's own.
 
     It can when the path lies under the repository the command ran in, under the command's
-    working directory, or under a configuration home the command names. A change elsewhere
-    was seen only because the homes are shared between sessions, and grading it here would
-    hand this candidate another session's floor.
+    working directory or the configuration home holding it, or under a configuration home the
+    command names — by its path in any spelling (Windows, Git Bash), by `~/.claude`-style
+    shorthand, or by the environment variable that points at it. A change elsewhere was seen
+    only because the homes are shared between sessions, and grading it here would hand this
+    candidate another session's floor. A path a command builds at run time without spelling
+    the home is out of reach by design.
     """
     path = cwg.normalize_path(path)
-    grounds = [cwg.normalize_path(root) for root in snapshot_roots if root]
-    grounds.append(cwg.normalize_path(cwd))
+    cwd = cwg.normalize_path(cwd).rstrip("/")
+    homes = [cwg.normalize_path(root).rstrip("/") for root in agent_config_roots()]
+    grounds = [cwg.normalize_path(root).rstrip("/") for root in snapshot_roots if root]
+    grounds.append(cwd)
+    grounds.extend(home for home in homes if home and cwd and covers(home, cwd))
     if any(covers(ground, path) for ground in grounds if ground):
         return True
     command = str((data.get("tool_input") or {}).get("command") or "")
     if not command:
         return False
     spelled = cwg.normalize_path(command)
-    if any(home and home in spelled for home in map(cwg.normalize_path, agent_config_roots())):
-        return True
+    for home in homes:
+        if not home:
+            continue
+        spellings = [home]
+        if re.match(r"^[a-z]:/", home):
+            spellings.append("/" + home[0] + home[2:])
+        if any(spelling in spelled for spelling in spellings):
+            return True
     return bool(HOME_REFERENCE_RE.search(command))
 
 
