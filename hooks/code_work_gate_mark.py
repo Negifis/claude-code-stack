@@ -1010,15 +1010,8 @@ def on_home_ground(path, cwd, snapshot_roots, data):
 
 def head_commit(cwd):
     """The commit HEAD points at in this working directory, or None outside a repository."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    head = proc.stdout.strip()
-    return head if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
+    head = (cwg.git_text(cwd, ["rev-parse", "HEAD"], timeout=5) or "").strip()
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
 def content_fingerprint(paths):
@@ -1068,14 +1061,9 @@ def content_fingerprint(paths):
 
 def index_entries(directory, names):
     """`git ls-files -s` for these files: empty outside a repository or on any failure."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", directory, "ls-files", "-s", "--"] + [":(icase)" + name for name in sorted(names)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return proc.stdout if proc.returncode == 0 else ""
+    return cwg.git_text(
+        directory, ["ls-files", "-s", "--"] + [":(icase)" + name for name in sorted(names)], timeout=10
+    ) or ""
 
 
 def content_marks_after(marks, now, fingerprint):

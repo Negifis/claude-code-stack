@@ -1167,7 +1167,8 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
         transcript = write_transcript(events)
         result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                                  "last_assistant_message": "[gate] operational: checked; committed"})
-        check("a clean tree on a different commit is not restored", result.get("decision") == "block", result)
+        check("a clean tree on a different commit is not restored",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
         data = cwg.read_json(marker) or {}
         data["paths"] = list(data.get("paths") or []) + ["C:/elsewhere/lasting.py"]
         subprocess.run(["git", "-C", tree, "reset", "-q", "--hard", head], check=False, capture_output=True)
@@ -1175,7 +1176,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
         result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
                                  "last_assistant_message": "[gate] no-change: restored"})
         check("a lasting path outside the repository is not something git can vouch for",
-              result.get("decision") == "block", result)
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
     finally:
         cleanup(sid, locals().get("transcript"))
 

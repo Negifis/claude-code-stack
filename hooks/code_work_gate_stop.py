@@ -23,7 +23,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 import uuid
@@ -1181,14 +1180,6 @@ def anomaly_closure(receipt, state, key):
     return True, match.group(1)
 
 
-def git_output(root, arguments):
-    proc = subprocess.run(
-        ["git", "-C", root] + arguments, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", timeout=15, check=False,
-    )
-    return proc.stdout if proc.returncode == 0 else None
-
-
 def restored_to_head(entry):
     """Whether the repository shows nothing lasting changed since the candidate opened.
 
@@ -1197,25 +1188,25 @@ def restored_to_head(entry):
     when a change could not be attributed or the path list overflowed. A lasting path outside
     the repository is not something git can vouch for, so it keeps the candidate open.
     """
-    root, _, _ = str(entry.get("identity") or "").partition("#")
+    import code_work_gate_mark as mark
+    root = cwg.identity_root(entry.get("identity")).rstrip("/")
     start = entry.get("head_at_start")
     if not root or not isinstance(start, str) or not start:
         return False
     durable = cwg.durable_paths(marker_paths(entry))
-    inside = [path for path in durable if path == root or path.startswith(root.rstrip("/") + "/")]
+    inside = [path for path in durable if mark.covers(root, path)]
     if len(inside) != len(durable):
         return False
-    try:
-        head = git_output(root, ["rev-parse", "HEAD"])
-        if head is None or head.strip() != start:
-            return False
-        scope = (
-            [] if entry.get("unattributed_durable") or entry.get("path_overflow") or not inside
-            else ["--"] + inside
-        )
-        status = git_output(root, ["status", "--porcelain", "--untracked-files=all"] + scope)
-    except (OSError, subprocess.SubprocessError):
+    # Two short git calls, each failing fast into "the candidate stays open": the Stop hook
+    # has a ten-second window of its own.
+    head = cwg.git_text(root, ["rev-parse", "HEAD"], timeout=4)
+    if head is None or head.strip() != start:
         return False
+    scope = (
+        [] if entry.get("unattributed_durable") or entry.get("path_overflow") or not inside
+        else ["--"] + inside
+    )
+    status = cwg.git_text(root, ["status", "--porcelain", "--untracked-files=all"] + scope, timeout=4)
     return status is not None and status.strip() == ""
 
 

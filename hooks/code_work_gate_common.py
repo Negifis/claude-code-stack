@@ -237,6 +237,24 @@ def packet_capture_path(session_key_, tool_use_id):
     return os.path.join(tempfile.gettempdir(), "cwg_packet_{}_{}.json".format(session_key_, tool_use_id))
 
 
+def git_text(cwd, arguments, timeout):
+    """`git -C cwd …` stdout as text, or None on any failure — a hang is a failure too."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd] + list(arguments), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def identity_root(identity):
+    """The repository root half of a candidate identity (`<root>#<branch>`), or empty."""
+    return str(identity or "").partition("#")[0]
+
+
 def codex_home():
     return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
