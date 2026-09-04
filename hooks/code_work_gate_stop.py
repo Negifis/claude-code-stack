@@ -1186,10 +1186,12 @@ def anomaly_closure(receipt, state, key):
 def restored_to_head(entry):
     """Whether the repository shows nothing lasting changed since the candidate opened.
 
-    True only when the marker remembers the commit and the refs the cycle opened on, HEAD is that
-    commit again, every ref points where it did (no commit on a side branch, no tag, no stash, no
-    push that moved a remote-tracking ref), no lasting path the cycle recorded is gitignored (git
-    could not see a change to it), and `git status` for the whole tree is clean — a tree that was
+    True only when the marker remembers the commit and the refs the cycle opened on and names
+    every lasting path it touched, HEAD is that commit again, every ref points where it did (no
+    commit on a side branch, no tag, no stash, no push that moved a remote-tracking ref), the
+    repository ignores case so the lower-cased paths can be checked against its ignore patterns,
+    none of them is gitignored (git could not see a change to it), and `git status` for the
+    whole tree is clean — a tree that was
     dirty before the candidate opened cannot close this way, which is the conservative side. A
     lasting path outside the repository is not something git can vouch for. Every git call shares
     one small budget and any failure keeps the candidate open.
@@ -1198,6 +1200,10 @@ def restored_to_head(entry):
     root = cwg.identity_root(entry.get("identity")).rstrip("/")
     start, refs = entry.get("head_at_start"), entry.get("refs_at_start")
     if not root or not isinstance(start, str) or not start or not isinstance(refs, str) or not refs:
+        return False
+    # Past the path cap the marker no longer names every lasting path, so the ignore probe
+    # below could not cover them all.
+    if entry.get("path_overflow"):
         return False
     durable = cwg.durable_paths(marker_paths(entry))
     inside = [path for path in durable if mark.covers(root, path)]
@@ -1220,6 +1226,12 @@ def restored_to_head(entry):
     ).hexdigest() != refs:
         return False
     if inside:
+        # The marker's paths are lower-cased; `check-ignore` matches them against the patterns
+        # case-insensitively only while the repository ignores case, so any other setting
+        # leaves the answer unknown.
+        ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
+        if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
+            return False
         ignored = call(["check-ignore", "-q", "--"] + inside, 1.5)
         # Exit 0: at least one path is ignored; 1: none; anything else, or a hang: unknown.
         if not ignored or ignored[0] != 1:

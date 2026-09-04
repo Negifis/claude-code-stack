@@ -16,7 +16,7 @@ template — it is a stack in daily use on Windows, published as-is.
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (1149 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (1154 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
 | `skills/` | 16 skills for engineering workflow, verification, writing, delegation, chips and task start |
 | `agents/` | The adversarial reviewer, the single `simplify-reviewer` lane, and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |

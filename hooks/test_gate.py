@@ -1245,6 +1245,29 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
     finally:
         cleanup(sid, locals().get("transcript"))
 
+    # A repository that does not ignore case cannot vouch for lower-cased paths; past the path
+    # cap the marker cannot name every lasting path.
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('cased')" + chr(10))
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('u')" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "false"], check=False, capture_output=True)
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a repository that does not ignore case keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "true"], check=False, capture_output=True)
+        marker, _ = gate_paths(sid)
+        data = cwg.read_json(marker) or {}
+        data["path_overflow"] = True
+        cwg.write_json(marker, data)
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a marker past the path cap keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
     # A cycle a shell command opens remembers the state from before that command.
     sid = session()
     try:
