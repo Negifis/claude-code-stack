@@ -87,6 +87,9 @@ TERMINAL_RE = re.compile(
     re.IGNORECASE,
 )
 # `[gate] anomaly-reported: <report id>; <the verifiable contradiction>`
+# Wall-clock budget for the git calls that decide whether a repository is back where the
+# candidate opened: the Stop hook has a ten-second window of its own.
+RESTORE_BUDGET = 4.0
 ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
 VERIFIED_REASON_RE = re.compile(r"^(LOW|STANDARD|HIGH)\s*;\s*\S", re.IGNORECASE)
 OPERATIONAL_RECEIPTS = {"operational", "no-change"}
@@ -1183,31 +1186,46 @@ def anomaly_closure(receipt, state, key):
 def restored_to_head(entry):
     """Whether the repository shows nothing lasting changed since the candidate opened.
 
-    True only when the marker remembers the commit the cycle opened on, HEAD is that commit
-    again, and `git status` is clean for every lasting path the cycle recorded — the whole tree
-    when a change could not be attributed or the path list overflowed. A lasting path outside
-    the repository is not something git can vouch for, so it keeps the candidate open.
+    True only when the marker remembers the commit and the refs the cycle opened on, HEAD is that
+    commit again, every ref points where it did (no commit on a side branch, no tag, no stash, no
+    push that moved a remote-tracking ref), no lasting path the cycle recorded is gitignored (git
+    could not see a change to it), and `git status` for the whole tree is clean — a tree that was
+    dirty before the candidate opened cannot close this way, which is the conservative side. A
+    lasting path outside the repository is not something git can vouch for. Every git call shares
+    one small budget and any failure keeps the candidate open.
     """
     import code_work_gate_mark as mark
     root = cwg.identity_root(entry.get("identity")).rstrip("/")
-    start = entry.get("head_at_start")
-    if not root or not isinstance(start, str) or not start:
+    start, refs = entry.get("head_at_start"), entry.get("refs_at_start")
+    if not root or not isinstance(start, str) or not start or not isinstance(refs, str) or not refs:
         return False
     durable = cwg.durable_paths(marker_paths(entry))
     inside = [path for path in durable if mark.covers(root, path)]
     if len(inside) != len(durable):
         return False
-    # Two short git calls, each failing fast into "the candidate stays open": the Stop hook
-    # has a ten-second window of its own.
-    head = cwg.git_text(root, ["rev-parse", "HEAD"], timeout=4)
-    if head is None or head.strip() != start:
+    deadline = time.monotonic() + RESTORE_BUDGET
+
+    def call(arguments, cap):
+        remaining = deadline - time.monotonic()
+        if remaining < 0.25:
+            return None
+        return cwg.git_run(root, arguments, timeout=min(cap, remaining))
+
+    head = call(["rev-parse", "HEAD"], 1.5)
+    if not head or head[0] != 0 or head[1].strip() != start:
         return False
-    scope = (
-        [] if entry.get("unattributed_durable") or entry.get("path_overflow") or not inside
-        else ["--"] + inside
-    )
-    status = cwg.git_text(root, ["status", "--porcelain", "--untracked-files=all"] + scope, timeout=4)
-    return status is not None and status.strip() == ""
+    listing = call(["for-each-ref", "--format=%(refname) %(objectname)"], 1.5)
+    if not listing or listing[0] != 0 or hashlib.sha256(
+        listing[1].encode("utf-8", "replace")
+    ).hexdigest() != refs:
+        return False
+    if inside:
+        ignored = call(["check-ignore", "-q", "--"] + inside, 1.5)
+        # Exit 0: at least one path is ignored; 1: none; anything else, or a hang: unknown.
+        if not ignored or ignored[0] != 1:
+            return False
+    status = call(["status", "--porcelain", "--untracked-files=all"], 2.5)
+    return bool(status) and status[0] == 0 and status[1].strip() == ""
 
 
 def receipt_preflight(receipt, entry):

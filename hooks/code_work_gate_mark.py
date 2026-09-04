@@ -741,6 +741,7 @@ def cycle_start(marker, now, identity, incoming):
         "unattributed_durable": False,
         "content_marks": [],
         "head_at_start": None,
+        "refs_at_start": None,
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -766,6 +767,7 @@ def cycle_start(marker, now, identity, incoming):
             "unattributed_durable": bool(existing.get("unattributed_durable")),
             "content_marks": list(existing.get("content_marks") or []),
             "head_at_start": existing.get("head_at_start"),
+            "refs_at_start": existing.get("refs_at_start"),
         }
     if os.path.exists(marker):
         try:
@@ -811,7 +813,8 @@ def outside_snapshot(paths, roots, watched=()):
 
 
 def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
-                 watched_roots=(), unattributed_risk=None, write_capable_command=True):
+                 watched_roots=(), unattributed_risk=None, write_capable_command=True,
+                 opening=None):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
     `unattributed_risk` is the grade of a lasting change seen during this command that no
@@ -872,9 +875,18 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     )
     content_marks = cycle.get("content_marks") or []
     if not cycle.get("edits") and cycle.get("head_at_start") is None:
-        # The commit the cycle opened on: a tree that is back on it, clean, has changed nothing
-        # lasting, whatever happened in between (a rebase probe that was aborted, an edit undone).
-        cycle["head_at_start"] = head_commit(str(data.get("cwd") or os.getcwd()))
+        # The commit and refs the cycle opened on: a repository back on them, clean, has changed
+        # nothing lasting, whatever happened in between (a rebase probe that was aborted, an
+        # edit undone). For a cycle a shell command opens, that state is what the pre-command
+        # snapshot saw — the command itself may have moved HEAD; an Edit cannot, so the state
+        # after it is the state before it. A shell opening without a snapshot leaves both unknown.
+        if opening is not None:
+            cycle["head_at_start"] = opening.get("head")
+            cycle["refs_at_start"] = opening.get("refs")
+        else:
+            cwd = str(data.get("cwd") or os.getcwd())
+            cycle["head_at_start"] = head_commit(cwd)
+            cycle["refs_at_start"] = cwg.refs_digest(cwd)
     if last_durable_ts == now:
         # A change the snapshot could not attribute may have touched anything, so the content
         # after it is unknown; a named edit leaves the lasting paths' bytes to be measured.
@@ -905,6 +917,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "unattributed_durable": unattributed_durable,
         "content_marks": content_marks,
         "head_at_start": cycle.get("head_at_start"),
+        "refs_at_start": cycle.get("refs_at_start"),
     })
 
 
@@ -1156,6 +1169,8 @@ def main():
                         dict(
                             shell_snapshot(cwd),
                             ts=started,
+                            head=head_commit(cwd),
+                            refs=cwg.refs_digest(cwd),
                         ),
                     )
             elif cwg.is_gated(path):
@@ -1230,7 +1245,8 @@ def main():
                     cwg.publish_claims(session, paths=shell_paths, cwd=cwd)
                     record_paths(data, shell_paths, snapshot_roots=snapshot_roots,
                                  watched_roots=watched_roots, unattributed_risk=floor,
-                                 write_capable_command=write_capable(data))
+                                 write_capable_command=write_capable(data),
+                                 opening={"head": before.get("head"), "refs": before.get("refs")})
                 elif observed or not home_ground or policy == SHELL_UNKNOWN:
                     # An empty delta is not proof of no write: ignored files, and paths
                     # outside both the repository and the configuration homes, are invisible
@@ -1249,6 +1265,7 @@ def main():
                         watched_roots=watched_roots,
                         unattributed_risk=floor,
                         write_capable_command=write_capable(data),
+                        opening={"head": before.get("head"), "refs": before.get("refs")},
                     )
         finally:
             # Closed on every path out of this block, and deliberately not before it: closing

@@ -237,8 +237,8 @@ def packet_capture_path(session_key_, tool_use_id):
     return os.path.join(tempfile.gettempdir(), "cwg_packet_{}_{}.json".format(session_key_, tool_use_id))
 
 
-def git_text(cwd, arguments, timeout):
-    """`git -C cwd …` stdout as text, or None on any failure — a hang is a failure too."""
+def git_run(cwd, arguments, timeout):
+    """(exit code, stdout) of `git -C cwd …`, or None when git could not be run — a hang too."""
     import subprocess
     try:
         proc = subprocess.run(
@@ -247,7 +247,24 @@ def git_text(cwd, arguments, timeout):
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return proc.stdout if proc.returncode == 0 else None
+    return proc.returncode, proc.stdout
+
+
+def git_text(cwd, arguments, timeout):
+    """`git -C cwd …` stdout as text, or None on any failure."""
+    result = git_run(cwd, arguments, timeout)
+    return result[1] if result and result[0] == 0 else None
+
+
+def refs_digest(cwd, timeout=3):
+    """A digest of every ref and what it points at, or None outside a repository.
+
+    A commit on a side branch, a tag, a stash, a push that moved a remote-tracking ref: each
+    changes this, while an aborted rebase or an undone edit leaves it as it was.
+    """
+    import hashlib
+    listing = git_text(cwd, ["for-each-ref", "--format=%(refname) %(objectname)"], timeout)
+    return hashlib.sha256(listing.encode("utf-8", "replace")).hexdigest() if listing is not None else None
 
 
 def identity_root(identity):

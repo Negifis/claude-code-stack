@@ -49,8 +49,10 @@ No simplify pass and no code review on a throwaway script that already executed.
 execution, where it belongs, satisfies that.
 
 A lasting change that was undone — a rebase probe aborted, an edit reverted — leaves the
-repository on the commit the candidate opened on and clean; the gate reads that from git and
-accepts `operational` or `no-change` for it, so do not manufacture a review for nothing.
+repository on the commit the candidate opened on, with every ref where it was and the whole
+tree clean; the gate reads that from git and accepts `operational` or `no-change` for it, so do
+not manufacture a review for nothing. A commit on another branch, a stash, a push, a gitignored
+lasting file or a tree that was already dirty when the candidate opened keep it open.
 
 ## 3. Classify risk
 

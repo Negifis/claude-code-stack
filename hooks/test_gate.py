@@ -1179,6 +1179,97 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
               result.get("decision") == "block" and "still differs" in result["reason"], result)
     finally:
         cleanup(sid, locals().get("transcript"))
+    subprocess.run(["git", "-C", tree, "reset", "-q", "--hard", head], check=False, capture_output=True)
+
+    def open_by_edit(sid, path, content):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": path}})
+
+    def stop_with(sid, transcript, message):
+        return run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript, "last_assistant_message": message})
+
+    # A capitalised component below the root: the whole tree is what git reports on.
+    upper = os.path.join(tree, "Src", "App.py")
+    os.makedirs(os.path.dirname(upper), exist_ok=True)
+    with open(upper, "w", encoding="utf-8") as stream:
+        stream.write("print('u')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "upper"], check=False, capture_output=True)
+    head_upper = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('changed')" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a modified file under a capitalised directory keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('u')" + chr(10))
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("restored under a capitalised directory closes as no-change",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+    # A commit on a side branch, then back: the refs moved, so nothing is "restored".
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('side')" + chr(10))
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "-b", "side"], check=False, capture_output=True)
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "side work"], check=False, capture_output=True)
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "master"], check=False, capture_output=True)
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] operational: committed on a side branch; back on master")
+        check("a commit on a side branch keeps the candidate open although HEAD is back",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+        subprocess.run(["git", "-C", tree, "branch", "-q", "-D", "side"], check=False, capture_output=True)
+
+    # A gitignored lasting file: git cannot see its change, so it cannot vouch for it.
+    with open(os.path.join(tree, ".gitignore"), "w", encoding="utf-8") as stream:
+        stream.write(".env" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", ".gitignore"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "ignore"], check=False, capture_output=True)
+    sid = session()
+    try:
+        secret = os.path.join(tree, ".env")
+        open_by_edit(sid, secret, "TOKEN=1" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] no-change: nothing to see")
+        check("an ignored lasting file keeps the candidate open even with a clean status",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        os.remove(secret)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+    # A cycle a shell command opens remembers the state from before that command.
+    sid = session()
+    try:
+        head_before = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        payload = {"session_id": sid, "tool_name": "Bash", "tool_use_id": "open-" + uuid.uuid4().hex[:6],
+                   "cwd": tree, "tool_input": {"command": "git commit -q -am 'shell opened'"}}
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+        # What the command did: committed one file and left another modified.
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('committed by the command')" + chr(10))
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "shell opened"], check=False, capture_output=True)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('left dirty')" + chr(10))
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+        marker, _ = gate_paths(sid)
+        data = cwg.read_json(marker) or {}
+        check("a shell-opened cycle remembers the commit from before the command",
+              data.get("head_at_start") == head_before and bool(data.get("refs_at_start")), data.get("head_at_start"))
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "--", "src/app.py"], check=False, capture_output=True)
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] operational: committed; tree clean")
+        check("a commit made by the opening command keeps the candidate open although the tree is clean again",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
 
 # --- the same candidate resumed the next morning keeps its cycle, and its review rounds with it
 stale = {"first_ts": 100.0, "last_ts": 200.0, "identity": "c:/repo#refs/heads/work",
