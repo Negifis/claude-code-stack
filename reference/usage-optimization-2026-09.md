@@ -225,7 +225,7 @@ that block minted and quoting its reason (development-verification section 10). 
 anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
 review, an approval expired by a durable edit within a minute of being stated, a hook failure — the Stop hook now logs
 `hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
-the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1097.
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1108.
 
 Three more findings from this session's own ledger, fixed in the same change set: a task
 notification absorbed while the turn was running never becomes a user record (only the
@@ -239,3 +239,11 @@ First report delivered by push (session issue-255, 2026-09-03 17:40): an approva
 edit that was reverted byte for byte. Fixed: the marker fingerprints its lasting paths at every
 durable change and the Stop hook judges freshness by content — a verdict covers the candidate
 when the bytes it reviewed are the bytes on disk, whatever edits happened in between.
+
+Third pushed report (session Charon, 2026-09-04 14:15): a `glab api` loop run in a worktree got a
+HIGH floor from an unattributed change under `~/.claude` that the gate-ops session was making at
+that moment. Fixed: an unattributed change under a root the command neither ran in nor names
+raises no floor. The gate-ops session's own closing then hit a fourth pattern: a cycle restarted
+after the 8-hour idle limit discarded the candidate's earlier review rounds, so the ESCALATE
+sequence check failed. Fixed: the idle limit no longer ends a cycle the same branch resumes on a
+file it already holds.

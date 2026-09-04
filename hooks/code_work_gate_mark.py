@@ -695,8 +695,19 @@ def continues_cycle(existing, now, identity, incoming):
     """Whether an open marker still describes the candidate being edited now."""
     if not cwg.valid_ts(existing.get("first_ts")):
         return False
+    named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
+    recorded = set(existing.get("paths") or [])
+    resumed = (
+        identity and existing.get("identity") == identity
+        and any(path in recorded for path in named)
+    )
     last_ts = existing.get("last_ts")
-    if cwg.valid_ts(last_ts) and now - float(last_ts) > CANDIDATE_IDLE_LIMIT:
+    # The idle limit is a backstop for a candidate abandoned on its branch, not a clock on
+    # honest work: the same branch touching a file the cycle already holds is the same
+    # candidate the next morning, and restarting it would discard the review rounds it had —
+    # on 2026-09-04 that turned a REVISE, REVISE, ESCALATE sequence into an illegal lone
+    # ESCALATE.
+    if not resumed and cwg.valid_ts(last_ts) and now - float(last_ts) > CANDIDATE_IDLE_LIMIT:
         return False
     if not identity_mismatch(existing.get("identity"), identity):
         # An unknown identity is not evidence of a new candidate. Treating it as one would hand
@@ -711,10 +722,8 @@ def continues_cycle(existing, now, identity, incoming):
     # An opaque shell mark names no file, so it can neither confirm nor deny a different
     # candidate. Counting it as disjoint would make the branch switch itself — recorded exactly
     # this way — restart the window and drop the evidence of the work being published.
-    named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
     if not named:
         return True
-    recorded = set(existing.get("paths") or [])
     return any(path in recorded for path in named)
 
 
@@ -953,6 +962,33 @@ def capture_packet(data, session):
     })
 
 
+# How a command names a configuration home it might write to: the home's own path, its
+# shell spellings, or the environment variable that points at it.
+HOME_REFERENCE_RE = re.compile(r"(?i)(?:^|[\s\"'=:/\\])(?:~[/\\]\.(?:claude|codex|agents)|\.(?:claude|codex|agents)[/\\]|claude_config_dir|codex_home)")
+
+
+def on_home_ground(path, cwd, snapshot_roots, data):
+    """Whether an unattributed change at this path can be this command's own.
+
+    It can when the path lies under the repository the command ran in, under the command's
+    working directory, or under a configuration home the command names. A change elsewhere
+    was seen only because the homes are shared between sessions, and grading it here would
+    hand this candidate another session's floor.
+    """
+    path = cwg.normalize_path(path)
+    grounds = [cwg.normalize_path(root) for root in snapshot_roots if root]
+    grounds.append(cwg.normalize_path(cwd))
+    if any(path == ground or path.startswith(ground.rstrip("/") + "/") for ground in grounds if ground):
+        return True
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    if not command:
+        return False
+    home = cwg.normalize_path(cwg.config_home())
+    if home and home in cwg.normalize_path(command):
+        return True
+    return bool(HOME_REFERENCE_RE.search(command))
+
+
 def content_fingerprint(paths):
     """A digest of the lasting paths as they are now, or None when it cannot be known cheaply.
 
@@ -1155,7 +1191,14 @@ def main():
                     [(cwg.normalize_path(root), ()) for root in snapshot_roots if root]
                     + [(root, AGENT_CONFIG_SKIP) for root in watched_roots],
                 )
-                unattributed = cwg.durable_paths(ambiguous)
+                # A change under a root the command neither ran in nor names is another
+                # session's work seen through a shared home, not this command's: on
+                # 2026-09-04 a `glab api` loop run in a worktree inherited a HIGH floor from
+                # the gate-ops session editing hooks under ~/.claude at that moment.
+                unattributed = [
+                    path for path in cwg.durable_paths(ambiguous)
+                    if on_home_ground(path, cwd, snapshot_roots, data)
+                ]
                 floor = cwg.minimum_risk(unattributed) if unattributed else None
 
         try:

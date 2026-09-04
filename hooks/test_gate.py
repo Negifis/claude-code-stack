@@ -1120,6 +1120,57 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- the same candidate resumed the next morning keeps its cycle, and its review rounds with it
+stale = {"first_ts": 100.0, "last_ts": 200.0, "identity": "c:/repo#refs/heads/work",
+         "paths": ["c:/repo/src/app.py"]}
+day_later = 200.0 + 9 * 3600
+check("an idle cycle continues when the same branch touches a file it already holds",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", ["c:/repo/src/app.py"]) is True, stale)
+check("an idle cycle still ends when a different file is touched",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is False, stale)
+check("an idle cycle still ends when the branch changed",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/next", ["c:/repo/src/app.py"]) is False, stale)
+check("an idle cycle still ends on an opaque shell mark",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", [cwg.SHELL_MUTATION_PATH]) is False, stale)
+check("within the idle limit the cycle continues as before",
+      marker_hook.continues_cycle(stale, 200.0 + 3600, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is True, stale)
+
+# --- another session's change under the shared configuration home is not this command's floor
+for label, command, expect_high in (
+    ("a command run in its repository does not inherit a floor from a change under the config home",
+     "for M in 477 478; do glab api projects/1/merge_requests/$M; done", False),
+    ("a command that names the config home still answers for a change under it",
+     "python ~/.claude/hooks/patch.py && ls", True),
+):
+    with tempfile.TemporaryDirectory(prefix="cwg_ground_") as tree:
+        sid = session()
+        try:
+            subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+            with open(os.path.join(tree, "README.md"), "w", encoding="utf-8") as stream:
+                stream.write("hello" + chr(10))
+            subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+            marker, _ = gate_paths(sid)
+            payload = {"session_id": sid, "tool_name": "Bash", "tool_use_id": "ground-" + uuid.uuid4().hex[:6],
+                       "cwd": tree, "tool_input": {"command": command}}
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            # Another session has a command in flight under the configuration home, and a
+            # file appears there while this command runs: nobody can say whose it is.
+            other = cwg.session_key(session())
+            cwg.publish_claims(other, shell_start_ts=time.time() - 1, cwd=os.path.join(CLAUDE_CONFIG_DIR, "hooks"))
+            foreign = os.path.join(CLAUDE_CONFIG_DIR, "hooks", "foreign_" + uuid.uuid4().hex[:6] + ".py")
+            os.makedirs(os.path.dirname(foreign), exist_ok=True)
+            with open(foreign, "w", encoding="utf-8") as stream:
+                stream.write("# written by another session while the command ran" + chr(10))
+            time.sleep(0.05)
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(label, bool(data.get("unattributed_durable")) is expect_high
+                  and (foreign.replace(chr(92), "/").lower() not in [x.lower() for x in data.get("paths") or []]), data)
+            os.remove(foreign)
+            cwg.retire_claims(other)
+        finally:
+            cleanup(sid)
+
 # --- how a launch is read: any spelling of codex, one exec segment, no conditional execution
 for command, fed, tail in (
     ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err  # CODE_WORK_GATE_REVIEW", True, "C:/tmp/p.md"),
