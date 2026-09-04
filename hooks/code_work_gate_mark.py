@@ -16,8 +16,10 @@ Fail-open: any error returns continue=true.
 """
 import json
 import hashlib
+import glob
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ SHELL_WRITE_RE = re.compile(
     r"\bperl\b[^\r\n]*\s-pi\b|\b(Set-Content|Add-Content|Out-File)\b|"
     r"\b(Copy-Item|Move-Item|Remove-Item|Rename-Item|New-Item)\b|"
     r"\b(prettier|eslint|ruff)\b[^\r\n]*"
-    r"(--write|--fix)\b|\b(cat|echo|printf)\b[^\r\n]*(>>?|\btee\b))"
+    r"(--write|--fix)\b|\b(cat|echo|printf)\b[^\r\n]*((?<![0-9])>>?(?!&)|\btee\b))"
 )
 READ_ONLY_SHELL_RE = re.compile(
     r"(?i)^\s*(?:"
@@ -99,6 +101,81 @@ AGENT_CONFIG_LIMIT = 8192
 # copy, not the session's work; the sources they are copied from are watched in the homes above.
 # Attribution only, like the skip list: an edit made through Edit/Write is still gated by path.
 SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNORECASE)
+# Whether a shell command could have rewritten a file the snapshot did not see decides whether
+# an unresolved mutation expires the review verdict. The rule is an allowlist of commands proven
+# read-only, judged per pipeline segment: anything unknown, any redirect other than a discarded
+# or merged stderr, a command substitution, a heredoc or a script block is write-capable.
+# `git status --porcelain | wc -l` seven seconds after a Codex approval expired that approval on
+# 2026-09-03 and cost the session a native review round it did not need; nothing that command
+# can do touches a lasting artifact, while `tee`, `truncate` or `1>` plainly can.
+READ_ONLY_COMMANDS = frozenset("""
+    cd ls dir cat head tail grep egrep fgrep rg find fd wc sort uniq cut tr diff comm
+    stat file du df pwd echo printf date true false test [ type which where whoami
+    printenv jq column nl tac basename dirname realpath readlink md5sum sha1sum sha256sum tree
+    ps tasklist nproc uname sleep
+    get-childitem get-content get-item get-command select-string select-object measure-object
+    format-table format-list out-string write-output write-host test-path resolve-path
+    get-process get-location get-date sort-object gci gc gi sls findstr
+""".split())
+GIT_READ_SUBCOMMANDS = frozenset("""
+    status log diff show rev-parse ls-files ls-tree blame describe rev-list cat-file shortlog
+    for-each-ref name-rev merge-base grep check-ignore diff-tree diff-index count-objects reflog
+    var version help
+""".split())
+# The listing forms of git subcommands that also write: `git branch` alone lists, `git branch x`
+# creates, and `git stash` alone stashes.
+GIT_LISTING_RE = re.compile(
+    r"^(?:(?:branch|tag|remote|worktree|config)\b(?:\s+(?:list|-l|--list|-a|-v|-vv|--all|"
+    r"--show-current|--merged|--no-merged|--contains\s+\S+|--get(?:-all|-regexp)?\s+\S+))*"
+    r"|stash\s+(?:list|show)\b[^\r\n]*)\s*$"
+)
+# Arguments that turn a listed command into a writer or a command runner. A command absent
+# here can only write through a redirect, which is caught separately.
+MUTATING_ARGS = {
+    "find": re.compile(r"(?:^|\s)-(?:delete|exec(?:dir)?|ok(?:dir)?|fprint0?|fprintf|fls)\b"),
+    "fd": re.compile(r"(?:^|\s)(?:-x|-X|--exec(?:-batch)?)\b"),
+    "rg": re.compile(r"(?:^|\s)--pre\b"),
+    # `-o` also inside a single-dash cluster or attached to its operand: `-uo f f`, `-ofile`.
+    "sort": re.compile(r"(?:^|\s)(?:-(?!-)\w*o|--output\b)"),
+    "tree": re.compile(r"(?:^|\s)-(?!-)\w*o"),
+    "date": re.compile(r"(?:^|\s)(?:-s\b|--set\b)"),
+    "git": re.compile(r"(?:^|\s)(?:-o\b|--output\b)"),
+}
+# gh talks to GitHub; only these forms are known not to touch the working tree or the local
+# clone. Anything else — `pr checkout`, `repo clone`, an alias, an extension — is write-capable.
+GH_READ_RE = re.compile(
+    r"^(?:(?:-R|--repo)(?:=\S+|\s+\S+)\s+)*(?:"
+    r"pr\s+(?:view|list|status|diff|checks|comment|edit|create|close|reopen|review|ready)|"
+    r"issue\s+(?:view|list|status|create|comment|edit|close|reopen)|repo\s+(?:view|list)|"
+    r"api|run\s+(?:view|list|watch)|release\s+(?:view|list)|search\s+\S+|label\s+list|"
+    r"auth\s+status|browse)\b"
+)
+# What a Codex launch feeds on stdin, read before the command runs: the Stop hook binds the
+# verdict to the session that was given exactly this text, whatever the file holds later.
+STDIN_REDIRECT_RE = re.compile(r"(?<![<>])<(?!<)\s*\"?([^\s\"<>|;&]+)\"?")
+PACKET_KEEP_BYTES = 256 * 1024
+# A capture older than this belongs to a launch whose notification never came.
+PACKET_CAPTURE_TTL = 24 * 3600.0
+# `-c key=value` is not skipped: it can point a reading subcommand at an external program
+# (`diff.external`, `core.fsmonitor`), and so falls through as an unknown subcommand.
+GIT_GLOBAL_OPTIONS_RE = re.compile(
+    r"^(?:(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+)\s+)+"
+)
+# Argument shapes that execute something whatever the command: a sub-expression or type
+# accessor in PowerShell, a bracket expression or grouping in either shell.
+EXECUTING_ARGUMENT_RE = re.compile(r"[(\[]|::")
+# Only a discarded or merged stderr is not a file the command may have written into.
+HARMLESS_REDIRECT_RE = re.compile(r"2>\s*(?:/dev/null|\$null|nul\b)|2>&1|1>&2|>&2")
+SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\r\n]")
+ENV_ASSIGNMENT_RE = re.compile(r"^\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s*")
+WRAPPER_RE = re.compile(r"^(?:timeout\s+(?:-\S+\s+)*\S+|time|nohup|command|builtin)\s+")
+# A verdict covers content, not edit events: the marker keeps a fingerprint of its lasting
+# paths at every durable change, so an edit that was reverted leaves the approved content — and
+# the approval — in place. Bounded so a wide candidate costs nothing: past these limits the
+# fingerprint is unknown and freshness falls back to the timestamp rule.
+FINGERPRINT_MAX_FILES = 64
+FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
+CONTENT_MARKS_KEPT = 32
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
 SHELL_UNKNOWN = "UNKNOWN_OR_MUTATING"
@@ -114,6 +191,110 @@ def shell_write(data):
         return False
     command = str((data.get("tool_input") or {}).get("command") or "")
     return bool(SHELL_WRITE_RE.search(command))
+
+
+def command_head(segment):
+    """The executable a pipeline segment starts with (lower-case basename, no `.exe`), and its
+    arguments. Environment assignments and timing wrappers in front of it are skipped."""
+    segment = segment.strip().lstrip("({!").strip()
+    while True:
+        stripped = WRAPPER_RE.sub("", ENV_ASSIGNMENT_RE.sub("", segment, count=1), count=1)
+        if stripped == segment:
+            break
+        segment = stripped
+    words = segment.split(None, 1)
+    if not words:
+        return "", ""
+    token = words[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if token.endswith(".exe"):
+        token = token[:-4]
+    return token, (words[1] if len(words) > 1 else "")
+
+
+SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.+-]{0,39}$")
+
+
+def command_label(command):
+    """What the ledger keeps of a command: its first executable's name, or nothing recognizable.
+
+    A first token that is not a plain executable name — a PowerShell assignment such as
+    `$token='…'`, a quoted path with spaces — is not copied at all, so no value it carries can
+    reach the ledger.
+    """
+    if not command.strip():
+        return ""
+    first = SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0]
+    head = command_head(first)[0]
+    return head if SAFE_LABEL_RE.match(head) else "(unrecognized)"
+
+
+def git_read_only(arguments):
+    """Whether a git invocation only reads: a reading subcommand, a listing form, no output file."""
+    arguments = GIT_GLOBAL_OPTIONS_RE.sub("", arguments.strip())
+    if MUTATING_ARGS["git"].search(arguments):
+        return False
+    words = arguments.split()
+    subcommand = words[0].lower() if words else ""
+    if subcommand == "reflog":
+        return len(words) == 1 or words[1] == "show"
+    return subcommand in GIT_READ_SUBCOMMANDS or bool(GIT_LISTING_RE.match(arguments))
+
+
+def read_only_pipeline(command):
+    """Whether every segment of the command is a command proven not to write, arguments included."""
+    if any(token in command for token in ("$(", "<(", ">(", "`", "<<", "{")):
+        return False
+    # A merged stderr (`2>&1`) is dropped before splitting, or its `&` would cut the pipeline.
+    cleaned = HARMLESS_REDIRECT_RE.sub(" ", command)
+    if ">" in cleaned:
+        return False
+    for segment in SEGMENT_SPLIT_RE.split(cleaned):
+        if not segment.strip():
+            continue
+        # An environment assignment can redirect a reading command to an external program
+        # (`GIT_EXTERNAL_DIFF`, `RIPGREP_CONFIG_PATH`), so a prefixed segment is not proven.
+        if ENV_ASSIGNMENT_RE.match(segment.strip().lstrip("({!").strip()):
+            return False
+        head, rest = command_head(segment)
+        if EXECUTING_ARGUMENT_RE.search(rest):
+            return False
+        if head == "git":
+            if git_read_only(rest):
+                continue
+            return False
+        if head == "gh":
+            if GH_READ_RE.match(rest.strip()):
+                continue
+            return False
+        if head not in READ_ONLY_COMMANDS:
+            return False
+        guard = MUTATING_ARGS.get(head)
+        if guard and guard.search(rest):
+            return False
+        # `uniq input output` writes its second operand.
+        if head == "uniq" and len([w for w in rest.split() if not w.startswith("-")]) > 1:
+            return False
+    return True
+
+
+def write_capable(data):
+    """Whether this shell command could have rewritten a file the snapshot did not see.
+
+    Broader than `shell_write`, which names the shapes that definitely write and therefore keep
+    their whole delta in `own_delta`; this one only decides whether an unresolved mutation may
+    expire a review verdict. Only a pipeline of commands proven read-only is outside it, plus a
+    validation command: reruns of the checks the skill asks for never edit source.
+    """
+    if str(data.get("tool_name") or "") not in cwg.SHELL_TOOLS:
+        return False
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    if shell_write(data):
+        return True
+    if not command.strip():
+        return False
+    if VALIDATION_SHELL_RE.match(command) and "$(" not in command:
+        return False
+    return not read_only_pipeline(command)
 
 
 def shell_policy(data):
@@ -222,11 +403,10 @@ def git_snapshot(cwd):
 
 def agent_config_roots():
     """The agent-configuration homes, honouring the environment overrides the tools read."""
-    home = os.path.expanduser("~")
     return (
-        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"),
-        os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"),
-        os.path.join(home, ".agents"),
+        cwg.config_home(),
+        cwg.codex_home(),
+        os.path.join(os.path.expanduser("~"), ".agents"),
     )
 
 
@@ -515,8 +695,19 @@ def continues_cycle(existing, now, identity, incoming):
     """Whether an open marker still describes the candidate being edited now."""
     if not cwg.valid_ts(existing.get("first_ts")):
         return False
+    named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
+    recorded = set(existing.get("paths") or [])
+    touches_recorded = any(path in recorded for path in named)
+    # An opaque shell mark on the same branch resumes too: the morning's first `git push`
+    # names no file, and restarting on it would discard the rounds the same way.
+    resumed = identity and existing.get("identity") == identity and (touches_recorded or not named)
     last_ts = existing.get("last_ts")
-    if cwg.valid_ts(last_ts) and now - float(last_ts) > CANDIDATE_IDLE_LIMIT:
+    # The idle limit is a backstop for a candidate abandoned on its branch, not a clock on
+    # honest work: the same branch touching a file the cycle already holds is the same
+    # candidate the next morning, and restarting it would discard the review rounds it had —
+    # on 2026-09-04 that turned a REVISE, REVISE, ESCALATE sequence into an illegal lone
+    # ESCALATE.
+    if not resumed and cwg.valid_ts(last_ts) and now - float(last_ts) > CANDIDATE_IDLE_LIMIT:
         return False
     if not identity_mismatch(existing.get("identity"), identity):
         # An unknown identity is not evidence of a new candidate. Treating it as one would hand
@@ -531,11 +722,9 @@ def continues_cycle(existing, now, identity, incoming):
     # An opaque shell mark names no file, so it can neither confirm nor deny a different
     # candidate. Counting it as disjoint would make the branch switch itself — recorded exactly
     # this way — restart the window and drop the evidence of the work being published.
-    named = [path for path in incoming if path != cwg.SHELL_MUTATION_PATH]
     if not named:
         return True
-    recorded = set(existing.get("paths") or [])
-    return any(path in recorded for path in named)
+    return touches_recorded
 
 
 def cycle_start(marker, now, identity, incoming):
@@ -550,6 +739,9 @@ def cycle_start(marker, now, identity, incoming):
         "identity": identity,
         "last_durable_ts": 0.0,
         "unattributed_durable": False,
+        "content_marks": [],
+        "head_at_start": None,
+        "refs_at_start": None,
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -573,6 +765,9 @@ def cycle_start(marker, now, identity, incoming):
             "identity": stored if mismatch else (identity or stored),
             "last_durable_ts": float(carried) if cwg.valid_ts(carried) else 0.0,
             "unattributed_durable": bool(existing.get("unattributed_durable")),
+            "content_marks": list(existing.get("content_marks") or []),
+            "head_at_start": existing.get("head_at_start"),
+            "refs_at_start": existing.get("refs_at_start"),
         }
     if os.path.exists(marker):
         try:
@@ -618,7 +813,8 @@ def outside_snapshot(paths, roots, watched=()):
 
 
 def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
-                 watched_roots=(), unattributed_risk=None):
+                 watched_roots=(), unattributed_risk=None, write_capable_command=True,
+                 opening=None):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
     `unattributed_risk` is the grade of a lasting change seen during this command that no
@@ -659,7 +855,13 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     # edit forced a fresh review round for work the verdict already covered. An unresolved
     # mutation is the exception: it could have edited source through the shell, so once the
     # cycle holds durable paths it must expire the verdict the same way a named edit would.
-    expired = unresolved or outside_snapshot(paths, snapshot_roots, watched_roots)
+    # Only a command that could actually write expires a verdict on the strength of what the
+    # snapshot could not see; the snapshot's own evidence (a durable path in `incoming`) always
+    # does. A read-only pipeline the policy regex does not recognise, or a git failure under
+    # load, must not cost a review round.
+    expired = write_capable_command and (
+        unresolved or bool(outside_snapshot(paths, snapshot_roots, watched_roots))
+    )
     # An unattributable durable change anchors freshness too, even though its path is not
     # recorded: without an anchor such a candidate keeps last_durable_ts at zero, the Stop hook
     # falls back to the whole-cycle timestamp, and every later command then expires the very
@@ -671,6 +873,37 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
+    content_marks = cycle.get("content_marks") or []
+    if not cycle.get("edits") and cycle.get("head_at_start") is None:
+        # The commit and refs the cycle opened on: a repository back on them, clean, has changed
+        # nothing lasting, whatever happened in between (a rebase probe that was aborted, an
+        # edit undone). For a cycle a shell command opens, that state is what the pre-command
+        # snapshot saw — the command itself may have moved HEAD; an Edit cannot, so the state
+        # after it is the state before it. A shell opening without a snapshot leaves both unknown.
+        if opening is not None:
+            cycle["head_at_start"] = opening.get("head")
+            cycle["refs_at_start"] = opening.get("refs")
+        else:
+            cwd = str(data.get("cwd") or os.getcwd())
+            cycle["head_at_start"] = head_commit(cwd)
+            cycle["refs_at_start"] = cwg.refs_digest(cwd)
+    if last_durable_ts == now:
+        # A change the snapshot could not attribute may have touched anything, so the content
+        # after it is unknown; a named edit leaves the lasting paths' bytes to be measured.
+        fingerprint = (
+            None if (unattributed_risk or not cwg.durable_paths(incoming))
+            else content_fingerprint(paths)
+        )
+        content_marks = content_marks_after(content_marks, now, fingerprint)
+        cwg.log_event(
+            "durable", session=cwg.session_key(data.get("session_id")),
+            reason=("edit" if cwg.durable_paths(incoming) else
+                    "unattributed" if unattributed_risk else "unresolved-write-capable"),
+            paths=[p for p in cwg.durable_paths(incoming)][:5],
+            tool=str(data.get("tool_name") or ""),
+            command=command_label(str((data.get("tool_input") or {}).get("command") or "")),
+            fp=(fingerprint or "")[:12],
+        )
     return cwg.write_json(marker, {
         "first_ts": cycle["first_ts"],
         "last_ts": now,
@@ -682,7 +915,247 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "path_overflow": overflow,
         "identity": cycle["identity"],
         "unattributed_durable": unattributed_durable,
+        "content_marks": content_marks,
+        "head_at_start": cycle.get("head_at_start"),
+        "refs_at_start": cycle.get("refs_at_start"),
     })
+
+
+def codex_launch(command):
+    """How a shell command launches Codex: whether anything is fed on stdin, and the packet file.
+
+    `fed` is any stdin redirect anywhere in the command; `path` is the file read by the one
+    segment whose executable is codex — any spelling, `.exe` or not, behind `timeout` or an
+    environment assignment — running `exec`. It is empty when that segment cannot be named: no
+    codex segment, several, or a `||` that may skip it. The Stop hook treats a launch that fed
+    something it cannot bind by as binding nothing.
+    """
+    command = str(command or "")
+    fed = bool(STDIN_REDIRECT_RE.search(command))
+    if "||" in command:
+        return {"fed": fed, "path": ""}
+    fed_by = []
+    for segment in SEGMENT_SPLIT_RE.split(command):
+        head, rest = command_head(segment)
+        words = rest.split()
+        if head == "codex" and words and words[0].lower() == "exec":
+            matches = STDIN_REDIRECT_RE.findall(segment)
+            fed_by.append(matches[-1] if matches else "")
+    if len(fed_by) != 1 or not fed_by[0]:
+        return {"fed": fed, "path": ""}
+    import codex_lane
+    # The command arrives as the agent wrote it, `${REVIEW_ID}` and all; the value comes from
+    # an assignment in the same command. A variable nothing assigns leaves no file to capture.
+    path = codex_lane.resolve_variables(command, fed_by[0])
+    return {"fed": fed, "path": "" if "$" in path else codex_lane.windows_path(path)}
+
+
+def forget_stale_captures(session, now=None):
+    """Drop this session's packet captures older than a day: their launches never reported back."""
+    now = time.time() if now is None else now
+    for path in glob.glob(cwg.packet_capture_path(session, "*")):
+        try:
+            if now - os.path.getmtime(path) > PACKET_CAPTURE_TTL:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def capture_packet(data, session):
+    """Keep what this launch is about to feed Codex, so a later rewrite of the file changes nothing."""
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    path = codex_launch(command)["path"]
+    if not path or not data.get("tool_use_id"):
+        return
+    forget_stale_captures(session)
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(PACKET_KEEP_BYTES + 1)
+    except OSError:
+        raw = b""
+    text = cwg.normalized(raw[:PACKET_KEEP_BYTES].decode("utf-8", "replace"))
+    # `text` and `truncated` are what the Stop hook reads; `path` and `ts` are for a person
+    # opening the capture to see which launch it belonged to.
+    cwg.write_json(cwg.packet_capture_path(session, str(data.get("tool_use_id"))), {
+        "path": path, "ts": time.time(), "text": text,
+        "truncated": len(raw) > PACKET_KEEP_BYTES,
+    })
+
+
+# How a command names a configuration home it might write to: the home's own path, its
+# shell spellings, or the environment variable that points at it.
+HOME_REFERENCE_RE = re.compile(r"(?i)(?:\.(?:claude|codex|agents)(?=$|[\s\"'/\\;&|)])|claude_config_dir|codex_home)")
+
+
+def on_home_ground(path, cwd, snapshot_roots, data):
+    """Whether an unattributed change at this path can be this command's own.
+
+    It can when the path lies under the repository the command ran in, under the command's
+    working directory or the configuration home holding it, or under a configuration home the
+    command names — by its path in any spelling (Windows, Git Bash), by `~/.claude`-style
+    shorthand, or by the environment variable that points at it. A change elsewhere was seen
+    only because the homes are shared between sessions, and grading it here would hand this
+    candidate another session's floor. A path a command builds at run time without spelling
+    the home is out of reach by design.
+    """
+    path = cwg.normalize_path(path)
+    cwd = cwg.normalize_path(cwd).rstrip("/")
+    homes = [cwg.normalize_path(root).rstrip("/") for root in agent_config_roots()]
+    grounds = [cwg.normalize_path(root).rstrip("/") for root in snapshot_roots if root]
+    grounds.append(cwd)
+    grounds.extend(home for home in homes if home and cwd and covers(home, cwd))
+    if any(covers(ground, path) for ground in grounds if ground):
+        return True
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    if not command:
+        return False
+    spelled = cwg.normalize_path(command)
+    for home in homes:
+        if not home:
+            continue
+        spellings = [home]
+        if re.match(r"^[a-z]:/", home):
+            spellings.append("/" + home[0] + home[2:])
+        if any(spelling in spelled for spelling in spellings):
+            return True
+    return bool(HOME_REFERENCE_RE.search(command))
+
+
+def head_commit(cwd):
+    """The commit HEAD points at in this working directory, or None outside a repository."""
+    head = (cwg.git_text(cwd, ["rev-parse", "HEAD"], timeout=5) or "").strip()
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+
+def content_fingerprint(paths):
+    """A digest of the lasting paths as they are now, or None when it cannot be known cheaply.
+
+    Every record is domain-separated and length-prefixed — kind, path, mode, bytes or link
+    target — so no content can imitate another record. A path that no longer exists contributes
+    nothing: the candidate is what is on disk, so an add that was deleted again is no change,
+    while a file the approval covered going missing is one. Inside a repository a staged blob
+    that matches neither HEAD nor the file on disk is part of the record — something was put in
+    the index that nobody reviewed — while staging or committing the reviewed bytes changes
+    nothing: `git add` and `git commit` after an approval are not edits.
+    """
+    durable = sorted(set(cwg.durable_paths(paths)))
+    if not durable or len(durable) > FINGERPRINT_MAX_FILES:
+        return None
+    digest = hashlib.sha256()
+
+    def add(kind, *fields):
+        digest.update(kind)
+        for field in fields:
+            data = field if isinstance(field, bytes) else str(field).encode("utf-8", "replace")
+            digest.update(struct.pack(">Q", len(data)))
+            digest.update(data)
+
+    by_dir = {}
+    for path in durable:
+        try:
+            if os.path.islink(path):
+                add(b"L", path, os.readlink(path))
+                continue
+            if not os.path.exists(path):
+                continue
+            if os.path.isdir(path):
+                add(b"D", path)
+                continue
+            if os.path.getsize(path) > FINGERPRINT_MAX_BYTES:
+                return None
+            with open(path, "rb") as stream:
+                content = stream.read()
+            add(b"F", path, os.stat(path).st_mode & 0o777, content)
+            by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
+        except OSError:
+            return None
+    for directory, names in sorted(by_dir.items()):
+        divergences = staged_divergences(directory, names)
+        if divergences is None:
+            return None
+        for name, oid in divergences:
+            add(b"S", os.path.join(directory, name), oid)
+    return digest.hexdigest()
+
+
+# Per hook run: whether each repository root has a commit yet.
+_HEAD_BORN = {}
+
+
+def staged_divergences(directory, names):
+    """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk, and
+    (name, "deleted") for a file on disk and in HEAD that the index no longer holds.
+
+    The disk blob is what git itself would store for the file (`hash-object` applies the same
+    line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. The
+    listings are read NUL-separated, so a name git would quote (non-ASCII, a tab) keys like any
+    other, and keyed by Python's own lower-casing, the same one the marker uses. Outside a
+    repository nothing is recorded; anything git could not answer — including whether this is a
+    repository at all — returns None, so the caller records an unknown fingerprint rather than a
+    false one.
+    """
+    names = sorted(names)
+    # One answer per repository for "is this a repository" and "does HEAD exist": a candidate
+    # spread over many directories of one checkout asks git these twice, not twice per directory.
+    toplevel = cwg.git_run(directory, ["rev-parse", "--show-toplevel"], timeout=5)
+    if toplevel is None:
+        return None
+    if toplevel[0] != 0 or not toplevel[1].strip():
+        return []
+    root = toplevel[1].strip()
+    if not _HEAD_BORN.get(root):
+        # Only "born" is remembered: a repository gains its first commit, never loses it.
+        born = cwg.git_run(root, ["rev-parse", "--verify", "-q", "HEAD"], timeout=5)
+        if born is None:
+            return None
+        _HEAD_BORN[root] = born[0] == 0
+    staged = cwg.git_text(directory, ["ls-files", "-s", "-z"], timeout=10)
+    if staged is None:
+        return None
+    committed = ""
+    if _HEAD_BORN[root]:
+        committed = cwg.git_text(directory, ["ls-tree", "-z", "HEAD"], timeout=10)
+        if committed is None:
+            return None
+    present = [name for name in names if os.path.isfile(os.path.join(directory, name))]
+    # `hash-object` takes paths on disk, not pathspecs; one missing path fails the whole call,
+    # and every file then counts as divergent, which can only cost a review round.
+    on_disk = cwg.git_text(directory, ["hash-object", "--"] + present, timeout=10) if present else ""
+    disk_by_name = (
+        dict(zip(present, on_disk.split())) if on_disk is not None else {}
+    )
+
+    def entries(listing, oid_field):
+        # `ls-files -s -z`: "<mode> <oid> <stage>\t<path>"; `ls-tree -z`: "<mode> <type> <oid>\t<path>".
+        found = {}
+        for record in listing.split("\0"):
+            head, _, path = record.partition("\t")
+            parts = head.split()
+            if len(parts) == 3 and path and "/" not in path:
+                found[path.lower()] = parts[oid_field]
+        return found
+
+    staged_by_name = entries(staged, 1)
+    head_by_name = entries(committed, 2)
+    divergent = []
+    for name in names:
+        key = name.lower()
+        oid = staged_by_name.get(key)
+        if oid is None:
+            if key in head_by_name and name in present:
+                divergent.append((name, "deleted"))
+            continue
+        if oid != head_by_name.get(key) and oid != disk_by_name.get(name, "unreadable"):
+            divergent.append((name, oid))
+    return divergent
+
+
+def content_marks_after(marks, now, fingerprint):
+    """The marks with this change appended: a new one only when the content actually differs."""
+    kept = [mark for mark in (marks or []) if isinstance(mark, dict)]
+    if not kept or fingerprint is None or kept[-1].get("fp") != fingerprint:
+        kept.append({"ts": now, "fp": fingerprint})
+    return kept[-CONTENT_MARKS_KEPT:]
 
 
 def candidate_note(before, after):
@@ -754,6 +1227,7 @@ def main():
 
         if event == "PreToolUse":
             if is_shell:
+                capture_packet(data, session)
                 if policy != SHELL_READ_ONLY:
                     started = time.time()
                     # The window is published before the command runs, so a session resolving a
@@ -766,6 +1240,8 @@ def main():
                         dict(
                             shell_snapshot(cwd),
                             ts=started,
+                            head=head_commit(cwd),
+                            refs=cwg.refs_digest(cwd),
                         ),
                     )
             elif cwg.is_gated(path):
@@ -821,7 +1297,14 @@ def main():
                     [(cwg.normalize_path(root), ()) for root in snapshot_roots if root]
                     + [(root, AGENT_CONFIG_SKIP) for root in watched_roots],
                 )
-                unattributed = cwg.durable_paths(ambiguous)
+                # A change under a root the command neither ran in nor names is another
+                # session's work seen through a shared home, not this command's: on
+                # 2026-09-04 a `glab api` loop run in a worktree inherited a HIGH floor from
+                # the gate-ops session editing hooks under ~/.claude at that moment.
+                unattributed = [
+                    path for path in cwg.durable_paths(ambiguous)
+                    if on_home_ground(path, cwd, snapshot_roots, data)
+                ]
                 floor = cwg.minimum_risk(unattributed) if unattributed else None
 
         try:
@@ -832,7 +1315,9 @@ def main():
                 if shell_paths:
                     cwg.publish_claims(session, paths=shell_paths, cwd=cwd)
                     record_paths(data, shell_paths, snapshot_roots=snapshot_roots,
-                                 watched_roots=watched_roots, unattributed_risk=floor)
+                                 watched_roots=watched_roots, unattributed_risk=floor,
+                                 write_capable_command=write_capable(data),
+                                 opening={"head": before.get("head"), "refs": before.get("refs")})
                 elif observed or not home_ground or policy == SHELL_UNKNOWN:
                     # An empty delta is not proof of no write: ignored files, and paths
                     # outside both the repository and the configuration homes, are invisible
@@ -850,6 +1335,8 @@ def main():
                         snapshot_roots=snapshot_roots,
                         watched_roots=watched_roots,
                         unattributed_risk=floor,
+                        write_capable_command=write_capable(data),
+                        opening={"head": before.get("head"), "refs": before.get("refs")},
                     )
         finally:
             # Closed on every path out of this block, and deliberately not before it: closing

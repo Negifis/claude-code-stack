@@ -1,9 +1,11 @@
 """Regression tests for the strict finite Code Work Gate."""
 import atexit
 import datetime
+import glob
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +40,7 @@ os.makedirs(AGENT_HOME, exist_ok=True)
 os.environ["USERPROFILE"] = AGENT_HOME
 os.environ["HOME"] = AGENT_HOME
 MARK_HOOK = os.path.join(HERE, "code_work_gate_mark.py")
+GATE_INBOX = os.path.join(HERE, "gate_inbox.py")
 def _discard_fixtures():
     """Leave nothing of this run behind.
 
@@ -266,6 +269,8 @@ CODEX_COMMAND = 'node "codex-companion.mjs" adversarial-review "--wait CODE_WORK
 REQUIRED_CODEX_COMMAND = CODEX_COMMAND[:-1] + ' CODE_WORK_GATE_REQUIRED"'
 CODEX_ERRAND_COMMAND = 'node "codex-companion.mjs" review "--wait CODE_WORK_GATE_REVIEW"'
 CODEX_CLI_COMMAND = "codex exec --json - < /c/tmp/packet-CODE_WORK_GATE_REVIEW.md"
+# A launch that feeds no packet on stdin: bound by the single-session rule, no capture needed.
+CODEX_BG_COMMAND = "codex exec --json -  # CODE_WORK_GATE_REVIEW"
 
 
 def review_text(verdict, subject="the auth session candidate"):
@@ -308,7 +313,8 @@ def reviewer_role_text():
 
 
 def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True,
-                  partial_role=False, briefed_at=None, filler_bytes=0, earlier=None):
+                  partial_role=False, briefed_at=None, filler_bytes=0, earlier=None,
+                  packet="Round 1 packet."):
     """One Codex rollout log in the CLI's own shape.
 
     `logged` is what the session said, and only an assistant record stamped inside the call's
@@ -331,7 +337,7 @@ def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True
                 "payload": {"type": "message", "role": "developer",
                             "content": [{"type": "input_text",
                                          "text": (given[:300] if partial_role else given)
-                                                 + "\n\nRound 1 packet."}]},
+                                                 + "\n\n" + packet}]},
             }) + "\n")
         for at, text in earlier or ():
             # Earlier rounds of the same session, behind the bulk that follows them.
@@ -959,6 +965,1305 @@ try:
     check("the legacy trio still satisfies a HIGH candidate", result.get("continue") is True and "decision" not in result, result)
 finally:
     cleanup(sid, locals().get("transcript"))
+
+# --- background work: a review lane that went to the background, and turns that may end
+def notification_text_for(task_id, output_file, status="completed"):
+    return (
+        "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n"
+        "<output-file>{}</output-file>\n<status>{}</status>\n"
+        "<summary>Background command \"review\" {}</summary>\n</task-notification>"
+    ).format(task_id, output_file, status, "completed (exit code 0)" if status == "completed" else status)
+
+
+def notification(stamp, task_id, output_file, status="completed"):
+    return entry(stamp, "user", [{"type": "text", "text": notification_text_for(task_id, output_file, status)}])
+
+
+def midturn_notification(stamp, task_id, output_file, status="completed"):
+    """A notification absorbed while the turn was running: queued, attached, never a user turn."""
+    text = notification_text_for(task_id, output_file, status)
+    return [
+        {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(stamp), "content": text},
+        {"type": "attachment", "timestamp": iso(stamp),
+         "attachment": {"type": "queued_command", "prompt": text, "commandMode": "task-notification"}},
+        {"type": "queue-operation", "operation": "remove", "timestamp": iso(stamp + 0.3), "content": text,
+         "reason": "absorbed_mid_turn"},
+    ]
+
+
+def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-" + task_id, CODEX_BG_COMMAND,
+                           run_in_background=(True if "running in background" in ack_text else None)))
+    events.append(tool_result(now - 699, "codex-" + task_id, ack_text))
+    if notify:
+        events.append(notification(now - 600, task_id, out_file, notify_status))
+    return events
+
+
+tasks_dir = os.path.join(AGENT_HOME, "tasks")
+os.makedirs(tasks_dir, exist_ok=True)
+
+
+def write_review_output(path, text, finished_at):
+    """A background task's output file as the harness leaves it: last written when the task ended."""
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    os.utime(path, (finished_at, finished_at))
+
+
+DETACHED_ACK = "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."
+for label, ack in (
+    ("a detached launch",
+     "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."),
+    ("a foreground launch the harness moved to the background",
+     "Command did not complete within its 120s timeout and was moved to the background (ID: {id}). Output is being written to: {out}. You will be notified when it completes."),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "btask" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 601)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = background_review_events(now, task_id, out_file, ack.format(id=task_id, out=out_file))
+        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {
+            "session_id": sid, "transcript_path": transcript,
+            "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background",
+        })
+        check("{} is bound through its completion notification".format(label),
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bpend" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
+    transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify=False))
+    payload = {"session_id": sid, "transcript_path": transcript,
+               "last_assistant_message": "Waiting for the review.\n[gate] verified: HIGH; pending"}
+    result = run(STOP_HOOK, payload)
+    check("a pending background review lets the turn end",
+          result.get("continue") is True and "decision" not in result, result)
+    check("the waiting note names the task and forbids polling",
+          task_id in result.get("systemMessage", "") and "Do not poll" in result.get("systemMessage", ""), result)
+    state = cwg.read_json(gate_paths(sid)[1]) or {}
+    check("a waiting stop is not a block", state.get("blocks", 0) == 0 and state.get("waits") == 1, state)
+    for _ in range(gate.MAX_BACKGROUND_WAITS - 1):
+        run(STOP_HOOK, payload)
+    result = run(STOP_HOOK, payload)
+    check("waiting stops are bounded per candidate", result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bdead" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    old = now - 4 * 3600
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=old - 200, last_ts=old - 100, durable_ts=old - 100)
+    events = [skill_use(old - 190, "development-verification", "skill-dev")]
+    simplify_wave(events, old - 180, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(old, "codex-dead", CODEX_BG_COMMAND, run_in_background=True))
+    events.append(tool_result(old + 1, "codex-dead", DETACHED_ACK.format(id=task_id, out=out_file)))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a background task older than the wait limit no longer holds the gate open",
+          result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bfail" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
+    transcript = write_transcript(background_review_events(now, task_id, out_file, ack, notify_status="failed"))
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the background Codex lane failed"})
+    check("a failed background review lane is current failure evidence for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bstop" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    ack = DETACHED_ACK.format(id=task_id, out=out_file)
+    events = background_review_events(now, task_id, out_file, ack, notify=False)
+    events.append(entry(now - 500, "assistant", [{
+        "type": "tool_use", "id": "stop-1", "name": "TaskStop", "input": {"task_id": task_id},
+    }]))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a stopped background review is no longer in flight",
+          result.get("decision") == "block" and "systemMessage" not in result, result)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the background Codex lane was stopped"})
+    check("a stopped background review lane is current failure evidence for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a repository back on the commit the candidate opened on, and clean, changed nothing lasting
+with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
+    subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.email", "t@example.com"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.name", "t"], check=False, capture_output=True)
+    target = os.path.join(tree, "src", "app.py")
+    os.makedirs(os.path.dirname(target))
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "start"], check=False, capture_output=True)
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("<<<<<<< probe" + chr(10))
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        data = cwg.read_json(marker) or {}
+        check("a new cycle remembers the commit it opened on", data.get("head_at_start") == head, data.get("head_at_start"))
+        events = [skill_use(120, "development-verification", "skill-dev")]
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: the probe was aborted"})
+        check("a tree that still differs from the start commit keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('a')" + chr(10))
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: the probe was aborted and the tree restored"})
+        check("a tree restored to the start commit closes as no-change",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('b')" + chr(10))
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "moved"], check=False, capture_output=True)
+        events = [skill_use(120, "development-verification", "skill-dev")]
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] operational: checked; committed"})
+        check("a clean tree on a different commit is not restored",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        data = cwg.read_json(marker) or {}
+        data["paths"] = list(data.get("paths") or []) + ["C:/elsewhere/lasting.py"]
+        subprocess.run(["git", "-C", tree, "reset", "-q", "--hard", head], check=False, capture_output=True)
+        cwg.write_json(marker, data)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: restored"})
+        check("a lasting path outside the repository is not something git can vouch for",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+    subprocess.run(["git", "-C", tree, "reset", "-q", "--hard", head], check=False, capture_output=True)
+
+    def open_by_edit(sid, path, content):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": path}})
+
+    def stop_with(sid, transcript, message):
+        return run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript, "last_assistant_message": message})
+
+    # A capitalised component below the root: the whole tree is what git reports on.
+    upper = os.path.join(tree, "Src", "App.py")
+    os.makedirs(os.path.dirname(upper), exist_ok=True)
+    with open(upper, "w", encoding="utf-8") as stream:
+        stream.write("print('u')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "upper"], check=False, capture_output=True)
+    head_upper = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('changed')" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a modified file under a capitalised directory keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('u')" + chr(10))
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("restored under a capitalised directory closes as no-change",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+    # A commit on a side branch, then back: the refs moved, so nothing is "restored".
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('side')" + chr(10))
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "-b", "side"], check=False, capture_output=True)
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "side work"], check=False, capture_output=True)
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "master"], check=False, capture_output=True)
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] operational: committed on a side branch; back on master")
+        check("a commit on a side branch keeps the candidate open although HEAD is back",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+        subprocess.run(["git", "-C", tree, "branch", "-q", "-D", "side"], check=False, capture_output=True)
+
+    # A gitignored lasting file: git cannot see its change, so it cannot vouch for it.
+    with open(os.path.join(tree, ".gitignore"), "w", encoding="utf-8") as stream:
+        stream.write(".env" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", ".gitignore"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "ignore"], check=False, capture_output=True)
+    sid = session()
+    try:
+        secret = os.path.join(tree, ".env")
+        open_by_edit(sid, secret, "TOKEN=1" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] no-change: nothing to see")
+        check("an ignored lasting file keeps the candidate open even with a clean status",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        os.remove(secret)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+    # A repository that does not ignore case cannot vouch for lower-cased paths; past the path
+    # cap the marker cannot name every lasting path.
+    sid = session()
+    try:
+        open_by_edit(sid, upper, "print('cased')" + chr(10))
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('u')" + chr(10))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "false"], check=False, capture_output=True)
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a repository that does not ignore case keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "true"], check=False, capture_output=True)
+        marker, _ = gate_paths(sid)
+        data = cwg.read_json(marker) or {}
+        data["path_overflow"] = True
+        cwg.write_json(marker, data)
+        result = stop_with(sid, transcript, "[gate] no-change: reverted")
+        check("a marker past the path cap keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+    # A cycle a shell command opens remembers the state from before that command.
+    sid = session()
+    try:
+        head_before = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        payload = {"session_id": sid, "tool_name": "Bash", "tool_use_id": "open-" + uuid.uuid4().hex[:6],
+                   "cwd": tree, "tool_input": {"command": "git commit -q -am 'shell opened'"}}
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+        # What the command did: committed one file and left another modified.
+        with open(upper, "w", encoding="utf-8") as stream:
+            stream.write("print('committed by the command')" + chr(10))
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "shell opened"], check=False, capture_output=True)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('left dirty')" + chr(10))
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+        marker, _ = gate_paths(sid)
+        data = cwg.read_json(marker) or {}
+        check("a shell-opened cycle remembers the commit from before the command",
+              data.get("head_at_start") == head_before and bool(data.get("refs_at_start")), data.get("head_at_start"))
+        subprocess.run(["git", "-C", tree, "checkout", "-q", "--", "src/app.py"], check=False, capture_output=True)
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = stop_with(sid, transcript, "[gate] operational: committed; tree clean")
+        check("a commit made by the opening command keeps the candidate open although the tree is clean again",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+# --- the same candidate resumed the next morning keeps its cycle, and its review rounds with it
+stale = {"first_ts": 100.0, "last_ts": 200.0, "identity": "c:/repo#refs/heads/work",
+         "paths": ["c:/repo/src/app.py"]}
+day_later = 200.0 + 9 * 3600
+check("an idle cycle continues when the same branch touches a file it already holds",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", ["c:/repo/src/app.py"]) is True, stale)
+check("an idle cycle still ends when a different file is touched",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is False, stale)
+check("an idle cycle still ends when the branch changed",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/next", ["c:/repo/src/app.py"]) is False, stale)
+check("an idle cycle continues on an opaque shell mark on the same branch",
+      marker_hook.continues_cycle(stale, day_later, "c:/repo#refs/heads/work", [cwg.SHELL_MUTATION_PATH]) is True, stale)
+check("an idle cycle ends when the identity is unknown",
+      marker_hook.continues_cycle(stale, day_later, None, ["c:/repo/src/app.py"]) is False, stale)
+check("within the idle limit the cycle continues as before",
+      marker_hook.continues_cycle(stale, 200.0 + 3600, "c:/repo#refs/heads/work", ["c:/repo/src/other.py"]) is True, stale)
+
+# --- every way a command names a configuration home counts, and none of them is a false one
+home_norm = cwg.normalize_path(CLAUDE_CONFIG_DIR).rstrip("/")
+home_gitbash = "/" + home_norm[0] + home_norm[2:] if re.match(r"^[a-z]:/", home_norm) else home_norm
+changed = os.path.join(CLAUDE_CONFIG_DIR, "hooks", "x.py")
+for command, expect in (
+    ("cd $HOME/.claude && python hooks/patch.py", True),
+    ("cd {} && python hooks/patch.py".format(home_gitbash), True),
+    ('cd "{}" && python hooks/patch.py'.format(CLAUDE_CONFIG_DIR), True),
+    ("cd %USERPROFILE%\\.claude && python hooks/patch.py", True),
+    ("cd $HOME/.codex; python x.py", True),
+    ('python "$CLAUDE_CONFIG_DIR/hooks/patch.py"', True),
+    ("python ${CODEX_HOME}/skills/sync.py", True),
+    ("for M in 477 478; do glab api projects/1/merge_requests/$M; done", False),
+    ("echo claudette", False),
+    ("", False),
+):
+    got = marker_hook.on_home_ground(changed, "C:/tmp/worktree", ["C:/tmp/worktree"],
+                                     {"tool_input": {"command": command}})
+    check("on_home_ground {!r} -> {}".format(command[:44], expect), got is expect, command)
+check("a command run inside a configuration home without a repository snapshot is on home ground",
+      marker_hook.on_home_ground(changed, os.path.join(CLAUDE_CONFIG_DIR, "skills"), [], {"tool_input": {"command": "python sync.py"}}) is True, changed)
+check("a trailing slash on the working directory does not lose the ground",
+      marker_hook.on_home_ground("C:/tmp/worktree/src/a.py", "C:/tmp/worktree/", [], {"tool_input": {"command": "python x.py"}}) is True, "trailing slash")
+check("on_home_ground survives malformed input",
+      marker_hook.on_home_ground(changed, "", [None], {}) is False and marker_hook.on_home_ground(changed, None, [], {"tool_input": None}) is False, "malformed")
+
+# --- another session's change under the shared configuration home is not this command's floor
+for label, command, expect_high in (
+    ("a command run in its repository does not inherit a floor from a change under the config home",
+     "for M in 477 478; do glab api projects/1/merge_requests/$M; done", False),
+    ("a command that names the config home still answers for a change under it",
+     "python ~/.claude/hooks/patch.py && ls", True),
+):
+    with tempfile.TemporaryDirectory(prefix="cwg_ground_") as tree:
+        sid = session()
+        try:
+            subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+            with open(os.path.join(tree, "README.md"), "w", encoding="utf-8") as stream:
+                stream.write("hello" + chr(10))
+            subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+            marker, _ = gate_paths(sid)
+            payload = {"session_id": sid, "tool_name": "Bash", "tool_use_id": "ground-" + uuid.uuid4().hex[:6],
+                       "cwd": tree, "tool_input": {"command": command}}
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            # Another session has a command in flight under the configuration home, and a
+            # file appears there while this command runs: nobody can say whose it is.
+            other = cwg.session_key(session())
+            cwg.publish_claims(other, shell_start_ts=time.time() - 1, cwd=os.path.join(CLAUDE_CONFIG_DIR, "hooks"))
+            foreign = os.path.join(CLAUDE_CONFIG_DIR, "hooks", "foreign_" + uuid.uuid4().hex[:6] + ".py")
+            os.makedirs(os.path.dirname(foreign), exist_ok=True)
+            with open(foreign, "w", encoding="utf-8") as stream:
+                stream.write("# written by another session while the command ran" + chr(10))
+            time.sleep(0.05)
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            check(label, bool(data.get("unattributed_durable")) is expect_high
+                  and (foreign.replace(chr(92), "/").lower() not in [x.lower() for x in data.get("paths") or []]), data)
+            os.remove(foreign)
+            cwg.retire_claims(other)
+        finally:
+            cleanup(sid)
+
+# --- how a launch is read: any spelling of codex, one exec segment, no conditional execution
+for command, fed, tail in (
+    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err  # CODE_WORK_GATE_REVIEW", True, "C:/tmp/p.md"),
+    ('PYTHONIOENCODING=utf-8 "C:/tools/Codex.exe" exec - < "C:/tmp/q.md"', True, "C:/tmp/q.md"),
+    ("CODEX EXEC - < p.md", True, "p.md"),
+    ("true || codex exec - < p.md", True, ""),
+    ("helper < other.md && codex exec - < target.md", True, "target.md"),
+    ("codex exec - < a.md; codex exec - < b.md", True, ""),
+    ("codex exec - <<'PY'", False, ""),
+    ("codex exec -", False, ""),
+    ("cat < notes.md | grep x", True, ""),
+    ("REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err", True, "C:/tmp/codex-packet-r7.md"),
+    ("codex exec - < /c/tmp/codex-packet-${UNSET}.md", True, ""),
+):
+    launch = marker_hook.codex_launch(command)
+    check("codex_launch reads {!r}".format(command[:48]),
+          launch["fed"] is fed and launch["path"].replace(chr(92), "/").endswith(tail) and (bool(launch["path"]) == bool(tail)), launch)
+
+# --- the fingerprint: records that cannot imitate one another, existence by presence, the index included
+with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
+    a = os.path.join(tree, "src", "a.py")
+    b = os.path.join(tree, "src", "b.py")
+    os.makedirs(os.path.dirname(a))
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    only_a = marker_hook.content_fingerprint([a, b])
+    with open(b, "wb") as stream:
+        stream.write(b"<missing>")
+    check("a file holding the old sentinel bytes is not a missing file",
+          marker_hook.content_fingerprint([a, b]) != only_a, only_a)
+    os.remove(b)
+    check("an add that was deleted again is no change", marker_hook.content_fingerprint([a, b]) == only_a
+          and marker_hook.content_fingerprint([a]) == only_a, only_a)
+    subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    staged_a = marker_hook.content_fingerprint([a])
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('changed')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    check("a staged blob that matches neither HEAD nor the disk is part of the record",
+          marker_hook.content_fingerprint([a]) != staged_a, staged_a)
+    subprocess.run(["git", "-C", tree, "checkout", "-q", "--", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "reset", "-q"], check=False, capture_output=True)
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('reviewed')" + chr(10))
+    reviewed = marker_hook.content_fingerprint([a])
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    added = marker_hook.content_fingerprint([a])
+    subprocess.run(["git", "-C", tree, "config", "user.email", "t@example.com"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.name", "t"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "reviewed"], check=False, capture_output=True)
+    committed = marker_hook.content_fingerprint([a])
+    check("staging and committing the reviewed bytes change nothing",
+          reviewed == added == committed and reviewed is not None, (reviewed, added, committed))
+
+    def git(*args):
+        return subprocess.run(["git", "-C", tree] + list(args), check=False, capture_output=True, text=True, encoding="utf-8")
+
+    # A tracked file: edit, stage, commit — the fingerprint of the reviewed bytes never moves.
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('tracked edit')" + chr(10))
+    edited = marker_hook.content_fingerprint([a])
+    git("add", ".")
+    staged = marker_hook.content_fingerprint([a])
+    git("commit", "-q", "-m", "tracked edit")
+    landed = marker_hook.content_fingerprint([a])
+    check("a tracked file's fingerprint survives staging and committing its reviewed bytes",
+          edited == staged == landed and edited is not None, (edited, staged, landed))
+
+    # A stale index committed: the reviewer saw Q on disk, P was staged and got committed.
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('P')" + chr(10))
+    git("add", ".")
+    with open(a, "w", encoding="utf-8") as stream:
+        stream.write("print('Q')" + chr(10))
+    at_review = marker_hook.content_fingerprint([a])
+    git("commit", "-q", "-m", "stale index")
+    check("committing a stale index changes the fingerprint the reviewer's bytes had",
+          marker_hook.content_fingerprint([a]) != at_review, at_review)
+    git("checkout", "-q", "--", ".")
+
+    # A staged deletion of a file still on disk is a divergence.
+    before_rm = marker_hook.content_fingerprint([a])
+    git("rm", "-q", "--cached", "src/a.py")
+    check("a staged deletion of a file still on disk changes the fingerprint",
+          marker_hook.content_fingerprint([a]) != before_rm, before_rm)
+    git("add", ".")
+
+    # A non-ASCII name keys like any other.
+    cyr = os.path.join(tree, "src", "\u0437\u0430\u043c\u0435\u0442\u043a\u0438.md")
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("one" + chr(10))
+    git("add", ".")
+    git("commit", "-q", "-m", "cyrillic")
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("two" + chr(10))
+    cyr_edited = marker_hook.content_fingerprint([cyr])
+    git("add", ".")
+    cyr_staged = marker_hook.content_fingerprint([cyr])
+    with open(cyr, "w", encoding="utf-8") as stream:
+        stream.write("three" + chr(10))
+    check("a non-ASCII file name is keyed, staged and diverged like any other",
+          cyr_edited == cyr_staged and marker_hook.content_fingerprint([cyr]) != cyr_staged, (cyr_edited, cyr_staged))
+    git("checkout", "-q", "--", ".")
+
+with tempfile.TemporaryDirectory(prefix="cwg_unborn_") as unborn:
+    subprocess.run(["git", "-C", unborn, "init", "-q"], check=False, capture_output=True)
+    fresh = os.path.join(unborn, "new.py")
+    with open(fresh, "w", encoding="utf-8") as stream:
+        stream.write("print('new')" + chr(10))
+    first = marker_hook.content_fingerprint([fresh])
+    subprocess.run(["git", "-C", unborn, "add", "."], check=False, capture_output=True)
+    check("a repository without a commit yet stages without changing the fingerprint",
+          first == marker_hook.content_fingerprint([fresh]) and first is not None, first)
+    silent = marker_hook.cwg.git_run
+    try:
+        marker_hook.cwg.git_run = lambda *args, **kwargs: None
+        marker_hook._HEAD_BORN.clear()
+        check("a fingerprint is unknown, not clean, when git cannot answer at all",
+              marker_hook.content_fingerprint([fresh]) is None, "git silent")
+    finally:
+        marker_hook.cwg.git_run = silent
+        marker_hook._HEAD_BORN.clear()
+
+# --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
+def marker_with_marks(sid, marks):
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=marks[-1][0], durable_ts=marks[-1][0])
+    marker, _ = gate_paths(sid)
+    data = cwg.read_json(marker)
+    data["content_marks"] = [{"ts": stamp, "fp": fp} for stamp, fp in marks]
+    cwg.write_json(marker, data)
+
+
+for label, marks, verdict_at, expect in (
+    ("an approval between an edit and its byte-identical revert still covers the candidate",
+     [(110.0, "fpA"), (140.0, "fpB"), (150.0, "fpA")], 120.0, True),
+    ("an approval of content that was changed since does not",
+     [(110.0, "fpA"), (140.0, "fpB"), (150.0, "fpA")], 145.0, False),
+    ("a change the snapshot could not attribute leaves the content unknown",
+     [(110.0, "fpA"), (150.0, None)], 120.0, False),
+    ("an unattributable change between the verdict and a byte-identical revert is a barrier",
+     [(110.0, "fpA"), (150.0, None), (160.0, "fpB"), (170.0, "fpA")], 120.0, False),
+    ("a verdict given once the content was measured again covers a later edit-and-revert",
+     [(110.0, "fpA"), (150.0, None), (160.0, "fpA"), (170.0, "fpB"), (180.0, "fpA")], 165.0, True),
+    ("a marker without content marks keeps the strict timestamp rule",
+     [], 120.0, False),
+):
+    sid = session()
+    try:
+        if marks:
+            marker_with_marks(sid, marks)
+        else:
+            seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=150.0, durable_ts=150.0)
+        events = base_events(include_simplify=True)
+        add_review(events, verdict_at, "review-content", review_text("APPROVED"))
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; reviewed"})
+        allowed = result.get("continue") is True and "decision" not in result
+        check(label, allowed is expect, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+with tempfile.TemporaryDirectory(prefix="cwg_marks_") as tree:
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        target = os.path.join(tree, "src", "app.py")
+        os.makedirs(os.path.dirname(target))
+        for content in ("print('a')\n", "print('b')\n", "print('a')\n"):
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write(content)
+            run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                            "cwd": tree, "tool_input": {"file_path": target}})
+        marks = (cwg.read_json(marker) or {}).get("content_marks") or []
+        check("the marker fingerprints the lasting paths at every durable change",
+              len(marks) == 3 and marks[0]["fp"] == marks[2]["fp"] != marks[1]["fp"]
+              and all(isinstance(m["fp"], str) and len(m["fp"]) == 64 for m in marks), marks)
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        marks = (cwg.read_json(marker) or {}).get("content_marks") or []
+        check("an edit that changed nothing adds no mark", len(marks) == 3, marks)
+    finally:
+        cleanup(sid)
+
+# --- a notification absorbed mid-turn is read from the queue records the harness leaves
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmid" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    events.extend(midturn_notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a review whose notification was absorbed mid-turn is bound all the same",
+          result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmidf" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    events.extend(midturn_notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; still waiting"})
+    check("a task that failed mid-turn is no longer in flight",
+          result.get("decision") == "block" and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- the packet the launch fed in names the session among several running at once
+def capture_launch(sid, call_id, command):
+    """What the marker hook does before a Codex launch runs: keep the packet it feeds."""
+    run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_use_id": call_id, "cwd": AGENT_HOME, "tool_input": {"command": command}})
+
+
+PACKET_A = "Round 1 packet for the auth candidate: " + "the session store rotates ids on privilege change and the tests pin it. " * 4
+PACKET_B = "Round 1 packet for another chat's candidate: " + "the deploy preamble names its failure and the fixtures cover the retry. " * 4
+PACKET_ROLE_ONLY = "Round 1."
+
+for label, packet_on_disk, rewrite_after, other_packet, expect_bound in (
+    ("the session given this launch's packet is the one bound, another session alongside notwithstanding",
+     PACKET_A, None, PACKET_B, True),
+    ("a packet rewritten after the launch still binds the session the launch fed",
+     PACKET_A, PACKET_B, PACKET_B, True),
+    ("two sessions given the same packet are told apart by nothing and bind nothing",
+     PACKET_A, None, PACKET_A, False),
+    ("a packet that is all role, with nothing distinctive, binds nothing",
+     PACKET_ROLE_ONLY, None, PACKET_B, False),
+    ("a packet naming no session binds nothing",
+     "Round 1 packet rewritten before the launch: " + "nobody was given these words in this window. " * 5, None, PACKET_B, False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "bpkt" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        packet_file = os.path.join(AGENT_HOME, "packet-" + task_id + ".md")
+        with open(packet_file, "w", encoding="utf-8") as stream:
+            stream.write(reviewer_role_text() + "\n\n" + packet_on_disk)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = [skill_use(now - 890, "development-verification", "skill-dev")]
+        simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+        # The launch names the packet the way the shell does: a Git-Bash path for one case.
+        shell_path = packet_file.replace(chr(92), "/")
+        if expect_bound and re.match(r"^[A-Za-z]:/", shell_path):
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        command = 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(shell_path)
+        capture_launch(sid, "codex-" + task_id, command)
+        if rewrite_after:
+            with open(packet_file, "w", encoding="utf-8") as stream:
+                stream.write(reviewer_role_text() + "\n\n" + rewrite_after)
+        events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(now - 600, task_id, out_file, "completed"))
+        log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")), packet=PACKET_A)
+        log_codex_run(now - 640, codex_cli_output(review_text("APPROVED", subject="another chat's candidate")),
+                      packet=other_packet)
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound, result)
+        if expect_bound:
+            check("closing the candidate discards its packet captures",
+                  not glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")), sid)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bnocap" + uuid.uuid4().hex[:4]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    command = 'helper < /c/tmp/other.md && codex exec - < /c/tmp/missing-packet.md  # CODE_WORK_GATE_REVIEW'
+    events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-" + task_id, DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a launch that fed a packet but left no capture binds nothing, whatever else spoke",
+          result.get("decision") == "block", result)
+    check("the stdin redirect is read from the codex segment, not the first redirect on the line",
+          marker_hook.codex_launch(command)["path"].replace(chr(92), "/").endswith("missing-packet.md"), marker_hook.codex_launch(command))
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a background lane's verdict is what the rollout log says, not what the output file says
+for label, file_text, logged, expect_bound in (
+    ("the rollout, not the output file, states the verdict",
+     codex_cli_output(review_text("APPROVED")), [codex_cli_output(review_text("REVISE"))], False),
+    ("a missing output file costs the lane nothing",
+     None, [codex_cli_output(review_text("APPROVED"))], True),
+    ("two briefed sessions speaking in the window are ambiguous and bind nothing",
+     codex_cli_output(review_text("APPROVED")),
+     [codex_cli_output(review_text("APPROVED")),
+      codex_cli_output(review_text("APPROVED", subject="an unrelated candidate"))], False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "broll" + uuid.uuid4().hex[:5]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        if file_text is not None:
+            write_review_output(out_file, file_text, now - 601)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+        events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
+        for text in logged:
+            log_codex_run(now - 650, text)
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound and "background work" not in result.get("systemMessage", ""), result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "breq" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    write_review_output(out_file, codex_cli_output(review_text("APPROVED")), now - 601)
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-req", REQUIRED_CODEX_COMMAND, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-req", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "completed"))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; required Codex evidence bound in the background"})
+    check("a required Codex review bound in the background satisfies the requirement",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "breqf" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-req", REQUIRED_CODEX_COMMAND, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-req", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; required Codex evidence unavailable"})
+    check("a failed required background review cannot close as verified",
+          result.get("decision") == "block", result)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: required Codex evidence unavailable"})
+    check("a required background review that failed is an unavailable reviewer for draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a foreground review that mentions a background task is still a review
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    spoken = ("Command did not complete within its 120s timeout and was moved to the background "
+              "(ID: example). Output is being written to: C:/tmp/example.output. You will be "
+              "notified when it completes. To check interim output, use Read on that file path.\n"
+              + review_text("APPROVED"))
+    add_codex_review(events, now - 700, "codex-fg", CODEX_CLI_COMMAND, codex_cli_output(spoken))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the foreground"})
+    check("a foreground result that opens with the whole moved-to-background envelope is still a review",
+          result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a server started before the candidate opened is still this session's running work
+sid = session()
+try:
+    now = time.time()
+    server_id = "bsrv" + uuid.uuid4().hex[:5]
+    server_out = os.path.join(tasks_dir, server_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [
+        bash_use(now - 3000, "srv-call", "npm run dev", run_in_background=True),
+        tool_result(now - 2999, "srv-call", DETACHED_ACK.format(id=server_id, out=server_out)),
+        skill_use(now - 890, "development-verification", "skill-dev"),
+    ]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; the suite is still running"})
+    check("a background task launched before the candidate lets the turn end",
+          result.get("continue") is True and server_id in result.get("systemMessage", ""), result)
+    events.append(entry(now - 500, "assistant", [{
+        "type": "tool_use", "id": "stop-srv", "name": "TaskStop", "input": {"task_id": server_id},
+    }]))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; the suite is still running"})
+    check("stopping that task ends the allowance", result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a background verdict covers the candidate as launched, not as notified
+sid = session()
+try:
+    now = time.time()
+    task_id = "bedit" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    # The lasting edit lands after the launch and after Codex spoke, before the notification.
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 620, durable_ts=now - 620)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a durable edit after the launch expires a background verdict delivered later",
+          result.get("decision") == "block" and "background work" not in result.get("systemMessage", ""), result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- lane results that mention task notifications are still lane results
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    events.append(entry(now - 880, "assistant", [{
+        "type": "tool_use", "id": "simp-note", "name": "Agent",
+        "input": {"subagent_type": "simplify-reviewer", "run_in_background": False,
+                  "description": "simplify"},
+    }]))
+    events.append(tool_result(now - 870, "simp-note",
+                              "Checked the task-notification parsing and the <task-notification> handling: no findings."))
+    events.append(entry(now - 700, "assistant", [{
+        "type": "tool_use", "id": "rev-note", "name": "Agent",
+        "input": {"subagent_type": "adversarial-reviewer", "run_in_background": False,
+                  "description": "review"},
+    }]))
+    events.append(tool_result(now - 690, "rev-note",
+                              "The task-notification branch is sound.\n" + review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; native review of the notification parser"})
+    check("lane results mentioning task notifications are read as lane results",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- one notification record may carry several tasks, each with its own status
+sid = session()
+try:
+    now = time.time()
+    task_id = "bmix" + uuid.uuid4().hex[:5]
+    other_id = "bmixo" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file, DETACHED_ACK.format(id=task_id, out=out_file), notify=False)
+    mixed = (
+        "<task-notification>\n<task-id>{}</task-id>\n<status>completed</status>\n</task-notification>\n"
+        "<task-notification>\n<task-id>{}</task-id>\n<status>failed</status>\n</task-notification>"
+    ).format(other_id, task_id)
+    events.append(entry(now - 600, "user", [{"type": "text", "text": mixed}]))
+    log_codex_run(now - 650, codex_cli_output(review_text("APPROVED")))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] verified: HIGH; Codex reviewed in the background"})
+    check("a failed task in a batched notification is not judged by its neighbour's status",
+          result.get("decision") == "block", result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a background lane that hit the usage limit trips the breaker at its notification
+sid = session()
+try:
+    import codex_lane
+    codex_lane.clear_state()
+    now = time.time()
+    task_id = "blim" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    err_path = os.path.join(AGENT_HOME, "codex-bg-limit.err")
+    with open(err_path, "w", encoding="utf-8") as stream:
+        stream.write("ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 4:24 PM.\n")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-lim", CODEX_BG_COMMAND + " 2>" + err_path.replace("\\", "/"),
+                           run_in_background=True))
+    events.append(tool_result(now - 699, "codex-lim", DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "failed"))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "[gate] draft-blocked: the Codex lane hit its usage limit"})
+    check("a failed background lane still closes draft-blocked",
+          result.get("continue") is True and "decision" not in result, result)
+    available, message = codex_lane.status()
+    check("the breaker learns a background lane's outage from its stderr capture",
+          available is False and "usage limit" in message, message)
+    codex_lane.clear_state()
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- an anomaly report closes a blocked candidate UNVERIFIED, and nothing less than a report does
+def inbox(*args, stdin=None, env=None):
+    proc = subprocess.run([sys.executable, GATE_INBOX] + list(args), input=stdin, text=True,
+                          encoding="utf-8", capture_output=True, check=False, env=env)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def file_report(sid, block_reason, facts="the transcript shows the evidence", nonce=""):
+    code, out, err = inbox("report", "--session", sid, "--block", block_reason, "--facts", facts,
+                           *(["--nonce", nonce] if nonce else []))
+    check("gate_inbox report exits zero", code == 0, err)
+    match = re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out)
+    check("gate_inbox report prints an id", bool(match), out)
+    return match.group(1)
+
+
+def block_reason_of(result):
+    match = re.search(r"Cannot finalize this candidate: (.*?)\.\n", result.get("reason") or "", re.S)
+    return match.group(1) if match else ""
+
+
+def nonce_of(result):
+    match = re.search(r"--nonce ([0-9a-f]{12})", result.get("reason") or "")
+    return match.group(1) if match else ""
+
+
+def gate_inbox_path():
+    return os.path.join(CLAUDE_CONFIG_DIR, "state", "gate-anomalies.jsonl")
+
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    payload = {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: 0badc0de; the hook is wrong"}
+    result = run(STOP_HOOK, payload)
+    check("an anomaly receipt before any block is refused",
+          result.get("decision") == "block" and "only available after the gate has blocked" in result["reason"], result)
+    check("the block reminder offers the report command with the session id and a nonce",
+          "gate_inbox.py" in result["reason"] and sid in result["reason"] and nonce_of(result), result)
+    without_nonce = file_report(sid, block_reason_of(result), "the facts")
+    refused = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(without_nonce)})
+    check("a report without the block's nonce is refused",
+          refused.get("decision") == "block" and "nonce" in refused["reason"], refused)
+    check("every block mints a fresh nonce", nonce_of(refused) and nonce_of(refused) != nonce_of(result), refused["reason"][-300:])
+    wrong = file_report(sid, "some other reason entirely", nonce=nonce_of(refused))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(wrong)})
+    check("a report that does not quote the block's reason is refused",
+          result.get("decision") == "block" and "does not quote" in result["reason"], result)
+    report_id = file_report(sid, block_reason_of(result), "APPROVED at 12:00 from a foreground lane after the last edit at 11:58", nonce=nonce_of(result))
+    closed = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; hook contradicts the transcript".format(report_id)})
+    check("a report filed after the block, carrying its nonce and quoting its reason, closes the candidate as anomaly-reported",
+          closed.get("continue") is True and "anomaly-reported" in closed.get("systemMessage", "") and "UNVERIFIED" in closed.get("systemMessage", ""), closed)
+    check("the anomaly closure retires the candidate", not os.path.exists(gate_paths(sid)[0]) or (cwg.read_json(gate_paths(sid)[0]) or {}).get("closed"), gate_paths(sid)[0])
+    ledger_lines = open(cwg.event_log_path(), encoding="utf-8").read().splitlines()
+    check("the ledger records the anomaly closure with its report id",
+          any('"receipt": "anomaly-reported"' in line and report_id in line and sid in line for line in ledger_lines), report_id)
+    code, out, _ = inbox("show", report_id)
+    shown = json.loads(out)
+    check("the report carries the marker, the state, the nonce and the hook's own view",
+          shown.get("session") == cwg.session_key(sid) and shown["state"].get("blocks") == 3
+          and shown["marker"].get("paths") == 1 and "hook_view" in shown
+          and shown.get("block_nonce") == nonce_of(result), shown.get("state"))
+    code, out, _ = inbox("list")
+    check("the report is listed until acknowledged", report_id in out and wrong in out and without_nonce in out, out)
+    for pending_id in (report_id, wrong, without_nonce):
+        inbox("ack", pending_id, "--note", "test")
+    code, out, _ = inbox("list")
+    check("an acknowledged report leaves the list", code == 0 and report_id not in out and wrong not in out, out)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    first = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    second = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    check("a repeated block says so",
+          second.get("decision") == "block" and "Same reason as the previous block" in second["reason"]
+          and "Same reason" not in first["reason"], second)
+    third = run(STOP_HOOK, {"session_id": sid, "transcript_path": "C:/x/session.jsonl", "last_assistant_message": "done"})
+    check("the block reminder names the transcript when the hook was given one",
+          '--transcript "C:/x/session.jsonl"' in third["reason"], third["reason"][-400:])
+    report_id = file_report(sid, block_reason_of(third), "the transcript holds the evidence the hook denies", nonce=nonce_of(third))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the transcript holds the evidence".format(report_id)})
+    check("a substantive block can be answered with a report",
+          result.get("continue") is True and "UNVERIFIED" in result.get("systemMessage", ""), result)
+    inbox("ack", report_id)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    early = file_report(sid, "HIGH candidate lacks a current APPROVED verdict")
+    blocked = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: 0badc0de; the hook is wrong"})
+    check("an anomaly receipt naming no report is refused",
+          result.get("decision") == "block" and "names no report" in result["reason"], result)
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(early)})
+    check("a report filed before the block cannot close the candidate",
+          result.get("decision") == "block" and "nonce" in result["reason"], result)
+    inbox("ack", early)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    blocked = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    # A record written by hand: the minted nonce cannot be guessed, so the forger's best try is
+    # the right reason and a timestamp that compares as fresh — NaN never compares as older.
+    forged = uuid.uuid4().hex[:8]
+    with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"id": forged, "session": cwg.session_key(sid), "ts": float("nan"),
+                                 "block_reason": block_reason_of(blocked), "block_nonce": "0" * 12}) + chr(10))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(forged)})
+    check("a hand-written record without the minted nonce is refused",
+          result.get("decision") == "block" and "nonce" in result["reason"], result)
+    forged_timed = uuid.uuid4().hex[:8]
+    with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"id": forged_timed, "session": cwg.session_key(sid), "ts": float("nan"),
+                                 "block_reason": block_reason_of(result), "block_nonce": nonce_of(result)}) + chr(10))
+    result = run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "[gate] anomaly-reported: {}; the hook is wrong".format(forged_timed)})
+    check("a record with the nonce but no real timestamp is refused",
+          result.get("decision") == "block" and "no real timestamp" in result["reason"], result)
+    inbox("ack", forged)
+    inbox("ack", forged_timed)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- filing a report inspects the transcript without writing the hook's ledger lines, nor the breaker
+sid = session()
+try:
+    now = time.time()
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    add_review(events, now - 700, "rev-quiet", review_text("APPROVED"))
+    transcript = write_transcript(events)
+    run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript, "last_assistant_message": "done"})
+    before = open(cwg.event_log_path(), encoding="utf-8").read().count(chr(10))
+    code, out, err = inbox("report", "--session", sid, "--transcript", transcript, "--block", "x", "--facts", "y")
+    after = open(cwg.event_log_path(), encoding="utf-8").read().count(chr(10))
+    check("filing a report writes no ledger lines", code == 0 and after == before, (before, after, err))
+    import codex_lane
+    codex_lane.clear_state()
+    limited = "blim" + uuid.uuid4().hex[:5]
+    err_path = os.path.join(AGENT_HOME, "codex-report-limit.err")
+    with open(err_path, "w", encoding="utf-8") as stream:
+        stream.write("ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 4:24 PM." + chr(10))
+    events.append(bash_use(now - 500, "codex-rl", CODEX_BG_COMMAND + " 2>" + err_path.replace(chr(92), "/"), run_in_background=True))
+    events.append(tool_result(now - 499, "codex-rl", DETACHED_ACK.format(id=limited, out=os.path.join(tasks_dir, limited + ".output"))))
+    events.append(notification(now - 400, limited, os.path.join(tasks_dir, limited + ".output"), "failed"))
+    transcript = write_transcript(events)
+    code, out, err = inbox("report", "--session", sid, "--transcript", transcript, "--block", "x", "--facts", "y")
+    check("filing a report does not touch the Codex breaker", code == 0 and codex_lane.status()[0] is True, codex_lane.status())
+    inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+    shown = json.loads(inbox("show", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))[1])
+    check("the report still carries the hook's view of the transcript",
+          shown["hook_view"].get("available") is True and shown["hook_view"].get("review_events"), shown["hook_view"])
+    inbox("ack", shown["id"])
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+# --- a report is delivered to the registered gate-ops session, or stays in the inbox
+registry = os.path.join(CLAUDE_CONFIG_DIR, "state", "gate-ops-session.json")
+if os.path.exists(registry):
+    os.remove(registry)
+sid = session()
+code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
+check("without a gate-ops session the report stays in the inbox",
+      code == 0 and "No gate-ops session is registered" in out and "[gate anomaly] report" in out, out)
+inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+code, out, err = inbox("register", "--session", "ops-session-1", "--name", "in-50 [915105]", "--title", "Gate ops")
+check("a session registers as the gate-ops session", code == 0 and "ops-session-1" in out and os.path.exists(registry), err)
+code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y", "--did", "continued")
+check("a report names the registered session and the messaging tool",
+      code == 0 and 'session_id "ops-session-1"' in out and "mcp__ccd_session_mgmt__send_message" in out
+      and 'SendMessage to "in-50 [915105]"' in out and "did: continued" in out and "show:" in out, out)
+inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+for corrupt in ("[1, 2]", '{"session_id": "   "}', '{"session_id": 5}', "not json"):
+    with open(registry, "w", encoding="utf-8") as stream:
+        stream.write(corrupt)
+    code, out, err = inbox("report", "--session", sid, "--block", "x", "--facts", "y")
+    check("a registry naming no session ({!r}) means no gate-ops session, not a crash".format(corrupt[:12]),
+          code == 0 and "No gate-ops session is registered" in out, err or out)
+    inbox("ack", re.search(r"GATE_ANOMALY: ([0-9a-f]{8})", out).group(1))
+os.remove(registry)
+with tempfile.TemporaryDirectory(prefix="cwg_fresh_home_") as fresh_home:
+    fresh_env = dict(os.environ, CLAUDE_CONFIG_DIR=fresh_home)
+    code, out, err = inbox("register", "--session", "ops-fresh", env=fresh_env)
+    check("register works first thing on a fresh configuration home",
+          code == 0 and os.path.exists(os.path.join(fresh_home, "state", "gate-ops-session.json")), err)
+    code, out, err = inbox("register", env=fresh_env)
+    check("register without the session id says what to pass", code == 2 and "get_session self" in err, err)
+cleanup(sid)
+
+# --- the inbox digest reaches only a session started in the config home; the scan derives ledger anomalies
+pending = file_report(session(), "HIGH candidate lacks a current APPROVED verdict")
+code, out, _ = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR, "hook_event_name": "SessionStart"}))
+check("the digest names unresolved reports for a gate-ops session",
+      code == 0 and pending in out and "additionalContext" in out, out)
+code, out, _ = inbox("digest", stdin=json.dumps({"cwd": AGENT_HOME, "hook_event_name": "SessionStart"}))
+check("the digest stays silent elsewhere", code == 0 and out.strip() == "", out)
+with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+    stream.write('{"id": ["x"]}' + chr(10) + "not json" + chr(10) + '{"ack": 5}' + chr(10)
+                 + json.dumps({"id": "deadbeef", "session": "s", "ts": "soon", "kind": 7, "block_reason": None}) + chr(10))
+    stream.write(json.dumps({"id": "cafe0001", "session": "s", "ts": 1e300, "kind": "agent", "block_reason": "huge clock"}) + chr(10))
+code, out, err = inbox("digest", stdin="[]")
+check("the digest survives a list payload and malformed inbox lines", code == 0 and out.strip() == "", err)
+code, out, err = inbox("digest", stdin=json.dumps({"cwd": CLAUDE_CONFIG_DIR}))
+check("malformed inbox lines are skipped, real ones still shown", code == 0 and pending in out and "deadbeef" in out, err or out)
+check("a timestamp beyond the platform clock is rendered blank, not raised", "cafe0001 ??-?? ??:??" in out, out)
+inbox("ack", "cafe0001")
+code, out, err = inbox("list")
+check("the list survives malformed lines", code == 0 and pending in out, err)
+inbox("ack", "deadbeef")
+inbox("ack", pending)
+with open(cwg.event_log_path(), "a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"ts": time.time(), "kind": "exhausted", "session": "scan-test", "reason": "x"}) + "\n")
+    # Written in the order the hooks write them: the edit first, the verdict it expired only at
+    # the next Stop — the scan must judge by when things happened.
+    stream.write(json.dumps({"ts": time.time() - 20, "kind": "durable", "session": "scan-test-2", "reason": "edit", "command": "git"}) + "\n")
+    stream.write(json.dumps({"ts": time.time() - 5, "kind": "review", "session": "scan-test-2", "at": time.time() - 30, "engine": "codex", "verdict": "APPROVED"}) + "\n")
+    for offset in (10, 5):
+        stream.write(json.dumps({"ts": time.time() - offset, "kind": "review", "session": "scan-test-3", "engine": "codex-background", "verdict": None, "task": "btask-same"}) + "\n")
+    edited_at = time.time() - 40
+    stream.write(json.dumps({"ts": edited_at, "kind": "durable", "session": "scan-test-4", "reason": "edit"}) + chr(10))
+    stream.write(json.dumps({"ts": time.time() - 3, "kind": "review", "session": "scan-test-4", "at": edited_at - 10, "engine": "native", "verdict": "APPROVED"}) + chr(10))
+with open(gate_inbox_path(), "a", encoding="utf-8") as stream:
+    # An incident a previous version recorded under the rule's old name.
+    stream.write(json.dumps({"id": "0ldru1e0", "session": "scan-test-4", "ts": time.time(), "auto": True,
+                             "kind": "auto:verdict-expired-after-review", "rule": "verdict-expired-after-review",
+                             "event_at": edited_at}) + chr(10))
+code, out, _ = inbox("scan")
+check("the scan derives anomalies from the ledger", code == 0 and re.search(r"GATE_SCAN: [1-9]", out), out)
+code, listed, _ = inbox("list")
+check("the scan reports exhaustion and an approval expired right after it was stated",
+      "auto:exhausted" in listed and "auto:verdict-expired-after-approval" in listed, listed)
+expired_records = [json.loads(line) for line in open(gate_inbox_path(), encoding="utf-8") if '"scan-test-4"' in line]
+check("an incident recorded under a rule's old name is not derived again under the new one",
+      len([r for r in expired_records if "verdict-expired" in str(r.get("rule"))]) == 1, expired_records)
+check("one unbound review task re-read by several Stop runs is one anomaly",
+      sum(1 for line in listed.splitlines() if "scan-tes" in line and "unbound-background-review" in line) == 1, listed)
+code, out, _ = inbox("scan")
+check("a second scan adds nothing", "GATE_SCAN: 0 new" in out, out)
+
+# --- the ledger records the decision
+sid = session()
+try:
+    seed(sid, ["C:/repo/src/app.py"])
+    run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+    ledger = cwg.event_log_path()
+    lines = open(ledger, encoding="utf-8").read().splitlines() if os.path.exists(ledger) else []
+    check("a block is written to the gate event ledger",
+          any('"kind": "block"' in line and sid in line for line in lines), ledger)
+finally:
+    cleanup(sid)
+
+# --- write-capable commands are the only ones that expire a verdict through an unresolved mutation
+for command, expected in (
+    ('cd "C:/repo" && git status --porcelain | wc -l && git rev-parse --short HEAD', False),
+    ("ls ~/.codex/sessions | tail -3", False),
+    ("npm test -- --runInBand", False),
+    ("python -c rewrite_source", True),
+    ("python - <<'PY'\nimport io\nPY", True),
+    ("ls > out.txt", True),
+    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err", True),
+    ("git merge --no-ff chip/x", True),
+    ("git commit -m x && git push", True),
+    ("sed -i 's/a/b/' file.py", True),
+    ("rg pattern | tee reviewed.py", True),
+    ("truncate -s 0 reviewed.py", True),
+    ("echo hi 1> reviewed.py", True),
+    ("grep -rn foo . 2>/dev/null | head -5", False),
+    ("cat a.txt 2>&1 | head", False),
+    ("git branch --show-current && git remote -v && git stash list", False),
+    ("git branch new-branch", True),
+    ("git stash", True),
+    ("for f in *.py; do cat $f; done", True),
+    ("curl -sL https://example.org | head", True),
+    ("ls $(pwd)", True),
+    ('PYTHONIOENCODING=utf-8 timeout 30 "C:/tools/python.exe" -c pass', True),
+    ("find . -name '*.py' -delete", True),
+    ("find . -name '*.py' | head", False),
+    ("find . -name '*.py' -exec rm {} \\;", True),
+    ("sort -o reviewed.py reviewed.py", True),
+    ("sort --output=reviewed.py reviewed.py", True),
+    ("uniq input reviewed.py", True),
+    ("uniq -c input", False),
+    ("tree -o out.txt", True),
+    ("git diff --output=reviewed.py", True),
+    ("git -C C:/repo log --oneline -3", False),
+    ("git --no-pager diff HEAD~1 --stat", False),
+    ("git reflog expire --all", True),
+    ("git reflog", False),
+    ("rg --pre cat foo", True),
+    ("date -s '2020-01-01'", True),
+    ("hostname newname", True),
+    ("cat <(rm -f hooks/x.py)", True),
+    ("diff <(git show HEAD:a) <(cat a)", True),
+    ("sort -uo reviewed.py reviewed.py", True),
+    ("sort -oreviewed.py input", True),
+    ("sort --ignore-case input | head", False),
+    ("GIT_EXTERNAL_DIFF=./evil.sh git diff", True),
+    ("git -c diff.external=./evil.sh diff", True),
+    ("git -c core.fsmonitor=./evil.sh status", True),
+    ("RIPGREP_CONFIG_PATH=./evil rg foo", True),
+    ("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/x.md", True),
+    ("gh pr edit 2 --body-file /c/tmp/x.md && gh pr view 2 --json url", False),
+    ("gh -R o/r pr view 2 && gh --repo=o/r api repos/o/r", False),
+    ("gh pr checkout 7", True),
+    ("gh --repo o/r pr checkout 7", True),
+    ("gh co 7", True),
+    ("gh repo clone o/r", True),
+    ("gh extension install o/x", True),
+    ("", False),
+):
+    check("write-capable: {!r} -> {}".format(command[:50], expected),
+          marker_hook.write_capable({"tool_name": "Bash", "tool_input": {"command": command}}) is expected,
+          command)
+
+for command, expected in (
+    ("Get-Content x.py | Select-String foo", False),
+    ("Get-ChildItem -Recurse | Where-Object { $_.Length -gt 5MB }", True),
+    ("Set-Content x.py 'y'", True),
+    ("git status --porcelain | Measure-Object -Line", False),
+    ("Write-Output ([IO.File]::WriteAllText('C:/x/auth.py','evil'))", True),
+    ("Get-Content x.py | Select-Object -First 3", False),
+):
+    check("write-capable (PowerShell): {!r} -> {}".format(command[:50], expected),
+          marker_hook.write_capable({"tool_name": "PowerShell", "tool_input": {"command": command}}) is expected,
+          command)
+check("the ledger keeps only the executable of a command",
+      marker_hook.command_label('cd "C:/repo" && python deploy.py --token=SECRET') == "cd"
+      and marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h") == "curl",
+      marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h"))
+check("a PowerShell assignment never reaches the ledger",
+      marker_hook.command_label("$token='SECRET'; Get-Content x") == "(unrecognized)"
+      and marker_hook.command_label("$env:API_KEY='SECRET'; git status") == "(unrecognized)"
+      and marker_hook.command_label('"C:/tools/python.exe" script.py') == "python",
+      marker_hook.command_label("$token='SECRET'; Get-Content x"))
+
+with tempfile.TemporaryDirectory(prefix="cwg_quiet_") as outside:
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        run(MARK_HOOK, {
+            "session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write",
+            "cwd": outside, "tool_input": {"file_path": os.path.join(outside, "src", "app.py")},
+        })
+        approved_at = (cwg.read_json(marker) or {}).get("last_durable_ts")
+        payload = {
+            "session_id": sid, "tool_name": "Bash", "tool_use_id": "quiet-shell",
+            "cwd": outside,
+            "tool_input": {"command": 'cd "%s" && git status --porcelain | wc -l && git rev-parse --short HEAD' % outside},
+        }
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+        data = cwg.read_json(marker) or {}
+        check("an unresolved read-only pipeline does not expire the verdict",
+              cwg.valid_ts(approved_at) and data.get("last_durable_ts") == approved_at, data)
+        check("the quiet command still keeps the candidate open",
+              cwg.SHELL_MUTATION_PATH in (data.get("paths") or []), data)
+    finally:
+        cleanup(sid)
 
 # --- candidate_shape reads a marker exactly as the Stop hook's own classification does
 for label, marker_entry in (

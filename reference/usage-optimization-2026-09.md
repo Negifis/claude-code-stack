@@ -91,6 +91,7 @@ reviewer lanes themselves are 6.3% of context tokens.
 | `skills/subagent-delegation` | trio exception; model guidance generic | routing by lane; `general-purpose` gets `model: "sonnet"` unless judgment is needed |
 | `commands/adversarial-review.md` | Codex first, resume on failure, effort xhigh | breaker check first; no resume on quota/capacity; effort high |
 | `CLAUDE.md` | 11.1 KB | 7.0 KB (hook contract and trio exception moved to the skill; NotebookLM block condensed) |
+| `settings.json` env | `ANTHROPIC_DEFAULT_FABLE_MODEL: claude-fable-5` | `claude-fable-5-1` (the Opus 5 and Sonnet 5 pins were already current); the project's `CLAUDE_CODE_SUBAGENT_MODEL` raised from `claude-sonnet-4-6` to `claude-sonnet-5` |
 | `continuity_session_start.py` | full checkpoint body injected on every fresh start | GOAL/STATUS/NEXT ACTION only on `startup`/`fork`; full body on `resume`/`compact` |
 | `reference/model-routing.md`, `reference/environment.md` | — | updated to the new lanes and files |
 
@@ -99,11 +100,12 @@ freshness rule (an approval must be newer than the last edit to a lasting artifa
 rebase or merge still costs a delta round); Codex as the default engine; the marketing and
 geo agent profiles (unused in the period, no evidence either way); the NotebookLM hooks (their
 latency is 1–1.5 s per event, their context 4 KB per session); the project's own `.claude`
-directory (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` in its `settings.local.json` is stale
-and, on a runtime before 2.1.251, would override the reviewer's model — flagged, not touched);
+directory, except that the stale `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` in its
+`settings.local.json` was raised to `claude-sonnet-5` on request (on a runtime before 2.1.251
+that variable still overrides the reviewer's model, so it stays a caveat);
 `GITLAB_TOKEN` in `settings.json` env (a secret in a file that has a public example — flagged).
-`CLAUDE_CODE_SUBAGENT_MODEL` was not set globally for the same version reason: the winget CLI
-on this machine is 2.1.236.
+`CLAUDE_CODE_SUBAGENT_MODEL` was not set globally for the same version reason: the
+`minimumVersion` floor (2.1.246) is below 2.1.251, where the override semantics changed.
 
 ## 4. Expected effect per representative workload
 
@@ -186,3 +188,62 @@ removed `agents/simplify-*-reviewer.md` and the two `cbm-*` hooks), delete
 `agents/simplify-reviewer.md`, `agents/Explore.md`, `hooks/codex_lane.py`,
 `hooks/code_work_gate_prompt.py`, and remove the three added keys and the prompt hook from
 `settings.json`.
+
+## 9. Addendum 2026-09-03: background lanes and false expiry
+
+Trigger: session `08244b4e` (worktree `charon-ownership-auth-model-c625ae`) kept spending
+requests after a Codex APPROVED. Replaying its transcript against the hooks found three
+independent defects, all fixed in this addendum's change set.
+
+| Finding | Evidence | Fix |
+|---|---|---|
+| Codex reviews launched with `run_in_background: true`, or moved to the background by the Bash timeout, left only a launch acknowledgement in the transcript; the gate never saw a verdict. | 34 background launches with 0 verdicts across the history, ~13 auto-backgrounded, 14 ack-sized results of 222 marked calls; in `08244b4e` every Codex round but one. | The Stop hook binds a backgrounded marked call at its `<task-notification>` to the verdict one briefed Codex session stated in the rollout log between launch and notification; the output file is not evidence, and two sessions speaking in the window bind nothing. `/adversarial-review` now launches in the background by design. |
+| The model polled the running lane instead of ending the turn: `tail`/`sleep`/`Monitor`/`TaskOutput` calls, each a full-context request. | 364 polling calls in `08244b4e`. | The Stop hook lets a turn end while this session's own background task is in flight (own launches only, `MAX_BACKGROUND_WAITS = 8` per candidate, `BACKGROUND_WAIT_LIMIT = 2 h` per task, `TaskStop`/`failed` counted as failed activity). Skills and the command say: end the turn, never poll. |
+| The one foreground APPROVED was expired 7 s later by `git status --porcelain \| wc -l && git rev-parse --short HEAD` (an unresolved shell mutation on a durable candidate), which produced block #3 and a needless native round. | Marker `last_durable_ts` 14:03:41 vs verdict 14:03:34; the replay does not reproduce the snapshot failure, so the unresolved branch was taken. | Expiry through an unresolved snapshot now requires a write-capable command, meaning anything not proven read-only: an allowlist per pipeline segment (`ls`, `cat`, `grep`, `wc`, git's reading subcommands…), with any redirect other than a discarded or merged stderr, a substitution, a heredoc or a script block counting as writing. Read-only pipelines keep the candidate open but never expire a verdict. |
+
+Also added: `state/gate-events.jsonl`, an append-only ledger of gate decisions, so the next
+question of this kind is answered from one file instead of a transcript replay.
+`test_gate.py` grew from 813 to 946 assertions (both acknowledgement shapes bound, pending wait
+allowed and capped, stale task blocks, stopped or failed lane → draft-blocked, a required lane
+bound in the background, the verdict read from the rollout rather than the output file, a
+foreground review that mentions a background task is still a review, a task launched before the
+candidate is tracked, ledger line, write-capable tables for Bash and PowerShell, quiet pipeline
+keeps the verdict).
+
+Residual for that session: its gate state already holds three blocks for the unchanged
+candidate, so its next Stop ends `UNVERIFIED` unless the candidate changes; the fix applies to
+new turns and new sessions.
+
+## 10. Addendum 2026-09-03: gate anomaly inbox
+
+Agents in any session can now disagree with a block on the record instead of re-running lanes
+or polling: `hooks/gate_inbox.py report` files the block reason, the verifiable facts, what was
+done instead, the marker and state, the session's ledger tail and the Stop hook's own view of
+the transcript into `state/gate-anomalies.jsonl`; the receipt `[gate] anomaly-reported: <id>;
+<fact>` closes the candidate UNVERIFIED, and only after a block, for a report carrying the nonce
+that block minted and quoting its reason (development-verification section 10). `gate_inbox.py scan` derives
+anomalies from the ledger by fixed rules (exhaustion, waits exhausted, unbound background
+review, an approval expired by a durable edit within a minute of being stated, a hook failure — the Stop hook now logs
+`hook_error` instead of failing open silently); `digest` runs as a SessionStart hook and shows
+the unresolved reports to a session started from `~/.claude`. `test_gate.py`: 946 → 1161.
+
+Three more findings from this session's own ledger, fixed in the same change set: a task
+notification absorbed while the turn was running never becomes a user record (only the
+`queue-operation` and `attachment` records the harness leaves), so the Stop hook now reads
+those too; two Codex reviews running at once from different chats made the rollout binding
+ambiguous, so a background launch that fed a packet on stdin is now bound to the session that
+was given that packet; and `gh pr edit` run outside a repository expired a verdict, so `gh` is
+read-only unless it touches the tree (`pr checkout`, `pr merge`, `repo clone`…).
+
+First report delivered by push (session issue-255, 2026-09-03 17:40): an approval expired by an
+edit that was reverted byte for byte. Fixed: the marker fingerprints its lasting paths at every
+durable change and the Stop hook judges freshness by content — a verdict covers the candidate
+when the bytes it reviewed are the bytes on disk, whatever edits happened in between.
+
+Third pushed report (session Charon, 2026-09-04 14:15): a `glab api` loop run in a worktree got a
+HIGH floor from an unattributed change under `~/.claude` that the gate-ops session was making at
+that moment. Fixed: an unattributed change under a root the command neither ran in nor names
+raises no floor. The gate-ops session's own closing then hit a fourth pattern: a cycle restarted
+after the 8-hour idle limit discarded the candidate's earlier review rounds, so the ESCALATE
+sequence check failed. Fixed: the idle limit no longer ends a cycle the same branch resumes on a
+file it already holds.

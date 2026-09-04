@@ -4,7 +4,7 @@
     "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "0",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"
   },
@@ -44,6 +44,16 @@
             "command": "__PYTHON__ __CLAUDE_DIR__/hooks/session_guard.py",
             "timeout": 10,
             "statusMessage": "Checking working tree for other sessions..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/gate_inbox.py digest",
+            "timeout": 5,
+            "statusMessage": "Gate inbox: checking anomaly reports..."
           }
         ]
       }

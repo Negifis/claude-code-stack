@@ -48,6 +48,12 @@ No simplify pass and no code review on a throwaway script that already executed.
 `[gate] no-change: <reason>`. Both require this skill to have been invoked; invoking it before
 execution, where it belongs, satisfies that.
 
+A lasting change that was undone — a rebase probe aborted, an edit reverted — leaves the
+repository on the commit the candidate opened on, with every ref where it was and the whole
+tree clean; the gate reads that from git and accepts `operational` or `no-change` for it, so do
+not manufacture a review for nothing. A commit on another branch, a stash, a push, a gitignored
+lasting file or a tree that was already dirty when the candidate opened keep it open.
+
 ## 3. Classify risk
 
 - **LOW** — docs, comments, formatting, tests-only changes, generated output with no semantic
@@ -91,6 +97,12 @@ so the receipt shape is never a surprise.
   failures. State the exact limitation; do not expand the task to repair the baseline.
 - Keep tool output out of context: tail or grep a log, run a suite with a failures-only
   reporter, read a fragment rather than a file, and never paste a diff twice.
+- Work that outlasts a foreground call — a Codex review, a broad suite, a server — is
+  launched into the background and the turn ends; its completion notification resumes the
+  work. Never poll a background task (`sleep`/`tail` loops, `Monitor`, `TaskOutput`): the
+  Stop hook lets a turn end while this session's own task is in flight, bounded to eight
+  such stops per candidate and two hours per task, and a task that was stopped or reported
+  `failed` is recorded as failed lane activity.
 
 ## 5. Bounded simplify
 
@@ -105,15 +117,18 @@ control-flow, type/error, resource, or efficiency concern).
 - Maximum two runs of the lane per candidate: the second only as a delta confirmation after
   accepted edits on broad or high-risk work. A lane result that already exists for this
   candidate is the completed pass; never re-run it for bookkeeping, and never after review
-  approval.
+  approval. A candidate ends with its receipt: edits made after a closed cycle — remediation
+  after a rebase, a follow-up on the same branch — are a new candidate, and a lane result from
+  the closed one does not carry over; run the lane once on the new delta.
 
 ## 6. Finite independent review
 
 For HIGH risk on a lasting artifact, or when the user explicitly requests it, run exactly one
 review lane per round, chosen in this order:
 
-1. **Codex** through `/adversarial-review`, in the foreground, the packet opening on the
-   contents of `agents/adversarial-reviewer.md`, the review returned verbatim. Cross-engine
+1. **Codex** through `/adversarial-review`, launched into the background
+   (`run_in_background: true`) and judged at its completion notification from the rollout log
+   Codex wrote in between, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
    judgment is worth more than a second opinion from the model that wrote the code. Run
    `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
    at capacity) means the lane is skipped for this round, not retried.
@@ -122,14 +137,20 @@ review lane per round, chosen in this order:
    fails before a verdict on its one allowed resume, or the user declines it. Say which engine
    reviewed and why when it was not Codex.
 
-Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict-bearing
-call must return as an observable foreground result. One ledger and one round budget span the
-lanes: switching engines continues the review, never restarts it. Add at most one specialist
+Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict must be
+observable — the native lane as a foreground result, the Codex lane as the rollout log bound at
+its notification — never as a summary you wrote. One ledger and one round
+budget span the lanes: switching engines continues the review, never restarts it. Add at most one specialist
 only for a named non-overlapping risk; the lane that owns the verdict keeps it.
 
 Obtain the verdict as the last step. Editing a lasting artifact after an approval invalidates
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
-scope); reruns of a throwaway script or a maintenance command do not.
+scope); reruns of a throwaway script or a maintenance command do not, and neither does an edit
+reverted byte for byte, nor does staging or committing the approved bytes — the gate measures
+content, not edit events (a file still in conflict when reviewed is the exception: `git add` is
+its resolution step, so resolve and stage before the review). A clean merge or rebase
+of an approved candidate needs nothing; one resolved by hand is a delta candidate whose
+resolution diff gets the delta lane and a delta round.
 
 ```
 MAX_REVIEW_ROUNDS = 3
@@ -220,6 +241,7 @@ End implementation work with exactly one factual receipt as the final non-empty 
 [gate] no-change: <why nothing was modified>
 [gate] pr-ready: <PR URL, or branch plus exact publication handoff>
 [gate] draft-blocked: <draft PR URL, or exact external publication blocker>
+[gate] anomaly-reported: <report id>; <the verifiable contradiction>
 ```
 
 The receipt is one line of evidence — the candidate and the check, verdict or blocker that
@@ -228,10 +250,45 @@ passed as expected need no prose elsewhere; a failure of any kind is stated unde
 regardless. `verified` states the risk of a lasting artifact; `operational` carries both
 halves; `no-change` closes an inspection-only step with its reason as a clause; edits made and
 then reverted close as `verified` at the path floor, stating the worktree was restored.
-`pr-ready` and `draft-blocked` follow the autonomous closure only. Never emit
-`[gate] escalated`. A closing message without a receipt is blocked by the Stop hook at most
+`pr-ready` and `draft-blocked` follow the autonomous closure only; `anomaly-reported` closes
+UNVERIFIED with a report (section 10). Never emit `[gate] escalated`. A closing message without a receipt is blocked by the Stop hook at most
 three times per unchanged candidate; the receipt records evidence and never substitutes for
 running the work.
+
+## 10. When the hook is wrong
+
+The Stop hook is right by default: a missing or misplaced receipt, a `REVISE`, an edit after the
+approval, a lane launched in the wrong mode are your mistakes, not the hook's. An anomaly is a
+block that contradicts facts you can verify in the transcript: the required evidence exists in
+the required shape (a foreground APPROVED after the last lasting edit, the simplify lane's
+result), the hook demands a lane this skill forbids repeating, the same block returns after its
+demand was met exactly, the marker names files you never touched, the hook failed or timed out,
+or its advice contradicts the breaker or this skill. Not an anomaly: a lane result that
+belongs to a candidate already closed by a receipt — the block names the candidate that
+opened afterwards, and that one needs its own delta pass.
+
+Order: check the three facts once — the receipt is the last line and well-formed, the last
+lasting edit precedes the verdict, the lanes ran in the foreground — and fix what is yours. If
+the block still stands, do not re-run lanes, do not poll, do not argue with the hook: file the
+report and finish honestly.
+
+```
+python "~/.claude/hooks/gate_inbox.py" report --session <session id> --nonce <nonce> \
+  --block "<the block reason, verbatim>" \
+  --facts "<what the transcript shows, with timestamps or tool ids>" --did "<what you did instead>"
+```
+
+Copy the command from the block text: it carries the session id, the transcript path and the
+nonce the hook minted for that block, and the receipt is accepted only for a report carrying
+that nonce. It prints an id and the message for the gate-ops session: deliver that message at
+once with `mcp__ccd_session_mgmt__send_message` to the session id it names (or `SendMessage`
+to the name it gives when that tool is absent), then go on with your work — the report is
+handled there, not by you, and no reply is needed. End with
+`[gate] anomaly-reported: <id>; <the contradiction in one line>`. The hook accepts that
+receipt only after it has blocked this candidate, for a report filed after that block and
+quoting its reason, and closes the candidate UNVERIFIED with the report attached — once per
+candidate, never as `verified`. Overuse shows up in the gate-ops session as a pattern and is
+treated as one.
 
 ## Incident hotfix order
 
