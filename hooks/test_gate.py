@@ -1489,6 +1489,15 @@ with tempfile.TemporaryDirectory(prefix="cwg_unborn_") as unborn:
     subprocess.run(["git", "-C", unborn, "add", "."], check=False, capture_output=True)
     check("a repository without a commit yet stages without changing the fingerprint",
           first == marker_hook.content_fingerprint([fresh]) and first is not None, first)
+    silent = marker_hook.cwg.git_run
+    try:
+        marker_hook.cwg.git_run = lambda *args, **kwargs: None
+        marker_hook._HEAD_BORN.clear()
+        check("a fingerprint is unknown, not clean, when git cannot answer at all",
+              marker_hook.content_fingerprint([fresh]) is None, "git silent")
+    finally:
+        marker_hook.cwg.git_run = silent
+        marker_hook._HEAD_BORN.clear()
 
 # --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
 def marker_with_marks(sid, marks):

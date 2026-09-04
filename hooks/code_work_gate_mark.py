@@ -1078,6 +1078,10 @@ def content_fingerprint(paths):
     return digest.hexdigest()
 
 
+# Per hook run: whether each repository root has a commit yet.
+_HEAD_BORN = {}
+
+
 def staged_divergences(directory, names):
     """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk, and
     (name, "deleted") for a file on disk and in HEAD that the index no longer holds.
@@ -1086,21 +1090,30 @@ def staged_divergences(directory, names):
     line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. The
     listings are read NUL-separated, so a name git would quote (non-ASCII, a tab) keys like any
     other, and keyed by Python's own lower-casing, the same one the marker uses. Outside a
-    repository nothing is recorded; a listing git could not give inside one returns None, so
-    the caller records an unknown fingerprint rather than a false one.
+    repository nothing is recorded; anything git could not answer — including whether this is a
+    repository at all — returns None, so the caller records an unknown fingerprint rather than a
+    false one.
     """
     names = sorted(names)
-    inside = cwg.git_run(directory, ["rev-parse", "--is-inside-work-tree"], timeout=5)
-    if inside is None or inside[0] != 0 or inside[1].strip() != "true":
+    # One answer per repository for "is this a repository" and "does HEAD exist": a candidate
+    # spread over many directories of one checkout asks git these twice, not twice per directory.
+    toplevel = cwg.git_run(directory, ["rev-parse", "--show-toplevel"], timeout=5)
+    if toplevel is None:
+        return None
+    if toplevel[0] != 0 or not toplevel[1].strip():
         return []
+    root = toplevel[1].strip()
+    if not _HEAD_BORN.get(root):
+        # Only "born" is remembered: a repository gains its first commit, never loses it.
+        born = cwg.git_run(root, ["rev-parse", "--verify", "-q", "HEAD"], timeout=5)
+        if born is None:
+            return None
+        _HEAD_BORN[root] = born[0] == 0
     staged = cwg.git_text(directory, ["ls-files", "-s", "-z"], timeout=10)
     if staged is None:
         return None
-    born = cwg.git_run(directory, ["rev-parse", "--verify", "-q", "HEAD"], timeout=5)
-    if born is None:
-        return None
     committed = ""
-    if born[0] == 0:
+    if _HEAD_BORN[root]:
         committed = cwg.git_text(directory, ["ls-tree", "-z", "HEAD"], timeout=10)
         if committed is None:
             return None
