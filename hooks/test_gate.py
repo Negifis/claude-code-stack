@@ -1120,6 +1120,65 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a repository back on the commit the candidate opened on, and clean, changed nothing lasting
+with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
+    subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.email", "t@example.com"], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "config", "user.name", "t"], check=False, capture_output=True)
+    target = os.path.join(tree, "src", "app.py")
+    os.makedirs(os.path.dirname(target))
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write("print('a')" + chr(10))
+    subprocess.run(["git", "-C", tree, "add", "."], check=False, capture_output=True)
+    subprocess.run(["git", "-C", tree, "commit", "-q", "-m", "start"], check=False, capture_output=True)
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("<<<<<<< probe" + chr(10))
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        data = cwg.read_json(marker) or {}
+        check("a new cycle remembers the commit it opened on", data.get("head_at_start") == head, data.get("head_at_start"))
+        events = [skill_use(120, "development-verification", "skill-dev")]
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: the probe was aborted"})
+        check("a tree that still differs from the start commit keeps the candidate open",
+              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('a')" + chr(10))
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: the probe was aborted and the tree restored"})
+        check("a tree restored to the start commit closes as no-change",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write("print('b')" + chr(10))
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+                        "cwd": tree, "tool_input": {"file_path": target}})
+        subprocess.run(["git", "-C", tree, "commit", "-q", "-am", "moved"], check=False, capture_output=True)
+        events = [skill_use(120, "development-verification", "skill-dev")]
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] operational: checked; committed"})
+        check("a clean tree on a different commit is not restored", result.get("decision") == "block", result)
+        data = cwg.read_json(marker) or {}
+        data["paths"] = list(data.get("paths") or []) + ["C:/elsewhere/lasting.py"]
+        subprocess.run(["git", "-C", tree, "reset", "-q", "--hard", head], check=False, capture_output=True)
+        cwg.write_json(marker, data)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": "[gate] no-change: restored"})
+        check("a lasting path outside the repository is not something git can vouch for",
+              result.get("decision") == "block", result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
 # --- the same candidate resumed the next morning keeps its cycle, and its review rounds with it
 stale = {"first_ts": 100.0, "last_ts": 200.0, "identity": "c:/repo#refs/heads/work",
          "paths": ["c:/repo/src/app.py"]}

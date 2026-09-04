@@ -48,6 +48,10 @@ No simplify pass and no code review on a throwaway script that already executed.
 `[gate] no-change: <reason>`. Both require this skill to have been invoked; invoking it before
 execution, where it belongs, satisfies that.
 
+A lasting change that was undone — a rebase probe aborted, an edit reverted — leaves the
+repository on the commit the candidate opened on and clean; the gate reads that from git and
+accepts `operational` or `no-change` for it, so do not manufacture a review for nothing.
+
 ## 3. Classify risk
 
 - **LOW** — docs, comments, formatting, tests-only changes, generated output with no semantic

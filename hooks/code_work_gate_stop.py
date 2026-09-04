@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -1180,6 +1181,44 @@ def anomaly_closure(receipt, state, key):
     return True, match.group(1)
 
 
+def git_output(root, arguments):
+    proc = subprocess.run(
+        ["git", "-C", root] + arguments, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=15, check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def restored_to_head(entry):
+    """Whether the repository shows nothing lasting changed since the candidate opened.
+
+    True only when the marker remembers the commit the cycle opened on, HEAD is that commit
+    again, and `git status` is clean for every lasting path the cycle recorded — the whole tree
+    when a change could not be attributed or the path list overflowed. A lasting path outside
+    the repository is not something git can vouch for, so it keeps the candidate open.
+    """
+    root, _, _ = str(entry.get("identity") or "").partition("#")
+    start = entry.get("head_at_start")
+    if not root or not isinstance(start, str) or not start:
+        return False
+    durable = cwg.durable_paths(marker_paths(entry))
+    inside = [path for path in durable if path == root or path.startswith(root.rstrip("/") + "/")]
+    if len(inside) != len(durable):
+        return False
+    try:
+        head = git_output(root, ["rev-parse", "HEAD"])
+        if head is None or head.strip() != start:
+            return False
+        scope = (
+            [] if entry.get("unattributed_durable") or entry.get("path_overflow") or not inside
+            else ["--"] + inside
+        )
+        status = git_output(root, ["status", "--porcelain", "--untracked-files=all"] + scope)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return status is not None and status.strip() == ""
+
+
 def receipt_preflight(receipt, entry):
     """Reject malformed, misclassified, or path-risk-downgraded receipts before scanning."""
     if receipt is None:
@@ -1194,7 +1233,14 @@ def receipt_preflight(receipt, entry):
             )
         return True, "preflight"
     if kind in OPERATIONAL_RECEIPTS:
-        return False, "{} cannot close a candidate that changed a lasting artifact".format(kind)
+        if restored_to_head(entry):
+            # A rebase probe aborted, an edit undone: the repository is back on the commit
+            # the candidate opened on and clean, so nothing lasting changed after all.
+            return True, "preflight"
+        return False, (
+            "{} cannot close a candidate that changed a lasting artifact (the repository "
+            "still differs from the commit the candidate opened on)".format(kind)
+        )
     required_risk = cwg.max_risk(
         minimum_risk(marker_paths(entry)),
         entry.get("minimum_risk_seen"),

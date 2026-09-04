@@ -740,6 +740,7 @@ def cycle_start(marker, now, identity, incoming):
         "last_durable_ts": 0.0,
         "unattributed_durable": False,
         "content_marks": [],
+        "head_at_start": None,
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -764,6 +765,7 @@ def cycle_start(marker, now, identity, incoming):
             "last_durable_ts": float(carried) if cwg.valid_ts(carried) else 0.0,
             "unattributed_durable": bool(existing.get("unattributed_durable")),
             "content_marks": list(existing.get("content_marks") or []),
+            "head_at_start": existing.get("head_at_start"),
         }
     if os.path.exists(marker):
         try:
@@ -869,6 +871,10 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         else cycle["last_durable_ts"]
     )
     content_marks = cycle.get("content_marks") or []
+    if not cycle.get("edits") and cycle.get("head_at_start") is None:
+        # The commit the cycle opened on: a tree that is back on it, clean, has changed nothing
+        # lasting, whatever happened in between (a rebase probe that was aborted, an edit undone).
+        cycle["head_at_start"] = head_commit(str(data.get("cwd") or os.getcwd()))
     if last_durable_ts == now:
         # A change the snapshot could not attribute may have touched anything, so the content
         # after it is unknown; a named edit leaves the lasting paths' bytes to be measured.
@@ -898,6 +904,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "identity": cycle["identity"],
         "unattributed_durable": unattributed_durable,
         "content_marks": content_marks,
+        "head_at_start": cycle.get("head_at_start"),
     })
 
 
@@ -999,6 +1006,19 @@ def on_home_ground(path, cwd, snapshot_roots, data):
         if any(spelling in spelled for spelling in spellings):
             return True
     return bool(HOME_REFERENCE_RE.search(command))
+
+
+def head_commit(cwd):
+    """The commit HEAD points at in this working directory, or None outside a repository."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = proc.stdout.strip()
+    return head if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
 def content_fingerprint(paths):
