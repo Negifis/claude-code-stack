@@ -1131,6 +1131,8 @@ for command, fed, tail in (
     ("codex exec - <<'PY'", False, ""),
     ("codex exec -", False, ""),
     ("cat < notes.md | grep x", True, ""),
+    ("REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err", True, "C:/tmp/codex-packet-r7.md"),
+    ("codex exec - < /c/tmp/codex-packet-${UNSET}.md", True, ""),
 ):
     launch = marker_hook.codex_launch(command)
     check("codex_launch reads {!r}".format(command[:48]),
@@ -1178,6 +1180,10 @@ for label, marks, verdict_at, expect in (
      [(110.0, "fpA"), (140.0, "fpB"), (150.0, "fpA")], 145.0, False),
     ("a change the snapshot could not attribute leaves the content unknown",
      [(110.0, "fpA"), (150.0, None)], 120.0, False),
+    ("an unattributable change between the verdict and a byte-identical revert is a barrier",
+     [(110.0, "fpA"), (150.0, None), (160.0, "fpB"), (170.0, "fpA")], 120.0, False),
+    ("a verdict given once the content was measured again covers a later edit-and-revert",
+     [(110.0, "fpA"), (150.0, None), (160.0, "fpA"), (170.0, "fpB"), (180.0, "fpA")], 165.0, True),
     ("a marker without content marks keeps the strict timestamp rule",
      [], 120.0, False),
 ):

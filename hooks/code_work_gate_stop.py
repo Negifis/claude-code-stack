@@ -1229,14 +1229,26 @@ def content_covers(entry, stamp, durable_ts):
 
     Freshness is measured against content, not against edit events: a verdict given before an
     edit that was later reverted covers exactly the bytes the reviewer read. Without content
-    marks — a marker written before they existed, or a change the snapshot could not attribute —
-    the strict rule stands: nothing older than the last durable change covers it.
+    marks — a marker written before they existed — the strict rule stands: nothing older than
+    the last durable change covers it. A change the snapshot could not attribute is a barrier
+    in its own right: the fingerprint measures only the recorded paths, so an equal fingerprint
+    after such a change proves nothing about what it touched, and only a fresh verdict crosses
+    it.
     """
     if stamp >= durable_ts:
         return True
-    marks = entry.get("content_marks") or []
-    now_fp = content_at(entry, float("inf")) if marks else None
-    return now_fp is not None and content_at(entry, stamp) == now_fp
+    marks = [
+        mark for mark in entry.get("content_marks") or []
+        if isinstance(mark, dict) and cwg.valid_ts(mark.get("ts"))
+    ]
+    if not marks:
+        return False
+    now_fp = content_at(entry, float("inf"))
+    if now_fp is None or content_at(entry, stamp) != now_fp:
+        return False
+    return not any(
+        float(mark["ts"]) > stamp and not isinstance(mark.get("fp"), str) for mark in marks
+    )
 
 
 def active_review_start(evidence, stale):

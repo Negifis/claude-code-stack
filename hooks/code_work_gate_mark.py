@@ -915,7 +915,10 @@ def codex_launch(command):
     if len(fed_by) != 1 or not fed_by[0]:
         return {"fed": fed, "path": ""}
     import codex_lane
-    return {"fed": fed, "path": codex_lane.windows_path(fed_by[0])}
+    # The command arrives as the agent wrote it, `${REVIEW_ID}` and all; the value comes from
+    # an assignment in the same command. A variable nothing assigns leaves no file to capture.
+    path = codex_lane.resolve_variables(command, fed_by[0])
+    return {"fed": fed, "path": "" if "$" in path else codex_lane.windows_path(path)}
 
 
 def forget_stale_captures(session, now=None):

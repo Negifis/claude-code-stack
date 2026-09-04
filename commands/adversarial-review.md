@@ -43,13 +43,17 @@ nothing, and the Stop hook lets a turn end while this session's own review is st
 Read the output file and `codex-<id>.err` only after the notification, to report the findings.
 Launch the review last: the verdict is filed at the launch, because the packet froze the
 candidate then, so an edit to a lasting file after the launch expires it exactly as it would a
-foreground verdict.
+foreground verdict — measured by content, so an edit reverted byte for byte does not, while a
+shell change the snapshot could not attribute always does.
 Feed the packet from a file on stdin (`- < /c/tmp/codex-packet-<id>.md`), never from a heredoc:
 the marker hook keeps a copy of that file at the launch, and the Stop hook binds the verdict to
 the Codex session that was given exactly that text — which is what keeps two reviews running at
 once from different chats apart. Write the packet in its own shell call and launch Codex in
 the next one: the copy is taken before the launch command runs, so a packet composed by the
-same command as the launch is not there yet and the verdict binds nothing.
+same command as the launch is not there yet and the verdict binds nothing. The packet path may
+use a variable assigned in the same command (`REVIEW_ID=… ; … < /c/tmp/codex-packet-${REVIEW_ID}.md`);
+a variable nothing assigns, `codex --profile x exec`, or `bash -c "codex exec …"` leave the
+launch unrecognizable and it binds nothing.
 Carry the literal marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is what makes
 the launch a review lane rather than an errand, so a review that ran but could not be
 attributed still counts as an unresolved lane instead of vanishing. The result must end with
