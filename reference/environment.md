@@ -150,7 +150,9 @@ with `cliSessionId`), cached in `state/session-map.json` for five minutes; that 
 lets a resumed parent — new transcript id, same `local_…` id — still be reminded about chips it
 opened earlier.
 
-Four registrations in `settings.json`: `PreToolUse` on the spawn tool (`hook-spawn`); `Stop`
+The chip is cut before the tool runs, because the child needs its directory to exist the moment it starts, so it stays `pending` until `hook-spawned` (PostToolUse) confirms the spawn landed; `hook-spawn-failed` (PostToolUseFailure) and a 10-minute sweep on the next spawn remove a chip whose tool was denied or cancelled, worktree and branch included. Idempotency is keyed on a `<!-- chip:<id> -->` token in the footer, not on the visible heading, so a task that merely quotes the heading is still registered.
+
+Six registrations in `settings.json`: `PreToolUse` on the spawn tool (`hook-spawn`), `PostToolUse` and `PostToolUseFailure` on it (`hook-spawned`, `hook-spawn-failed`); `Stop`
 (`hook-stop`), which blocks a chip session at
 most three times when its final message carries a `[gate]` receipt but the work was neither
 handed back nor even attempted, and otherwise lists — without blocking, and repeating until

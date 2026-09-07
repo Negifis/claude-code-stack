@@ -17,34 +17,24 @@ you the next command; the paths below are the shape, not something to retype fro
 
 ## Spawning one
 
-Nothing to do: a `PreToolUse` hook registers the chip while `spawn_task` is being called, and
-rewrites that call so the child starts in its own worktree with the handoff block already in
-its prompt. Spawn the way you always would. Everything below is what happens next, and the
-manual `open` remains only for a chip you are setting up by hand or one that needs
-`--operational` against your judgement rather than the hook's.
+Nothing to do. A `PreToolUse` hook registers the chip while `spawn_task` is being called and
+rewrites that call, so the child starts in its own worktree with the handoff block already in
+its prompt. Spawn the way you always would.
 
+It cuts a branch and worktree whenever the directory is a repository with a commit to branch
+from, and otherwise registers an operational chip that reports instead. The chip stays
+provisional until the spawn actually lands; a call that is denied or cancelled takes its
+worktree and branch with it.
 
-1. Get the parent session id — `mcp__ccd_session_mgmt__get_session` with `"self"`, field
-   `sessionId`. Without it the child cannot address its report and the parent gets no reminder.
+`open` remains for a chip you are setting up by hand:
 
-2. Decide what the chip produces. **Code** — anything that leaves a diff — gets its own branch
-   and worktree. **Operational** work — a command against a live system, a check, a
-   restart — has nothing to pull, so it gets `--operational` and no worktree.
+```bash
+python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>"
+python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>" --operational
+```
 
-   ```bash
-   python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>" --session <sessionId>
-   python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>" --session <sessionId> --operational
-   ```
-
-   The code form cuts `chip/<slug>-<id>` off the current HEAD and adds a worktree for it under
-   `~/.claude/state/chips/trees/`. Both forms record the parent branch and session and print a
-   ready handoff block.
-
-3. Call `spawn_task` with the printed block appended to the end of `prompt`. For a code chip
-   `cwd` is the printed worktree — never the parent's own directory. For an operational chip
-   pick `cwd` by the task. Everything above the block is the ordinary task description.
-
-Outside a git repository the code form fails and says to use `--operational`.
+It prints the worktree to pass as `cwd` and the block to append to `prompt`. Session ids are
+resolved on their own; pass `--session` only to override that.
 
 ## Finishing one
 
@@ -55,11 +45,9 @@ After the work is done and `development-verification` has closed it:
    that skill's operational track requires.
 
 2. Run the `finish` command from the handoff block. In a chip worktree it needs no arguments
-   beyond the summary; an operational chip passes its `--chip <id>`. Always pass
-   `--child-session` with your own `sessionId` from `get_session` with `"self"` — a hook can
-   only see this session's transcript id, and `archive_session` does not accept that, so
-   without it the parent can neither archive you nor send you back. It must be the real
-   `local_<uuid>`; anything else is refused rather than stored.
+   beyond the summary; an operational chip passes its `--chip <id>`. Nothing else: `finish`
+   resolves your own `sessionId` through the app's session registry, so the parent can archive
+   you or send you back without being told who you are.
 
    For code it merges into the parent branch when that branch is checked out nowhere, and
    otherwise leaves it alone — merging into a branch a live session holds would move the ref
@@ -102,12 +90,12 @@ When a chip is waiting:
    Closing is not optional bookkeeping: until a chip is closed its parent is reminded again on
    every turn, because a report nobody acted on is the failure this exists to catch.
 
-   `--accept` prints the child's `sessionId` when the child recorded one; archive that session
-   with `mcp__ccd_session_mgmt__archive_session`, which asks the user for confirmation. When it
-   prints no id — the child never passed `--child-session` — find the session by the chip's
-   title in `list_sessions`; never pass the transcript id it offers as a hint, `archive_session`
-   does not take that form. `--rework` prints the message to send back into the child session
-   with `send_message` — the child is waiting for exactly that and should not have been closed.
+   `--accept` prints the child's `sessionId` when one was recorded; archive that session with
+   `mcp__ccd_session_mgmt__archive_session`, which asks the user for confirmation. When it
+   prints no id, find the session by the chip's title in `list_sessions` — an id that is not of
+   the `local_<uuid>` form is refused rather than offered, because `archive_session` does not
+   take it. `--rework` prints the message to send back into the child session with
+   `send_message` — the child is waiting for exactly that and should not have been closed.
 
 `status` lists chips still waiting on somebody; pass `--session <sessionId>` for this
 session's own.

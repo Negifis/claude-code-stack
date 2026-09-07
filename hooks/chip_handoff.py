@@ -47,6 +47,7 @@ CHIP_DIR = os.path.join(hc.STATE_DIR, "chips")
 TREE_ROOT = os.path.join(CHIP_DIR, "trees")
 BY_TREE = os.path.join(CHIP_DIR, "by-tree")
 BY_PARENT = os.path.join(CHIP_DIR, "by-parent")
+BY_SPAWN = os.path.join(CHIP_DIR, "by-spawn")
 LOCK_PATH = os.path.join(CHIP_DIR, ".lock")
 LOCK_TIMEOUT = 3.0
 LOCK_STALE = 60.0
@@ -58,7 +59,10 @@ SESSION_REGISTRY = os.path.join(os.environ.get("APPDATA") or
 SESSION_MAP_CACHE = os.path.join(hc.STATE_DIR, "session-map.json")
 SESSION_MAP_TTL = 300.0
 SPAWN_TOOL = "mcp__ccd_session__spawn_task"
-HANDOFF_MARKER = "## Возврат работы родителю"
+PENDING_GRACE = 600.0
+# The footer carries this so a re-spawn of the same prompt is recognised by the chip it
+# names, not by prose that merely looks like a handoff block.
+CHIP_TOKEN_RE = re.compile(r"<!-- chip:([0-9a-f]{8}) -->")
 # The session ids the session-management tools address. Anything else — a transcript id, a
 # typo, a paraphrase — must never reach `archive_session`, so the shape is checked, not just
 # the prefix.
@@ -177,22 +181,52 @@ def session_map(force=False):
     cached = read_json(SESSION_MAP_CACHE)
     if not force and cached and time.time() - (cached.get("built_ts") or 0) < SESSION_MAP_TTL:
         return cached.get("pairs") or {}
-    pairs = {}
+    known_misses = set((cached or {}).get("misses") or ())
+    claims, pairs = {}, {}
     try:
         for entry in glob.glob(os.path.join(SESSION_REGISTRY, "**", "local_*.json"),
                                recursive=True):
             data = read_json(entry) or {}
             ccd, transcript = data.get("sessionId"), data.get("cliSessionId")
-            if ccd and transcript:
-                pairs[transcript] = ccd
-                pairs[ccd] = transcript
+            if ccd and transcript and is_ccd_session_id(ccd):
+                claims.setdefault(transcript, set()).add(ccd)
     except Exception:
         return (cached or {}).get("pairs") or {}
+    # A transcript claimed by two sessions identifies neither: publishing either one would send
+    # a report, or an archive command, to a session that never opened the chip.
+    for transcript, owners in claims.items():
+        if len(owners) == 1:
+            ccd = owners.pop()
+            pairs[transcript] = ccd
+            pairs[ccd] = transcript
     try:
-        save_json(SESSION_MAP_CACHE, {"built_ts": time.time(), "pairs": pairs})
+        save_json(SESSION_MAP_CACHE, {"built_ts": time.time(), "pairs": pairs,
+                                      "misses": sorted(known_misses)})
     except Exception:
         pass
     return pairs
+
+
+def remember_miss(any_id):
+    """Record an id the registry does not pair, so the next turn does not rescan for it.
+
+    A session that is not in the registry at all — and the Stop hook runs in every one of them —
+    would otherwise force a full rescan on every single turn.
+    """
+    cached = read_json(SESSION_MAP_CACHE) or {}
+    misses = set(cached.get("misses") or ())
+    if any_id in misses:
+        return
+    misses.add(any_id)
+    cached["misses"] = sorted(misses)
+    try:
+        save_json(SESSION_MAP_CACHE, cached)
+    except Exception:
+        pass
+
+
+def registry_misses():
+    return set((read_json(SESSION_MAP_CACHE) or {}).get("misses") or ())
 
 
 def ccd_for_transcript(transcript_id):
@@ -200,16 +234,27 @@ def ccd_for_transcript(transcript_id):
     if not transcript_id:
         return None
     found = session_map().get(transcript_id)
-    if not is_ccd_session_id(found):
+    if not is_ccd_session_id(found) and transcript_id not in registry_misses():
         found = session_map(force=True).get(transcript_id)
+        if not is_ccd_session_id(found):
+            remember_miss(transcript_id)
     return found if is_ccd_session_id(found) else None
 
 
 def session_ids(any_id):
-    """Both ids of one session, in the order a lookup should try them."""
+    """Both ids of one session, in the order a lookup should try them.
+
+    A resumed parent arrives with a transcript id minted after the cache was built, so an
+    unknown id is worth one rebuild: without it the parent hears nothing about its chips until
+    the cache expires, which is the whole failure this pairing exists to prevent.
+    """
     if not any_id:
         return []
     other = session_map().get(any_id)
+    if not other and any_id not in registry_misses():
+        other = session_map(force=True).get(any_id)
+        if not other:
+            remember_miss(any_id)
     return [any_id] + ([other] if other and other != any_id else [])
 
 
@@ -319,7 +364,7 @@ def cmd_open(args):
     return 0
 
 
-def create_chip(title, cwd, session, operational, transcript=None):
+def create_chip(title, cwd, session, operational, transcript=None, tool_use_id=None):
     """Register a chip and, for code work, cut its worktree. Raises ChipError."""
     cwd = os.path.abspath(cwd or os.getcwd())
     transcript = transcript or hook_session_id()
@@ -329,6 +374,7 @@ def create_chip(title, cwd, session, operational, transcript=None):
     chip_id = uuid.uuid4().hex[:8]
     record = {
         "chip_id": chip_id,
+        "spawn_tool_use_id": tool_use_id,
         "title": title,
         "mode": "operational" if operational else "code",
         "created_ts": time.time(),
@@ -338,7 +384,9 @@ def create_chip(title, cwd, session, operational, transcript=None):
         "parent_session_id": session,
         "parent_hook_session": transcript,
         "parent_cwd": cwd,
-        "status": "open",
+        # A chip cut by the spawn hook is not real until the spawn lands: the tool can
+        # still be denied or cancelled, and a card left behind would outlive its session.
+        "status": "pending" if tool_use_id else "open",
         "outcome": None,
         "notified": False,
         "delivery_attempted": False,
@@ -348,15 +396,15 @@ def create_chip(title, cwd, session, operational, transcript=None):
     }
 
     if not operational:
-        ok, repo_root, err = git(cwd, "rev-parse", "--show-toplevel")
+        ok, repo_root, err = git(cwd, "rev-parse", "--show-toplevel", timeout=10)
         if not ok:
             raise ChipError("не git-репозиторий: {}\nдля работы без кода добавь --operational\n{}"
                         .format(cwd, err))
         repo_root = os.path.abspath(repo_root)
-        ok, head, err = git(repo_root, "rev-parse", "--verify", "HEAD")
+        ok, head, err = git(repo_root, "rev-parse", "--verify", "HEAD", timeout=10)
         if not ok:
             raise ChipError("в репозитории нет коммитов, не от чего ветвиться\n{}".format(err))
-        _, branch, _ = git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+        _, branch, _ = git(repo_root, "rev-parse", "--abbrev-ref", "HEAD", timeout=10)
         parent_branch = None if branch in ("", "HEAD") else branch
         slug = slugify(title)
         chip_branch = "chip/{}-{}".format(slug, chip_id)
@@ -364,27 +412,31 @@ def create_chip(title, cwd, session, operational, transcript=None):
             TREE_ROOT, "{}-{}-{}".format(os.path.basename(repo_root), slug, chip_id))
         os.makedirs(TREE_ROOT, exist_ok=True)
         ok, _, err = git(repo_root, "worktree", "add", "-b", chip_branch, worktree,
-                         parent_branch or head)
+                         parent_branch or head, timeout=20)
         if not ok:
             raise ChipError("не удалось создать worktree {}\n{}".format(worktree, err))
         record.update({
             "repo_root": repo_root, "parent_branch": parent_branch, "worktree": worktree,
             "chip_branch": chip_branch, "base_sha": head,
         })
+    with chip_lock() as held:
+        if not held:
+            discard_chip(record)
+            raise ChipError("карточки чипов заняты другой операцией — чип не заведён")
         try:
             save_record(record)
-            index_write(BY_TREE, hc.tree_key(worktree), chip_id)
+            if not operational:
+                index_write(BY_TREE, hc.tree_key(worktree), chip_id)
+            if tool_use_id:
+                index_write(BY_SPAWN, tool_use_id, chip_id)
+            for key in (session, transcript):
+                if key:
+                    index_write(BY_PARENT, key, chip_id, append=True)
         except Exception as exc:
-            git(repo_root, "worktree", "remove", "--force", worktree)
-            git(repo_root, "branch", "-D", chip_branch)
+            # Through the same cleanup as an abandoned chip: a half-written card left behind
+            # would later be finalized as a chip whose worktree no longer exists.
+            discard_chip(record)
             raise ChipError("не удалось записать карточку чипа, worktree убран\n{}".format(exc))
-    else:
-        save_record(record)
-
-    with chip_lock():
-        for key in (session, transcript):
-            if key:
-                index_write(BY_PARENT, key, chip_id, append=True)
     return record
 
 
@@ -413,7 +465,8 @@ def finish_command(record):
 
 
 def handoff_footer(record):
-    lines = ["## Возврат работы родителю", ""]
+    lines = ["<!-- chip:{} -->".format(record["chip_id"]),
+             "## Возврат работы родителю", ""]
     if record["mode"] == "code":
         lines += [
             "Ты работаешь в отдельном worktree на ветке `{}`, отведённой от `{}`.".format(
@@ -512,7 +565,15 @@ def cmd_finish(args):
     if not record:
         return fail("не найдена карточка чипа: {} не worktree чипа, --chip не задан"
                     .format(cwd))
-    args.child_session = args.child_session or ccd_for_transcript(hook_session_id())
+    resolved = args.child_session or ccd_for_transcript(hook_session_id())
+    # `finish` re-run by the parent while it checks the work would otherwise rebind the chip to
+    # the parent, and `close --accept` would then offer to archive the session doing the
+    # accepting. A binding already made is kept.
+    if resolved and resolved == record.get("parent_session_id"):
+        resolved = None
+    if record.get("child_session_id") and not args.child_session:
+        resolved = record["child_session_id"]
+    args.child_session = resolved
     if args.child_session and not is_ccd_session_id(args.child_session):
         return fail("--child-session {} — это не идентификатор сессии: нужен вид "
                     "local_<uuid>, поле sessionId из get_session self"
@@ -753,6 +814,10 @@ def child_reminder(cwd, closing):
     record = record_for_tree(cwd)
     if not record or not closing or record.get("blocks", 0) >= MAX_BLOCKS:
         return False
+    # A chip the parent has already ruled on is finished with its child, whether or not a
+    # message was ever delivered; nagging it then asks for something nobody is waiting for.
+    if record["status"] in ("accepted", "rework", "pending"):
+        return False
     # An attempt is enough once the report is written. A parent that runs unattended cannot be
     # messaged at all, so demanding a delivered notification would hold such a chip hostage to
     # something it can never achieve — the card is the delivery in that case.
@@ -771,11 +836,19 @@ def child_reminder(cwd, closing):
         reason = ("Чип «{}» подготовлен к передаче, но родительская сессия не уведомлена.\n"
                   "Отправь итог через {}{}.").format(record.get("title"), NOTIFY_TOOL, where)
 
-    record["blocks"] = record.get("blocks", 0) + 1
-    try:
-        save_record(record)
-    except Exception:
-        return False
+    with chip_lock() as held:
+        # Without the lock the count is written from a copy read before the parent may have
+        # closed the chip, and the verdict is lost. A block skipped costs one reminder.
+        if not held:
+            return False
+        fresh = read_json(record_path(record["chip_id"]))
+        if not fresh or fresh.get("status") not in ("open", "handed-off", "rework"):
+            return False
+        fresh["blocks"] = fresh.get("blocks", 0) + 1
+        try:
+            save_record(fresh)
+        except Exception:
+            return False
     print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
     return True
 
@@ -814,6 +887,138 @@ def parent_reminder(session_id):
         .format(listed))}, ensure_ascii=False))
 
 
+def spawn_mode(cwd):
+    """(operational, repo_root) for a directory a chip is about to be spawned into.
+
+    Operational unless there is a commit to branch from. A repository without one reads as code
+    work by its top level alone, and cutting a worktree there fails — which used to leave the
+    chip with no card and no way back at all, so an unbranchable repository reports instead.
+    """
+    ok, repo_root, _ = git(cwd, "rev-parse", "--show-toplevel", timeout=10)
+    if not ok:
+        return True, None
+    has_head, _, _ = git(repo_root, "rev-parse", "--verify", "HEAD", timeout=10)
+    return (not has_head), (os.path.abspath(repo_root) if has_head else None)
+
+
+def sweep_pending(now=None):
+    """Settle chips whose spawn was never confirmed, by adopting them — never by deleting.
+
+    A chip is cut before the tool it belongs to runs, because the child needs its directory to
+    exist the moment it starts. Whether that spawn then happened is knowable only from the
+    confirmation hook, and a session started before that hook existed sends none. Nothing else
+    tells the two apart: a child can read for ten minutes before its first edit, and an
+    operational chip has no worktree to inspect at all. So an unconfirmed chip is treated as
+    real. A chip that truly never became a session leaves behind a clean worktree, which
+    `tools/worktree-audit.mjs` already owns; losing a live child's work would be unrecoverable,
+    and that asymmetry decides this.
+    """
+    now = now or time.time()
+    for name in (os.listdir(BY_SPAWN) if os.path.isdir(BY_SPAWN) else []):
+        for chip_id in index_read(BY_SPAWN, name):
+            record = read_json(record_path(chip_id))
+            if not record or record.get("status") != "pending":
+                # A card that is gone or has moved on leaves nothing to settle; its entry here
+                # would otherwise be read by every later spawn forever.
+                index_remove(BY_SPAWN, name, chip_id)
+                continue
+            if now - (record.get("created_ts") or 0) < PENDING_GRACE:
+                continue
+            adopt_pending(chip_id)
+
+
+def adopt_pending(chip_id):
+    """Promote one unconfirmed chip to a real one, under the lock and on a fresh read."""
+    with chip_lock() as held:
+        if not held:
+            return
+        fresh = read_json(record_path(chip_id))
+        if not fresh or fresh.get("status") != "pending":
+            return
+        fresh["status"] = "open"
+        try:
+            save_record(fresh)
+            if fresh.get("spawn_tool_use_id"):
+                index_remove(BY_SPAWN, fresh["spawn_tool_use_id"], chip_id)
+        except Exception:
+            pass
+
+
+def discard_chip(record):
+    """Remove a chip whose spawn was explicitly refused. Returns whether it went.
+
+    Never forces anything. A worktree that holds work refuses to be removed, and the branch is
+    only deleted while it still points at the commit it was cut from — so a child that started
+    working between any check and this call keeps everything, and the bookkeeping stays with it
+    rather than being deleted out from under a directory that survived.
+    """
+    repo_root, worktree = record.get("repo_root"), record.get("worktree")
+    if worktree and repo_root:
+        ok, _, _ = git(repo_root, "worktree", "remove", worktree, timeout=15)
+        if not ok:
+            return False
+        branch, base = record.get("chip_branch"), record.get("base_sha")
+        if branch and base:
+            ok, tip, _ = git(repo_root, "rev-parse", "--verify", "refs/heads/" + branch,
+                             timeout=10)
+            if ok and tip == base:
+                git(repo_root, "branch", "-D", branch, timeout=10)
+        index_remove(BY_TREE, hc.tree_key(worktree), record["chip_id"])
+    for key in (record.get("parent_session_id"), record.get("parent_hook_session")):
+        if key:
+            index_remove(BY_PARENT, key, record["chip_id"])
+    if record.get("spawn_tool_use_id"):
+        index_remove(BY_SPAWN, record["spawn_tool_use_id"], record["chip_id"])
+    try:
+        os.remove(record_path(record["chip_id"]))
+    except OSError:
+        pass
+    return True
+
+
+def record_for_spawn(tool_use_id):
+    if not tool_use_id:
+        return None
+    ids = index_read(BY_SPAWN, tool_use_id)
+    return read_json(record_path(ids[-1])) if ids else None
+
+
+def already_registered(prompt):
+    """Whether this prompt already carries a handoff for a chip that exists.
+
+    Keyed on the chip id the footer embeds rather than on the visible heading: a task about
+    this tooling quotes that heading, and treating the quote as proof of registration left the
+    chip with no card at all.
+    """
+    for chip_id in CHIP_TOKEN_RE.findall(prompt or ""):
+        if read_json(record_path(chip_id)):
+            return True
+    return False
+
+
+def chip_cwd(worktree, parent_cwd, repo_root):
+    """Where inside the chip worktree the child should start.
+
+    The caller may have pointed it at one package of a monorepo, and the same place in the
+    chip worktree is what that meant. Anything that cannot be expressed there — another drive,
+    a path outside the repository, a directory that did not exist at the base commit — falls
+    back to the worktree root rather than failing the spawn.
+    """
+    if not repo_root:
+        return worktree
+    try:
+        inside = os.path.relpath(parent_cwd, repo_root)
+    except ValueError:
+        return worktree
+    target = os.path.normpath(os.path.join(worktree, inside))
+    if not os.path.isdir(target):
+        return worktree
+    root = os.path.normcase(os.path.abspath(worktree))
+    if not os.path.normcase(os.path.abspath(target)).startswith(root):
+        return worktree
+    return target
+
+
 def hook_spawn():
     """Register the chip `spawn_task` is about to create, and hand it its way back.
 
@@ -822,10 +1027,11 @@ def hook_spawn():
     model has to remember at the exact moment it is delegating is a procedure that does not
     run, so the registration moves to the only place that cannot be skipped — the spawn itself.
 
-    The chip is cut here, and the tool's own input is rewritten to carry the handoff block and,
-    for code work, the chip's worktree as the child's directory. Fail-open in every branch: a
-    chip that spawns without a card is the old behaviour, while a hook that raises would stop
-    the user delegating at all.
+    The chip is cut here and stays `pending` until the spawn actually lands, and the tool input
+    is rewritten to carry the handoff block and, for code work, the chip worktree as the child
+    directory. The permission decision is left alone: this hook exists to add a route home, not
+    to approve delegating. Fail-open in every branch — a chip that spawns without a card is the
+    old behaviour, while a hook that raises would stop the user delegating at all.
     """
     payload = hc.read_payload()
     if payload is None or payload.get("tool_name") != SPAWN_TOOL:
@@ -833,32 +1039,56 @@ def hook_spawn():
     spawn = payload.get("tool_input")
     if not isinstance(spawn, dict):
         return 0
-    prompt = spawn.get("prompt") or ""
-    if HANDOFF_MARKER in prompt:
+    if already_registered(spawn.get("prompt") or ""):
         return 0
-    parent_cwd = spawn.get("cwd") or payload.get("cwd") or os.getcwd()
-    title = spawn.get("title") or "Чип"
-    # Code unless there is no repository to branch from: a chip that turns out to have nothing
-    # to hand back reports "изменений нет", which is a true report, whereas an operational chip
-    # that did touch code would have left its work with no route home.
-    operational = not git(parent_cwd, "rev-parse", "--show-toplevel", timeout=10)[0]
     try:
-        record = create_chip(title, parent_cwd, None, operational,
-                             transcript=payload.get("session_id") or hook_session_id())
+        sweep_pending()
+    except Exception:
+        pass
+
+    parent_cwd = os.path.abspath(spawn.get("cwd") or payload.get("cwd") or os.getcwd())
+    operational, repo_root = spawn_mode(parent_cwd)
+    try:
+        record = create_chip(spawn.get("title") or "Чип", parent_cwd, None, operational,
+                             transcript=payload.get("session_id") or hook_session_id(),
+                             tool_use_id=payload.get("tool_use_id"))
     except Exception:
         return 0
 
     updated = dict(spawn)
-    updated["prompt"] = prompt.rstrip() + "\n\n" + handoff_footer(record)
+    updated["prompt"] = (spawn.get("prompt") or "").rstrip() + "\n\n" + handoff_footer(record)
     if record["mode"] == "code":
-        updated["cwd"] = record["worktree"]
+        updated["cwd"] = chip_cwd(record["worktree"], parent_cwd, repo_root)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "permissionDecisionReason": "чип {} зарегистрирован, отчёт вернётся родителю".format(
-            record["chip_id"]),
         "updatedInput": updated,
     }}, ensure_ascii=False))
+    return 0
+
+
+def hook_spawned(failed=False):
+    """Finalize or discard the chip once the spawn itself has landed."""
+    payload = hc.read_payload()
+    if payload is None or payload.get("tool_name") != SPAWN_TOOL:
+        return 0
+    record = record_for_spawn(payload.get("tool_use_id"))
+    if not record or record.get("status") != "pending":
+        return 0
+    with chip_lock() as held:
+        if not held:
+            return 0
+        fresh = read_json(record_path(record["chip_id"]))
+        if not fresh or fresh.get("status") != "pending":
+            return 0
+        if failed:
+            discard_chip(fresh)
+            return 0
+        fresh["status"] = "open"
+        try:
+            save_record(fresh)
+            index_remove(BY_SPAWN, fresh["spawn_tool_use_id"], fresh["chip_id"])
+        except Exception:
+            pass
     return 0
 
 
@@ -943,6 +1173,8 @@ def main():
     lister.add_argument("--all", action="store_true")
 
     sub.add_parser("hook-spawn")
+    sub.add_parser("hook-spawned")
+    sub.add_parser("hook-spawn-failed")
     sub.add_parser("hook-stop")
     sub.add_parser("hook-notified")
     sub.add_parser("hook-notify-failed")
@@ -959,6 +1191,10 @@ def main():
     try:
         if args.command == "hook-spawn":
             return hook_spawn()
+        if args.command == "hook-spawned":
+            return hook_spawned()
+        if args.command == "hook-spawn-failed":
+            return hook_spawned(failed=True)
         if args.command == "hook-stop":
             return hook_stop()
         return hook_notified(failed=args.command == "hook-notify-failed")

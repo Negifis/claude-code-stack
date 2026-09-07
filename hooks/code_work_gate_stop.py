@@ -43,11 +43,14 @@ MAX_BACKGROUND_WAITS = 8
 # The harness's own acknowledgement envelopes, matched whole: a result that says anything more
 # — a review that opens by mentioning a background task — is not an acknowledgement.
 # After the envelope the harness may add its own notes, one per line — today the one it
-# writes when the command changed directory. Nothing else may follow: a review that opens
-# with these words is still a review.
+# writes when the command changed directory, matched through its fixed wording so nothing
+# can ride on the note's line. Every note starts with exactly one line break and nothing
+# else may follow, so a review that opens with these words is still a review, and a result
+# that nearly matches costs the regex one pass, not a search.
 ACK_TAIL = (
     r"(?: To check interim output, use Read on that file path\.)?"
-    r"(?:\s*\n\s*Session cwd remains [^\n]*)*\s*$"
+    r"(?:[ \t]*\r?\nSession cwd remains [^\r\n]*?; directory changes made by the "
+    r"backgrounded command do not apply to subsequent commands\.)*[ \t\r\n]*$"
 )
 DETACHED_ACK_RE = re.compile(
     r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\. "
@@ -1602,9 +1605,9 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "the lane result is the evidence, in whatever order it ran, so do not re-run a "
             "completed pass to satisfy this; two failed attempts end draft-blocked. HIGH "
             "completion requires one adversarial APPROVED result newer than the final edit to a "
-            "lasting artifact, from the foreground Codex lane (/adversarial-review; run "
-            "`codex_lane.py check` first and skip straight to the native lane on a recorded "
-            "outage) or the native reviewer (/adversarial-review-internal). "
+            "lasting artifact, from the Codex lane (/adversarial-review, launched in the "
+            "background; run `codex_lane.py check` first and skip straight to the native lane "
+            "on a recorded outage) or the native reviewer (/adversarial-review-internal). "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
         )

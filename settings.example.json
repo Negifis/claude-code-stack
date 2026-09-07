@@ -124,6 +124,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "mcp__ccd_session__spawn_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawned",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -144,6 +154,16 @@
             "type": "command",
             "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-notify-failed",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__ccd_session__spawn_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawn-failed",
+            "timeout": 30
           }
         ]
       }
