@@ -47,7 +47,7 @@ Resolved from the 2.1.179 binary, not from convention:
 | `policySettings` | managed settings | enterprise, wins over everything |
 
 `~/.claude/settings.local.json` is **not** a global file. It is the project-local file of the
-`C:\Users\in` directory and applies only to sessions started there — which is why the
+`C:\Users\you` directory and applies only to sessions started there — which is why the
 permissions Claude Code auto-saved from prompts in the home directory do not carry to other
 projects. Every genuinely global parameter belongs in `~/.claude/settings.json`.
 
@@ -164,9 +164,9 @@ delivery outright, and a chip must not be held hostage to a send that cannot suc
 ## Windows tooling
 
 Raw ripgrep when plain `rg` is unavailable:
-`C:\tools\ripgrep-15.1.0-x86_64-pc-windows-msvc\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe`.
+the absolute path to `rg.exe`.
 Python for hooks and scripts:
-`C:\Users\in\AppData\Local\Programs\Python\Python312\python.exe`.
+the absolute path to the interpreter the hooks were installed with.
 Route shell specifics through the `local-windows-tooling` skill.
 
 ## GitLab credentials in a Claude Code session
