@@ -2042,6 +2042,19 @@ result = stop_with(sid, events, "Waiting for the review lane.")
 check("a background review lane still running lets the turn end",
       result.get("continue") is True and "decision" not in result, result)
 
+# a native lane whose completion is only a queue enqueue (the turn ended before the attachment)
+# stays in flight, so its verdict is never silently dropped (Codex closure finding)
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+enq_launch = time.time() - 100
+add_background_review(events, enq_launch, "bg-review", "agent-enq")
+events.append({"type": "queue-operation", "operation": "enqueue", "timestamp": iso(enq_launch + 40),
+               "content": agent_notification_text("agent-enq", review_text("APPROVED"), "completed")})
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a native lane whose completion is only a queue enqueue stays in flight, not silently dropped",
+      result.get("continue") is True and "decision" not in result, result)
+
 # --- the acknowledgement's note lines: exact wording, nothing riding on them, no search on a near miss
 NOTE_LINE = "Session cwd remains C:/tmp; directory changes made by the backgrounded command do not apply to subsequent commands."
 MOVED_ACK = ("Command did not complete within its 120s timeout and was moved to the background (ID: {id}). "

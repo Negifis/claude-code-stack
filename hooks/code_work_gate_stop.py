@@ -721,10 +721,21 @@ def transcript_evidence(path, since, skill_since=None):
                         for task_id in NOTIFICATION_ID_RE.findall(notice):
                             if task_id.startswith("__orphan"):
                                 continue
-                            evidence["background_done"][task_id] = (stamp, status)
+                            delivery = entry.get("type") in ("user", "attachment")
+                            # A native review agent's verdict lives in its delivery record — the
+                            # absorbed command (`attachment`) or the idle turn (`user`) — not in
+                            # the queue bookkeeping. Marking such an agent done on a lone enqueue
+                            # (the turn ended between the enqueue and the attachment) would drop
+                            # it from in-flight without its verdict ever being read, letting an
+                            # earlier approval stand for a lane that had moved on. So a native
+                            # lane is done only when its delivery record is seen; every other
+                            # task (a Codex launch, judged from its rollout) is done on any
+                            # notification, as before.
+                            if task_id not in background_agents or delivery:
+                                evidence["background_done"][task_id] = (stamp, status)
                             if (
                                 task_id in background_agents and not stamp + 1 < since
-                                and entry.get("type") in ("user", "attachment")
+                                and delivery
                             ):
                                 # One notice per physical delivery: the absorbed command
                                 # (`attachment`) or the idle turn (`user`). The enqueue and the
