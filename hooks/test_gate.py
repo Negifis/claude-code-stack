@@ -1015,8 +1015,7 @@ def write_review_output(path, text, finished_at):
 
 DETACHED_ACK = "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."
 for label, ack in (
-    ("a detached launch",
-     "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."),
+    ("a detached launch", DETACHED_ACK),
     ("a foreground launch the harness moved to the background",
      "Command did not complete within its 120s timeout and was moved to the background (ID: {id}). Output is being written to: {out}. You will be notified when it completes."),
     ("a detached launch that changed directory, with the harness's cwd note appended",
