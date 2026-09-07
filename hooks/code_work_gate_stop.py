@@ -42,16 +42,22 @@ BACKGROUND_WAIT_LIMIT = 2 * 3600.0
 MAX_BACKGROUND_WAITS = 8
 # The harness's own acknowledgement envelopes, matched whole: a result that says anything more
 # — a review that opens by mentioning a background task — is not an acknowledgement.
+# After the envelope the harness may add its own notes, one per line — today the one it
+# writes when the command changed directory. Nothing else may follow: a review that opens
+# with these words is still a review.
+ACK_NOTES = (
+    r"(?:\s*\n\s*Session cwd remains [^\n]*)*"
+)
 DETACHED_ACK_RE = re.compile(
     r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\. "
     r"Output is being written to: [^\n]+?\.output\. You will be notified when it completes\."
-    r"(?: To check interim output, use Read on that file path\.)?\s*$"
+    r"(?: To check interim output, use Read on that file path\.)?" + ACK_NOTES + r"\s*$"
 )
 MOVED_ACK_RE = re.compile(
     r"^\s*Command did not complete within its \d+s timeout and was moved to the background "
     r"\(ID: ?([A-Za-z0-9_-]+)\)\. Output is being written to: [^\n]+?\.output\. "
     r"You will be notified when it completes\."
-    r"(?: To check interim output, use Read on that file path\.)?\s*$"
+    r"(?: To check interim output, use Read on that file path\.)?" + ACK_NOTES + r"\s*$"
 )
 AGENT_BG_RE = re.compile(
     r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"

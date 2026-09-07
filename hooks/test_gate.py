@@ -1019,6 +1019,8 @@ for label, ack in (
      "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes."),
     ("a foreground launch the harness moved to the background",
      "Command did not complete within its 120s timeout and was moved to the background (ID: {id}). Output is being written to: {out}. You will be notified when it completes."),
+    ("a detached launch that changed directory, with the harness's cwd note appended",
+     "Command running in background with ID: {id}. Output is being written to: {out}. You will be notified when it completes. To check interim output, use Read on that file path.\nSession cwd remains C:\\Users\\in\\.claude\\hooks; directory changes made by the backgrounded command do not apply to subsequent commands."),
 ):
     sid = session()
     try:
@@ -1761,6 +1763,7 @@ try:
     spoken = ("Command did not complete within its 120s timeout and was moved to the background "
               "(ID: example). Output is being written to: C:/tmp/example.output. You will be "
               "notified when it completes. To check interim output, use Read on that file path.\n"
+              "Session cwd remains C:/tmp; directory changes made by the backgrounded command do not apply to subsequent commands.\n"
               + review_text("APPROVED"))
     add_codex_review(events, now - 700, "codex-fg", CODEX_CLI_COMMAND, codex_cli_output(spoken))
     transcript = write_transcript(events)

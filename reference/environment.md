@@ -123,14 +123,41 @@ records the parent's verdict after the parent has checked the result, and `--acc
 child session for `archive_session`. Its regression suite is `hooks/chip_handoff_test.py`.
 
 State lives in `state/chips/<chip-id>.json`, found through two index directories:
-`by-tree/<tree-key>` for the child's own worktree and `by-parent/<sessionId>` for the parent's
-reminder, so each hook path costs one keyed file open and never a directory scan.
+`by-tree/<tree-key>` for the child's own worktree and `by-parent/<id>` for the parent's
+reminder, so each hook path costs a keyed file open and never a directory scan. `by-parent`
+holds only what is still pending — acceptance removes the entry — so `status` reads the cards
+themselves instead. A directory is deliberately not an index: two sessions share a checkout
+routinely, and an operational chip runs in its parent's own directory, so treating possession
+of a directory as parent authority would let a stranger, or the chip's own child, accept it.
+Every write to a card or an index happens under `state/chips/.lock` (`chip_lock`, a mkdir lock
+with a 3s wait and a 60s staleness break); a writer that cannot take it drops its bookkeeping
+rather than bury another party's verdict.
 
-Two registrations in `settings.json`: `Stop` (`hook-stop`), which blocks a chip session at most
-three times when its final message carries a `[gate]` receipt but the work was never handed
-back, and otherwise reminds the parent once — without blocking — that a reported chip is
-unverified; and `PostToolUse` on `mcp__ccd_session_mgmt__send_message` (`hook-notified`), which
-records that the parent was told and which session told it.
+**Two id spaces, and they do not convert.** A hook payload carries only the transcript session
+id (`state/session-index.jsonl`, `~/.claude/projects/**/<id>.jsonl`); the session-management
+tools use a `local_…` id that is a different uuid entirely. So `by-parent` is written under
+both — the `local_…` id the parent passes to `open`, and the transcript id `open` reads from
+`CLAUDE_CODE_SESSION_ID` — and `archive_session` only ever accepts the `local_…` form, which
+the child must supply itself via `finish --child-session`. A transcript id recorded by a hook
+is kept separately as `child_hook_session` and is never offered as an archive target.
+
+`open` is not something anybody has to remember: `hook-spawn` runs as a `PreToolUse` hook on
+`mcp__ccd_session__spawn_task`, cuts the chip there and returns `updatedInput` carrying the
+handoff block and the chip's worktree as the child's `cwd`. It picks code mode whenever the
+parent's directory is a repository. Both ids of a session are resolved through the app's own
+registry (`%APPDATA%/Claude/claude-code-sessions/**/local_<id>.json`, which pairs `sessionId`
+with `cliSessionId`), cached in `state/session-map.json` for five minutes; that is also what
+lets a resumed parent — new transcript id, same `local_…` id — still be reminded about chips it
+opened earlier.
+
+Four registrations in `settings.json`: `PreToolUse` on the spawn tool (`hook-spawn`); `Stop`
+(`hook-stop`), which blocks a chip session at
+most three times when its final message carries a `[gate]` receipt but the work was neither
+handed back nor even attempted, and otherwise lists — without blocking, and repeating until
+each is closed — the chips waiting for the acceptance of the session that opened them; and
+`mcp__ccd_session_mgmt__send_message` on both `PostToolUse` (`hook-notified`) and
+`PostToolUseFailure` (`hook-notify-failed`), because a parent that runs unattended refuses
+delivery outright, and a chip must not be held hostage to a send that cannot succeed.
 
 ## Windows tooling
 

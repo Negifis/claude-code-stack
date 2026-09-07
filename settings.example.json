@@ -136,6 +136,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "mcp__ccd_session_mgmt__send_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-notify-failed",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -171,6 +181,17 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "mcp__ccd_session__spawn_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawn",
+            "timeout": 30,
+            "statusMessage": "Registering the chip's way back..."
+          }
+        ]
+      },
       {
         "matcher": "Edit|Write|NotebookEdit",
         "hooks": [

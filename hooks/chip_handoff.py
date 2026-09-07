@@ -16,11 +16,20 @@ child session can be archived, or sent back with what is missing.
 
 Two hooks keep it honest without nagging. In a chip's own worktree the Stop hook speaks only
 when the child closes out work — a `[gate]` receipt in the final message — because a chip that
-is done without a handoff is the failure this exists to prevent. In the parent it reminds once,
-without blocking, that a reported chip is still unverified. Fail-open everywhere: a session must
-never fail to end because its bookkeeping did.
+is done without a handoff is the failure this exists to prevent. In the parent, and only in the
+session that opened the chip, it repeats without blocking until the chip is closed, because a
+report nobody acted on is the other half of the same failure. Fail-open everywhere: a session
+must never fail to end because its bookkeeping did.
+
+Two things this file is careful about. A session has two unrelated ids — the `local_…` one the
+session tools address and the transcript one every hook payload carries — so both are recorded,
+and only the first is ever offered to `archive_session`. And a card is written by three parties
+at once, so every mutation of a card or an index happens under `chip_lock`; a writer that
+cannot take it drops its bookkeeping rather than bury somebody else's verdict.
 """
 import argparse
+import contextlib
+import glob
 import json
 import os
 import re
@@ -38,7 +47,23 @@ CHIP_DIR = os.path.join(hc.STATE_DIR, "chips")
 TREE_ROOT = os.path.join(CHIP_DIR, "trees")
 BY_TREE = os.path.join(CHIP_DIR, "by-tree")
 BY_PARENT = os.path.join(CHIP_DIR, "by-parent")
+LOCK_PATH = os.path.join(CHIP_DIR, ".lock")
+LOCK_TIMEOUT = 3.0
+LOCK_STALE = 60.0
 MAX_BLOCKS = 3
+SESSION_REGISTRY = os.path.join(os.environ.get("APPDATA") or
+                                os.path.expanduser("~/AppData/Roaming"),
+                                "Claude", "claude-code-sessions")
+# Outside CHIP_DIR on purpose: `status` reads that directory as cards.
+SESSION_MAP_CACHE = os.path.join(hc.STATE_DIR, "session-map.json")
+SESSION_MAP_TTL = 300.0
+SPAWN_TOOL = "mcp__ccd_session__spawn_task"
+HANDOFF_MARKER = "## Возврат работы родителю"
+# The session ids the session-management tools address. Anything else — a transcript id, a
+# typo, a paraphrase — must never reach `archive_session`, so the shape is checked, not just
+# the prefix.
+CCD_SESSION_RE = re.compile(
+    r"^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 NOTIFY_TOOL = "mcp__ccd_session_mgmt__send_message"
 # The kinds are `code_work_gate_stop.TERMINAL_RE`'s, deliberately copied rather than imported:
 # each hook family here stays importable on its own. This one only asks whether the turn looks
@@ -102,14 +127,17 @@ def read_json(path):
         return None
 
 
-def save_record(record):
-    path = record_path(record["chip_id"])
-    os.makedirs(CHIP_DIR, exist_ok=True)
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = "{}.{}.tmp".format(path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False, indent=2)
+        json.dump(data, handle, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     return path
+
+
+def save_record(record):
+    return save_json(record_path(record["chip_id"]), record)
 
 
 def index_write(directory, key, chip_id, append=False):
@@ -127,18 +155,140 @@ def index_read(directory, key):
         return []
 
 
+def hook_session_id():
+    """This session's transcript id — the only id a hook payload ever carries.
+
+    A hook never sees the `local_…` session id the session-management tool uses, and the two
+    are different uuids, not one with a prefix. So a chip is indexed under both, and
+    `session_map` converts between them.
+    """
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def session_map(force=False):
+    """{transcript id: `local_…` id} and back, from the app's own session registry.
+
+    The registry is the only place the two id spaces meet: each `local_<id>.json` states its
+    own `sessionId` and the `cliSessionId` of the transcript it runs. Reading all of it costs
+    a few hundred small files, far too much for a hook that runs every turn, so the pairs are
+    cached and rebuilt on a timer — an id pairing never changes once written, only new ones
+    appear.
+    """
+    cached = read_json(SESSION_MAP_CACHE)
+    if not force and cached and time.time() - (cached.get("built_ts") or 0) < SESSION_MAP_TTL:
+        return cached.get("pairs") or {}
+    pairs = {}
+    try:
+        for entry in glob.glob(os.path.join(SESSION_REGISTRY, "**", "local_*.json"),
+                               recursive=True):
+            data = read_json(entry) or {}
+            ccd, transcript = data.get("sessionId"), data.get("cliSessionId")
+            if ccd and transcript:
+                pairs[transcript] = ccd
+                pairs[ccd] = transcript
+    except Exception:
+        return (cached or {}).get("pairs") or {}
+    try:
+        save_json(SESSION_MAP_CACHE, {"built_ts": time.time(), "pairs": pairs})
+    except Exception:
+        pass
+    return pairs
+
+
+def ccd_for_transcript(transcript_id):
+    """The `local_…` id of the session running this transcript, or None."""
+    if not transcript_id:
+        return None
+    found = session_map().get(transcript_id)
+    if not is_ccd_session_id(found):
+        found = session_map(force=True).get(transcript_id)
+    return found if is_ccd_session_id(found) else None
+
+
+def session_ids(any_id):
+    """Both ids of one session, in the order a lookup should try them."""
+    if not any_id:
+        return []
+    other = session_map().get(any_id)
+    return [any_id] + ([other] if other and other != any_id else [])
+
+
+def is_ccd_session_id(value):
+    """Whether this is an id the session tools address, rather than a transcript id."""
+    return bool(value) and bool(CCD_SESSION_RE.match(str(value)))
+
+
+@contextlib.contextmanager
+def chip_lock(timeout=LOCK_TIMEOUT):
+    """Serialize every write to a card and its indexes; yields whether the lock was taken.
+
+    A card is read, changed and written by three parties — the child's `finish`, the send
+    hook, the parent's `close` — and each also moves index entries. Unserialized, a hook that
+    read a card before the parent closed it writes the verdict away and leaves an accepted chip
+    looking unaccepted. Callers must not write when the lock was refused; a mutation dropped is
+    recoverable, a lost verdict is not.
+    """
+    os.makedirs(CHIP_DIR, exist_ok=True)
+    deadline = time.time() + timeout
+    held = False
+    while True:
+        try:
+            os.mkdir(LOCK_PATH)
+            held = True
+            break
+        except FileExistsError:
+            try:
+                # A process killed mid-write would otherwise wedge every later chip operation.
+                if time.time() - os.path.getmtime(LOCK_PATH) > LOCK_STALE:
+                    os.rmdir(LOCK_PATH)
+                    continue
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.02)
+        except Exception:
+            break
+    try:
+        yield held
+    finally:
+        if held:
+            try:
+                os.rmdir(LOCK_PATH)
+            except Exception:
+                pass
+
+
+def index_remove(directory, key, chip_id):
+    """Drop one id from an index. A closed chip must stop costing the Stop hook a file read."""
+    path = os.path.join(directory, safe_key(key))
+    remaining = [c for c in index_read(directory, key) if c != chip_id]
+    try:
+        if remaining:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(remaining) + "\n")
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def record_for_tree(cwd):
     ids = index_read(BY_TREE, hc.tree_key(cwd))
     return read_json(record_path(ids[-1])) if ids else None
 
 
-def records_for_parent(session_id):
+def records_from_index(directory, key):
     found = []
-    for chip_id in index_read(BY_PARENT, session_id):
+    for chip_id in index_read(directory, key):
         record = read_json(record_path(chip_id))
         if record:
             found.append(record)
     return found
+
+
+def records_for_parent(session_id):
+    return records_from_index(BY_PARENT, session_id)
 
 
 def checked_out_branches(repo_root):
@@ -156,35 +306,59 @@ def checked_out_branches(repo_root):
     return held
 
 
+class ChipError(Exception):
+    """A chip could not be opened. Carries the message the CLI prints and the hook swallows."""
+
+
 def cmd_open(args):
-    cwd = os.path.abspath(args.cwd or os.getcwd())
+    try:
+        record = create_chip(args.title, args.cwd, args.session, args.operational)
+    except ChipError as exc:
+        return fail(str(exc))
+    print_open_result(record)
+    return 0
+
+
+def create_chip(title, cwd, session, operational, transcript=None):
+    """Register a chip and, for code work, cut its worktree. Raises ChipError."""
+    cwd = os.path.abspath(cwd or os.getcwd())
+    transcript = transcript or hook_session_id()
+    # The parent almost never knows its own `local_…` id, and asking for it was one more thing
+    # to forget; the app's own session registry converts the transcript id the hook does see.
+    session = session or ccd_for_transcript(transcript)
     chip_id = uuid.uuid4().hex[:8]
     record = {
         "chip_id": chip_id,
-        "title": args.title,
-        "mode": "operational" if args.operational else "code",
+        "title": title,
+        "mode": "operational" if operational else "code",
         "created_ts": time.time(),
-        "parent_session_id": args.session,
+        # Two id spaces that never convert: a `local_…` id addresses a session for
+        # `send_message` and `archive_session`, a transcript id is all a hook payload carries.
+        # Each side records both so the reminder can find a chip and the parent can reach it.
+        "parent_session_id": session,
+        "parent_hook_session": transcript,
         "parent_cwd": cwd,
         "status": "open",
         "outcome": None,
         "notified": False,
+        "delivery_attempted": False,
         "child_session_id": None,
+        "child_hook_session": None,
         "blocks": 0,
     }
 
-    if not args.operational:
+    if not operational:
         ok, repo_root, err = git(cwd, "rev-parse", "--show-toplevel")
         if not ok:
-            return fail("не git-репозиторий: {}\nдля работы без кода добавь --operational\n{}"
+            raise ChipError("не git-репозиторий: {}\nдля работы без кода добавь --operational\n{}"
                         .format(cwd, err))
         repo_root = os.path.abspath(repo_root)
         ok, head, err = git(repo_root, "rev-parse", "--verify", "HEAD")
         if not ok:
-            return fail("в репозитории нет коммитов, не от чего ветвиться\n{}".format(err))
+            raise ChipError("в репозитории нет коммитов, не от чего ветвиться\n{}".format(err))
         _, branch, _ = git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
         parent_branch = None if branch in ("", "HEAD") else branch
-        slug = slugify(args.title)
+        slug = slugify(title)
         chip_branch = "chip/{}-{}".format(slug, chip_id)
         worktree = os.path.join(
             TREE_ROOT, "{}-{}-{}".format(os.path.basename(repo_root), slug, chip_id))
@@ -192,7 +366,7 @@ def cmd_open(args):
         ok, _, err = git(repo_root, "worktree", "add", "-b", chip_branch, worktree,
                          parent_branch or head)
         if not ok:
-            return fail("не удалось создать worktree {}\n{}".format(worktree, err))
+            raise ChipError("не удалось создать worktree {}\n{}".format(worktree, err))
         record.update({
             "repo_root": repo_root, "parent_branch": parent_branch, "worktree": worktree,
             "chip_branch": chip_branch, "base_sha": head,
@@ -203,14 +377,19 @@ def cmd_open(args):
         except Exception as exc:
             git(repo_root, "worktree", "remove", "--force", worktree)
             git(repo_root, "branch", "-D", chip_branch)
-            return fail("не удалось записать карточку чипа, worktree убран\n{}".format(exc))
+            raise ChipError("не удалось записать карточку чипа, worktree убран\n{}".format(exc))
     else:
         save_record(record)
 
-    if args.session:
-        index_write(BY_PARENT, args.session, chip_id, append=True)
+    with chip_lock():
+        for key in (session, transcript):
+            if key:
+                index_write(BY_PARENT, key, chip_id, append=True)
+    return record
 
-    print("chip:     {}".format(chip_id))
+
+def print_open_result(record):
+    print("chip:     {}".format(record["chip_id"]))
     if record["mode"] == "code":
         print("worktree: {}".format(record["worktree"]))
         print("branch:   {}".format(record["chip_branch"]))
@@ -228,7 +407,8 @@ def cmd_open(args):
 
 def finish_command(record):
     target = "" if record["mode"] == "code" else " --chip {}".format(record["chip_id"])
-    return '"{}" "{}" finish{} --message "<что сделано, одной строкой>"'.format(
+    return ('"{}" "{}" finish{} --child-session <свой sessionId> '
+            '--message "<что сделано, одной строкой>"').format(
         sys.executable, os.path.abspath(__file__), target)
 
 
@@ -256,7 +436,13 @@ def handoff_footer(record):
             "1. Убедись, что эффект проверен по самой системе, а не по ожиданию.",
             "2. Выполни:",
         ]
-    lines += ["", "```bash", finish_command(record), "```", ""]
+    lines += [
+        "   `--child-session` возьми из `mcp__ccd_session_mgmt__get_session` с `\"self\"`, "
+        "поле `sessionId` — без него родитель не сможет тебя ни заархивировать, ни вернуть "
+        "на доработку.",
+        "",
+        "```bash", finish_command(record), "```", "",
+    ]
     lines.append("3. Отправь напечатанный им текст в родительскую сессию через "
                  "`{}`".format(NOTIFY_TOOL))
     if record.get("parent_session_id"):
@@ -264,8 +450,14 @@ def handoff_footer(record):
     else:
         lines.append("   (идентификатор родительской сессии не записан — найди его через "
                      "`list_sessions`).")
-    lines += ["", "Родитель проверит результат и либо примет чип, либо пришлёт правки в эту же "
-                  "сессию — не закрывай её до его ответа."]
+    lines += [
+        "   Если отправка не проходит — родитель запущен по расписанию и недоступен для "
+        "сообщений, — это не твоя ошибка: отчёт уже лежит в карточке чипа, родитель заберёт "
+        "его оттуда. Повторять и обходить не нужно.",
+        "",
+        "Родитель проверит результат и либо примет чип, либо пришлёт правки в эту же "
+        "сессию — не закрывай её до его ответа.",
+    ]
     return "\n".join(lines)
 
 
@@ -320,16 +512,27 @@ def cmd_finish(args):
     if not record:
         return fail("не найдена карточка чипа: {} не worktree чипа, --chip не задан"
                     .format(cwd))
+    args.child_session = args.child_session or ccd_for_transcript(hook_session_id())
+    if args.child_session and not is_ccd_session_id(args.child_session):
+        return fail("--child-session {} — это не идентификатор сессии: нужен вид "
+                    "local_<uuid>, поле sessionId из get_session self"
+                    .format(args.child_session))
     record["finished_ts"] = time.time()
     record["summary"] = args.message
     record["blocks"] = 0
+    record["child_hook_session"] = hook_session_id() or record.get("child_hook_session")
+    # A new report is a new delivery: whatever was sent for the previous one says nothing about
+    # this one, and leaving the flags set would release the chip without it being sent again.
+    record["notified"] = False
+    record["notified_ts"] = None
+    record["delivery_attempted"] = False
+    if args.child_session:
+        record["child_session_id"] = args.child_session
 
     if record["mode"] == "operational":
         record["status"] = "handed-off"
         record["outcome"] = "reported"
-        save_record(record)
-        print(notification(record))
-        return 0
+        return publish_report(record)
 
     worktree = record.get("worktree") or cwd
     ok, dirty, err = git(worktree, "status", "--porcelain")
@@ -348,9 +551,7 @@ def cmd_finish(args):
 
     if record["commits"] == 0:
         record["outcome"] = "no-changes"
-        save_record(record)
-        print(notification(record))
-        return 0
+        return publish_report(record)
 
     outcome, detail, conflicts = try_merge(record, base)
     record["outcome"] = outcome
@@ -362,9 +563,7 @@ def cmd_finish(args):
                          "--not", base)
         record["bundle"] = bundle if ok else None
         record["bundle_error"] = None if ok else err
-    save_record(record)
-    print(notification(record))
-    return 0
+    return publish_report(record)
 
 
 def parent_actions(record):
@@ -445,7 +644,30 @@ def notification(record):
     return "\n".join(lines + parent_actions(record))
 
 
+def publish_report(record):
+    """Write a finished report and print it, refusing to bury a verdict recorded meanwhile."""
+    with chip_lock() as held:
+        if not held:
+            return fail("карточки чипов заняты другой операцией — повтори через несколько "
+                        "секунд; отчёт не записан")
+        fresh = read_json(record_path(record["chip_id"]))
+        if fresh and fresh.get("status") == "accepted":
+            return fail("чип {} уже принят родителем — отчёт не записан"
+                        .format(record["chip_id"]))
+        save_record(record)
+    print(notification(record))
+    return 0
+
+
 def cmd_close(args):
+    with chip_lock() as held:
+        if not held:
+            return fail("карточки чипов заняты другой операцией — повтори через несколько "
+                        "секунд; вердикт не записан")
+        return close_locked(args)
+
+
+def close_locked(args):
     record = read_json(record_path(args.chip))
     if not record:
         return fail("нет карточки чипа {}".format(args.chip))
@@ -454,33 +676,56 @@ def cmd_close(args):
     record["status"] = "accepted" if args.accept else "rework"
     record["closed_ts"] = time.time()
     record["verdict"] = args.rework if args.rework else None
+    if args.rework:
+        # Sending it back asks for another report, and that one has to be delivered on its own
+        # merits — carrying this delivery over would let the next handoff skip the message.
+        record["notified"] = False
+        record["notified_ts"] = None
+        record["delivery_attempted"] = False
     save_record(record)
+    if args.accept:
+        # Only acceptance is terminal. A chip sent back reports again, so it keeps its place in
+        # the indexes; an accepted one must stop being read on every Stop hook, forever.
+        for key in (record.get("parent_session_id"), record.get("parent_hook_session")):
+            if key:
+                index_remove(BY_PARENT, key, record["chip_id"])
 
+    # Only the `local_…` id the child read from `get_session self` addresses a session; the
+    # transcript id a hook records names a log file and archive_session rejects it.
     child = record.get("child_session_id")
+    if not is_ccd_session_id(child):
+        child = None
+    hint = ("" if child else
+            " Найди её в list_sessions по названию «{}»{}.".format(
+                record.get("title") or args.chip,
+                " (её транскрипт — {})".format(record["child_hook_session"])
+                if record.get("child_hook_session") else ""))
     if args.accept:
         print("Чип {} принят.".format(args.chip))
         if child:
             print("Заархивируй дочернюю сессию: archive_session session_id={}".format(child))
         else:
-            print("Идентификатор дочерней сессии не записан — найди её через list_sessions.")
+            print("Идентификатор дочерней сессии не записан." + hint)
         return 0
     print("Чип {} отправлен на доработку. Пошли в дочернюю сессию{}:".format(
-        args.chip, " {}".format(child) if child else " (найди её через list_sessions)"))
+        args.chip, " {}".format(child) if child else "." + hint))
     print("")
     print("Чип «{}» не принят. {}".format(record.get("title") or args.chip, args.rework))
     return 0
 
 
 def cmd_status(args):
-    if args.session:
-        records = records_for_parent(args.session)
-    elif os.path.isdir(CHIP_DIR):
+    # Always the cards themselves, never the index: the index carries only what is still
+    # pending, so reading it here would make `--all` mean different things with and without
+    # `--session`. This runs by hand, not in a hook, so a small directory listing is free.
+    records = []
+    if os.path.isdir(CHIP_DIR):
         records = [read_json(os.path.join(CHIP_DIR, name))
                    for name in sorted(os.listdir(CHIP_DIR)) if name.endswith(".json")]
-    else:
-        records = []
     rows = [r for r in records if r and r.get("chip_id")
-            and (args.all or r["status"] != "accepted")]
+            and (args.all or r["status"] != "accepted")
+            and (not args.session or args.session in (r.get("parent_session_id"),
+                                                      r.get("parent_hook_session")))]
     if not rows:
         print("открытых чипов нет")
         return 0
@@ -495,8 +740,9 @@ def hook_stop():
     payload = hc.read_payload()
     if payload is None:
         return 0
+    cwd = payload.get("cwd") or os.getcwd()
     closing = bool(GATE_RECEIPT.search(payload.get("last_assistant_message") or ""))
-    if child_reminder(payload.get("cwd") or os.getcwd(), closing):
+    if child_reminder(cwd, closing):
         return 0
     parent_reminder(payload.get("session_id"))
     return 0
@@ -507,7 +753,11 @@ def child_reminder(cwd, closing):
     record = record_for_tree(cwd)
     if not record or not closing or record.get("blocks", 0) >= MAX_BLOCKS:
         return False
-    if record["status"] != "open" and record.get("notified"):
+    # An attempt is enough once the report is written. A parent that runs unattended cannot be
+    # messaged at all, so demanding a delivered notification would hold such a chip hostage to
+    # something it can never achieve — the card is the delivery in that case.
+    if record["status"] != "open" and (record.get("notified")
+                                       or record.get("delivery_attempted")):
         return False
 
     where = " с session_id {}".format(record["parent_session_id"]) if record.get(
@@ -531,28 +781,88 @@ def child_reminder(cwd, closing):
 
 
 def parent_reminder(session_id):
-    """Tell the parent once that a chip reported and is still unverified. Never blocks."""
+    """Tell the parent a chip is reported and still unverified. Never blocks.
+
+    Deliberately repeats until the chip is closed: a report the parent never acted on is
+    exactly the state this exists to surface, and a nudge that fires once is a nudge that gets
+    scrolled past.
+    """
     if not session_id:
         return
-    pending = [r for r in records_for_parent(session_id)
-               if r.get("notified") and r["status"] == "handed-off" and not r.get("reminded")]
+    seen, pending = set(), []
+    # Both ids of the session, because a resumed parent keeps its `local_…` id while its
+    # transcript id changes: keyed only by the transcript, it would never hear about the chips
+    # it opened before the resume. Identity is the session and nothing else — a directory is
+    # where a chip was opened, not who owns it, and two sessions share a checkout routinely.
+    for key in session_ids(session_id):
+        for record in records_for_parent(key):
+            chip_id = record.get("chip_id")
+            if chip_id in seen:
+                continue
+            seen.add(chip_id)
+            # `notified` is deliberately not required: an undelivered report — the parent runs
+            # unattended, the send failed — most needs the parent's attention.
+            if record.get("status") == "handed-off":
+                pending.append(record)
     if not pending:
         return
     listed = ", ".join("{} «{}»".format(r["chip_id"], r.get("title")) for r in pending)
     print(json.dumps({"systemMessage": (
-        "Чипы отчитались и ждут приёмки: {}. Проверь результат и закрой их — "
-        "chip_handoff.py close --chip <id> --accept | --rework \"...\"".format(listed))},
-        ensure_ascii=False))
-    # Marked only after the reminder is out: a write that fails costs a repeat, not silence.
-    for record in pending:
-        record["reminded"] = True
-        try:
-            save_record(record)
-        except Exception:
-            return
+        "Чипы отчитались и ждут приёмки: {}. Проверь результат сам и закрой каждый — "
+        "chip_handoff.py close --chip <id> --accept | --rework \"...\"; "
+        "после --accept заархивируй дочернюю сессию, после --rework отправь ей правки."
+        .format(listed))}, ensure_ascii=False))
 
 
-def hook_notified():
+def hook_spawn():
+    """Register the chip `spawn_task` is about to create, and hand it its way back.
+
+    Everything else here assumed somebody ran `open` first. Nobody did: across every transcript
+    on this machine `spawn_task` was called hundreds of times and `open` once. A procedure the
+    model has to remember at the exact moment it is delegating is a procedure that does not
+    run, so the registration moves to the only place that cannot be skipped — the spawn itself.
+
+    The chip is cut here, and the tool's own input is rewritten to carry the handoff block and,
+    for code work, the chip's worktree as the child's directory. Fail-open in every branch: a
+    chip that spawns without a card is the old behaviour, while a hook that raises would stop
+    the user delegating at all.
+    """
+    payload = hc.read_payload()
+    if payload is None or payload.get("tool_name") != SPAWN_TOOL:
+        return 0
+    spawn = payload.get("tool_input")
+    if not isinstance(spawn, dict):
+        return 0
+    prompt = spawn.get("prompt") or ""
+    if HANDOFF_MARKER in prompt:
+        return 0
+    parent_cwd = spawn.get("cwd") or payload.get("cwd") or os.getcwd()
+    title = spawn.get("title") or "Чип"
+    # Code unless there is no repository to branch from: a chip that turns out to have nothing
+    # to hand back reports "изменений нет", which is a true report, whereas an operational chip
+    # that did touch code would have left its work with no route home.
+    operational = not git(parent_cwd, "rev-parse", "--show-toplevel", timeout=10)[0]
+    try:
+        record = create_chip(title, parent_cwd, None, operational,
+                             transcript=payload.get("session_id") or hook_session_id())
+    except Exception:
+        return 0
+
+    updated = dict(spawn)
+    updated["prompt"] = prompt.rstrip() + "\n\n" + handoff_footer(record)
+    if record["mode"] == "code":
+        updated["cwd"] = record["worktree"]
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": "чип {} зарегистрирован, отчёт вернётся родителю".format(
+            record["chip_id"]),
+        "updatedInput": updated,
+    }}, ensure_ascii=False))
+    return 0
+
+
+def hook_notified(failed=False):
     payload = hc.read_payload()
     if payload is None or payload.get("tool_name") != NOTIFY_TOOL:
         return 0
@@ -568,21 +878,33 @@ def hook_notified():
         # notified and disarm its reminder.
         waiting = [r for r in records_for_parent(target)
                    if r["status"] == "handed-off" and not r.get("notified")
-                   and r.get("child_session_id") in (None, sender)]
+                   and r.get("child_hook_session") in (None, sender)]
         if len(waiting) != 1:
             return 0
         record = waiting[0]
-    if record.get("child_session_id") in (None, sender):
-        record["child_session_id"] = sender or record.get("child_session_id")
-    # Only the report itself counts. A chip that writes to its parent mid-work would otherwise
-    # mark itself delivered and silence the block that makes it hand the work back.
-    if record["status"] == "handed-off":
-        record["notified"] = True
-        record["notified_ts"] = time.time()
-    try:
-        save_record(record)
-    except Exception:
-        pass
+    # Re-read under the lock and write in the same critical section: the parent may close this
+    # chip at any moment, and writing a copy read before that would drop the verdict and leave
+    # an accepted chip looking unaccepted. A refused lock drops this bookkeeping rather than
+    # risk that — the child is released by its own `finish`, not by this flag alone.
+    with chip_lock() as held:
+        if not held:
+            return 0
+        fresh = read_json(record_path(record["chip_id"]))
+        if not fresh:
+            return 0
+        if fresh.get("child_hook_session") in (None, sender):
+            fresh["child_hook_session"] = sender or fresh.get("child_hook_session")
+        # Only the report itself counts. A chip that writes to its parent mid-work would
+        # otherwise mark itself delivered and silence the block that hands the work back.
+        if fresh.get("status") == "handed-off":
+            fresh["delivery_attempted"] = True
+            if not failed:
+                fresh["notified"] = True
+                fresh["notified_ts"] = time.time()
+        try:
+            save_record(fresh)
+        except Exception:
+            pass
     return 0
 
 
@@ -605,6 +927,9 @@ def main():
     finisher = sub.add_parser("finish", help="merge or hand back the chip's work")
     finisher.add_argument("--message", help="one-line summary for the parent")
     finisher.add_argument("--chip", help="chip id, for a chip with no worktree of its own")
+    finisher.add_argument("--child-session", dest="child_session",
+                          help="this session's own sessionId, from get_session self — the only "
+                               "form archive_session accepts")
     finisher.add_argument("--cwd")
 
     closer = sub.add_parser("close", help="record the parent's verdict on a reported chip")
@@ -617,8 +942,10 @@ def main():
     lister.add_argument("--session", help="limit to chips spawned by this sessionId")
     lister.add_argument("--all", action="store_true")
 
+    sub.add_parser("hook-spawn")
     sub.add_parser("hook-stop")
     sub.add_parser("hook-notified")
+    sub.add_parser("hook-notify-failed")
 
     args = parser.parse_args()
     if args.command == "open":
@@ -630,7 +957,11 @@ def main():
     if args.command == "status":
         return cmd_status(args)
     try:
-        return hook_stop() if args.command == "hook-stop" else hook_notified()
+        if args.command == "hook-spawn":
+            return hook_spawn()
+        if args.command == "hook-stop":
+            return hook_stop()
+        return hook_notified(failed=args.command == "hook-notify-failed")
     except Exception:
         return 0
 
