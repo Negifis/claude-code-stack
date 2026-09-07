@@ -247,3 +247,15 @@ raises no floor. The gate-ops session's own closing then hit a fourth pattern: a
 after the 8-hour idle limit discarded the candidate's earlier review rounds, so the ESCALATE
 sequence check failed. Fixed: the idle limit no longer ends a cycle the same branch resumes on a
 file it already holds.
+
+Two reports on 2026-09-07 evening, both about the Stop hook's review-state rules. Session Charon
+(report 77226dfa): a closure packet sent before a round-3 `ESCALATE` was refused as a closure
+("requires round-3 ESCALATE") and then treated as terminal — the ordinary APPROVED the block
+itself had named as the remedy was "review activity after terminal READY", so the candidate had
+no legal move. Fixed: a closure result counts only after the ESCALATE it validates; before one it
+is review activity, never terminal. The gate-ops session's own report a1dc9c22: a native
+reviewer launched into the background (the user had interrupted the foreground launch) delivered
+`VERDICT: APPROVED` in its completion notification, which the hook never read. Fixed: a
+backgrounded native lane is judged from the result its notification carries — HTML-unescaped,
+one verdict across however many notifications the agent sent — and filed at the launch, exactly
+as the Codex binding is. `test_gate.py`: 1170 → 1249.

@@ -132,14 +132,17 @@ review lane per round, chosen in this order:
    judgment is worth more than a second opinion from the model that wrote the code. Run
    `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
    at capacity) means the lane is skipped for this round, not retried.
-2. **The native `adversarial-reviewer`** through `/adversarial-review-internal`, with
-   `run_in_background: false` set explicitly, when Codex is unavailable, reports an outage,
-   fails before a verdict on its one allowed resume, or the user declines it. Say which engine
-   reviewed and why when it was not Codex.
+2. **The native `adversarial-reviewer`** through `/adversarial-review-internal`, in the
+   foreground (`run_in_background: false`) or launched into the background and judged at its
+   completion notification, when Codex is unavailable, reports an outage, fails before a
+   verdict on its one allowed resume, or the user declines it. Say which engine reviewed and
+   why when it was not Codex.
 
 Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict must be
-observable — the native lane as a foreground result, the Codex lane as the rollout log bound at
-its notification — never as a summary you wrote. One ledger and one round
+observable — the native lane as a foreground result or as the result its completion
+notification carries, the Codex lane as the rollout log bound at its notification — never as a
+summary you wrote. A background verdict is filed at the launch: a lasting edit after the launch
+expires it exactly as an edit after a foreground approval does. One ledger and one round
 budget span the lanes: switching engines continues the review, never restarts it. Add at most one specialist
 only for a named non-overlapping risk; the lane that owns the verdict keeps it.
 
@@ -211,6 +214,9 @@ never the whole scope. `CLOSURE_VALIDATION: READY` → terminal `PR_READY`, publ
 validating again. `BLOCKED` at pass 1 must name a new concrete `REMEDIATE`/`REDESIGN` or go
 straight to `DRAFT_BLOCKED`; `BLOCKED` at pass 2, or `REVIEW_UNAVAILABLE` blocking required
 evidence, is terminal `DRAFT_BLOCKED`. Do not restart broad review or repeat an approach.
+A closure packet sent before a round-3 `ESCALATE` is not a closure validation: the hook counts
+it only as review activity, and the ordinary review continues within its round budget. The
+round-3 packet must offer `ESCALATE`; a round-3 `REVISE` leaves no legal closure.
 
 Ask the user only for choices reserved by the authority rules: product intent, acceptance of
 security/data-loss/irreversible risk, protected access or secrets, or an otherwise unauthorized
@@ -260,15 +266,17 @@ running the work.
 The Stop hook is right by default: a missing or misplaced receipt, a `REVISE`, an edit after the
 approval, a lane launched in the wrong mode are your mistakes, not the hook's. An anomaly is a
 block that contradicts facts you can verify in the transcript: the required evidence exists in
-the required shape (a foreground APPROVED after the last lasting edit, the simplify lane's
-result), the hook demands a lane this skill forbids repeating, the same block returns after its
+the required shape (an APPROVED after the last lasting edit — a foreground result, a background
+lane's notification or the Codex rollout — and the simplify lane's result), the hook demands a
+lane this skill forbids repeating, the same block returns after its
 demand was met exactly, the marker names files you never touched, the hook failed or timed out,
 or its advice contradicts the breaker or this skill. Not an anomaly: a lane result that
 belongs to a candidate already closed by a receipt — the block names the candidate that
 opened afterwards, and that one needs its own delta pass.
 
 Order: check the three facts once — the receipt is the last line and well-formed, the last
-lasting edit precedes the verdict, the lanes ran in the foreground — and fix what is yours. If
+lasting edit precedes the verdict, the lanes ran in a shape the hook reads (the simplify lane in
+the foreground; a review lane in the foreground or the background) — and fix what is yours. If
 the block still stands, do not re-run lanes, do not poll, do not argue with the hook: file the
 report and finish honestly.
 

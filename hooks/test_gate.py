@@ -2,6 +2,7 @@
 import atexit
 import datetime
 import glob
+import html
 import io
 import json
 import os
@@ -975,13 +976,11 @@ def notification_text_for(task_id, output_file, status="completed"):
     ).format(task_id, output_file, status, "completed (exit code 0)" if status == "completed" else status)
 
 
-def notification(stamp, task_id, output_file, status="completed"):
-    return entry(stamp, "user", [{"type": "text", "text": notification_text_for(task_id, output_file, status)}])
-
-
-def midturn_notification(stamp, task_id, output_file, status="completed"):
-    """A notification absorbed while the turn was running: queued, attached, never a user turn."""
-    text = notification_text_for(task_id, output_file, status)
+def notification_records(stamp, text, midturn=False):
+    """The records the harness writes for one notification: a user turn when the session was
+    idle; queued, attached and removed, never a user turn, when it was absorbed mid-turn."""
+    if not midturn:
+        return [entry(stamp, "user", [{"type": "text", "text": text}])]
     return [
         {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(stamp), "content": text},
         {"type": "attachment", "timestamp": iso(stamp),
@@ -989,6 +988,14 @@ def midturn_notification(stamp, task_id, output_file, status="completed"):
         {"type": "queue-operation", "operation": "remove", "timestamp": iso(stamp + 0.3), "content": text,
          "reason": "absorbed_mid_turn"},
     ]
+
+
+def notification(stamp, task_id, output_file, status="completed"):
+    return notification_records(stamp, notification_text_for(task_id, output_file, status))[0]
+
+
+def midturn_notification(stamp, task_id, output_file, status="completed"):
+    return notification_records(stamp, notification_text_for(task_id, output_file, status), midturn=True)
 
 
 def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
@@ -1678,6 +1685,35 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
+# --- a Codex launch with a path but no capture (its mark hook was cancelled) must not abort the
+#     scan: everything after the aborting notification went unread, so a later in-flight task
+#     earned no wait and the turn was blocked. Assert the later task is still seen.
+sid = session()
+try:
+    now = time.time()
+    codex_task = "bnocap" + uuid.uuid4().hex[:4]
+    suite_task = "bsuite" + uuid.uuid4().hex[:4]
+    codex_out = os.path.join(tasks_dir, codex_task + ".output")
+    suite_out = os.path.join(tasks_dir, suite_task + ".output")
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    # a background Codex review, path on stdin, but no capture_launch — so no capture file
+    codex_cmd = "codex exec - < /c/tmp/nocap.md  # CODE_WORK_GATE_REVIEW"
+    events.append(bash_use(now - 700, "codex-" + codex_task, codex_cmd, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-" + codex_task, DETACHED_ACK.format(id=codex_task, out=codex_out)))
+    events.append(notification(now - 600, codex_task, codex_out, "completed"))
+    # a later background suite still running: only a completed scan reaches and registers it
+    events.append(bash_use(now - 100, "suite-" + suite_task, "python test_gate.py", run_in_background=True))
+    events.append(tool_result(now - 99, "suite-" + suite_task, DETACHED_ACK.format(id=suite_task, out=suite_out)))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": "waiting for the suite"})
+    check("a capture-less Codex launch does not abort the scan: a later in-flight task still earns a wait",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
 # --- a background lane's verdict is what the rollout log says, not what the output file says
 for label, file_text, logged, expect_bound in (
     ("the rollout, not the output file, states the verdict",
@@ -1772,6 +1808,239 @@ try:
           result.get("continue") is True and "decision" not in result and "background work" not in result.get("systemMessage", ""), result)
 finally:
     cleanup(sid, locals().get("transcript"))
+
+# --- a closure packet sent before round-3 ESCALATE is not a closure validation (report 77226dfa)
+def stop_with(sid, events, receipt):
+    transcript = write_transcript(events)
+    try:
+        return run(STOP_HOOK, {
+            "session_id": sid,
+            "transcript_path": transcript,
+            "last_assistant_message": receipt,
+        })
+    finally:
+        cleanup(sid, transcript)
+
+
+VERIFIED_HIGH = "[gate] verified: HIGH; auth tests and review passed"
+PR_READY = "[gate] pr-ready: branch review/gate"
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", "VERDICT: REVISE")
+add_review(events, 132, "review-2", "VERDICT: REVISE")
+add_review(events, 134, "closure-before-escalate", "CLOSURE_VALIDATION: READY")
+add_review(events, 136, "review-3", review_text("APPROVED"))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("an ordinary APPROVED after a closure packet sent without ESCALATE verifies the candidate",
+      result.get("continue") is True and "decision" not in result, result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", "VERDICT: REVISE")
+add_review(events, 132, "review-2", "VERDICT: REVISE")
+add_review(events, 134, "closure-before-escalate", "CLOSURE_VALIDATION: READY")
+result = stop_with(sid, events, PR_READY)
+check("a closure packet sent without ESCALATE is not terminal and does not open a closure phase",
+      result.get("decision") == "block" and "terminal READY" not in result.get("reason", "")
+      and "requires round-3 ESCALATE or exhausted" in result.get("reason", ""), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", "VERDICT: REVISE")
+add_review(events, 132, "review-2", "VERDICT: REVISE")
+add_review(events, 133, "closure-before-escalate", "CLOSURE_VALIDATION: READY")
+add_review(events, 134, "review-3", "VERDICT: ESCALATE")
+result = stop_with(sid, events, PR_READY)
+check("pr-ready after ESCALATE names the closure packet that came before it",
+      result.get("decision") == "block"
+      and "before the ESCALATE is not a closure validation" in result.get("reason", ""), result)
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+add_review(events, 136, "closure-1", closure_text("READY"))
+result = stop_with(sid, events, PR_READY)
+check("the closure validation after ESCALATE counts although one came before it",
+      result.get("continue") is True and "decision" not in result, result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", review_text("APPROVED"))
+add_review(events, 132, "closure-after-approval", "CLOSURE_VALIDATION: READY")
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a closure packet sent without ESCALATE is still review activity after an approval",
+      result.get("decision") == "block" and "continued after terminal APPROVED" in result.get("reason", ""),
+      result)
+
+# --- a native review lane launched into the background is judged at its notification
+def agent_notification_text(task_id, result, status="completed"):
+    return (
+        "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>toolu_a</tool-use-id>\n"
+        "<output-file>C:/tasks/{}.output</output-file>\n<status>{}</status>\n"
+        "<summary>Agent \"review\" finished</summary>\n<result>{}</result>\n</task-notification>"
+    ).format(task_id, task_id, status, html.escape(result, quote=False))
+
+
+def agent_notification(stamp, task_id, result, status="completed", midturn=False):
+    return notification_records(stamp, agent_notification_text(task_id, result, status), midturn)
+
+
+def add_background_review(events, stamp, call_id, agent_id):
+    events.append(agent_use(stamp, "adversarial-reviewer", call_id, run_in_background=True))
+    events.append(tool_result(stamp + 0.5, call_id,
+                              "Async agent launched successfully. (This tool result is internal metadata.)\n"
+                              "agentId: {} (internal ID - do not mention to user.)".format(agent_id)))
+
+
+PROBED = "Probe timings: 3000 notes then a non-note line: <15 ms; `[^\\r\\n]*?` cannot cross a line.\n\n"
+
+for label, notices, receipt, expect_ok, expect_reason in (
+    ("a background lane's verdict is read from its notification result, escaping undone",
+     [(140, PROBED + review_text("APPROVED"), "completed", False)], VERIFIED_HIGH, True, ""),
+    ("a lane that first stopped to wait for its own suite and then approved is one verdict",
+     [(135, "Everything independent has been gathered; waiting for the suite.", "completed", False),
+      (140, review_text("APPROVED"), "completed", False)], VERIFIED_HIGH, True, ""),
+    ("the notification absorbed mid-turn carries the verdict too, its three records one notice",
+     [(140, review_text("APPROVED"), "completed", True)], VERIFIED_HIGH, True, ""),
+    ("a lane that completed without a verdict is review activity without an approval",
+     [(140, "No verdict line here.", "completed", False)], VERIFIED_HIGH, False, "lacks a current APPROVED"),
+    ("a killed lane is a failed lane",
+     [(140, "", "killed", False)], VERIFIED_HIGH, False, "lacks a current APPROVED"),
+    ("a second verdict from the same lane is activity after the first",
+     [(135, review_text("APPROVED"), "completed", False),
+      (140, review_text("REVISE"), "completed", False)], VERIFIED_HIGH, False, "continued after terminal APPROVED"),
+    ("the same verdict stated again by a resumed lane is activity after the first",
+     [(135, review_text("APPROVED"), "completed", False),
+      (140, review_text("APPROVED", "the candidate, once more"), "completed", False)], VERIFIED_HIGH, False,
+     "continued after terminal APPROVED"),
+    ("a stop between two identical statements of the verdict is activity after the first",
+     [(135, review_text("APPROVED"), "completed", False),
+      (140, "", "stopped", False),
+      (145, review_text("APPROVED"), "completed", False)], VERIFIED_HIGH, False, "continued after terminal APPROVED"),
+    ("a resumed agent restating a byte-identical APPROVED is activity after the first",
+     [(135, review_text("APPROVED"), "completed", False),
+      (145, review_text("APPROVED"), "completed", False)], VERIFIED_HIGH, False, "continued after terminal APPROVED"),
+):
+    sid = session()
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    add_background_review(events, 130, "bg-review", "agent-" + label[:6].replace(" ", "-"))
+    for stamp, text, status, midturn in notices:
+        events.extend(agent_notification(stamp, "agent-" + label[:6].replace(" ", "-"), text, status, midturn))
+    result = stop_with(sid, events, receipt)
+    ok = result.get("continue") is True and "decision" not in result
+    check(label, ok if expect_ok else (result.get("decision") == "block"
+                                      and expect_reason in result.get("reason", "")), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"], durable_ts=135)
+events = base_events(include_simplify=True)
+add_background_review(events, 130, "bg-review", "agent-edited")
+events.extend(agent_notification(140, "agent-edited", review_text("APPROVED")))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a background verdict is filed at the launch: a lasting edit after the launch expires it",
+      result.get("decision") == "block" and "lacks a current APPROVED" in result.get("reason", ""), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"], durable_ts=125)
+events = base_events(include_simplify=True)
+add_background_review(events, 130, "bg-review", "agent-clean")
+events.extend(agent_notification(140, "agent-clean", review_text("APPROVED")))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a lasting edit before the launch does not expire the background verdict",
+      result.get("continue") is True and "decision" not in result, result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 125, "review-1", review_text("APPROVED"))
+add_background_review(events, 130, "bg-review", "agent-stopped")
+events.append(entry(140, "assistant", [{"type": "tool_use", "id": "stop-1", "name": "TaskStop",
+                                        "input": {"task_id": "agent-stopped"}}]))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a background lane stopped by hand is failed activity that reopens an earlier approval",
+      result.get("decision") == "block" and "continued after terminal APPROVED" in result.get("reason", ""),
+      result)
+
+# What a lane does after stating its verdict is activity after it (Codex R1-001)
+for label, later, receipt, expect_reason in (
+    ("a lane stopped by hand after stating APPROVED reopens that approval",
+     [("stop", 145)], VERIFIED_HIGH, "continued after terminal APPROVED"),
+    ("a lane killed after stating APPROVED reopens that approval",
+     [("notice", 145, "", "killed")], VERIFIED_HIGH, "continued after terminal APPROVED"),
+    ("a lane that went on without a verdict after stating APPROVED reopens that approval",
+     [("notice", 145, "One more thought, no verdict.", "completed")], VERIFIED_HIGH,
+     "continued after terminal APPROVED"),
+):
+    sid = session()
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    events = base_events(include_simplify=True)
+    add_background_review(events, 130, "bg-review", "agent-later")
+    events.extend(agent_notification(140, "agent-later", review_text("APPROVED")))
+    for item in later:
+        if item[0] == "stop":
+            events.append(entry(item[1], "assistant", [{"type": "tool_use", "id": "stop-later", "name": "TaskStop",
+                                                        "input": {"task_id": "agent-later"}}]))
+        else:
+            events.extend(agent_notification(item[1], "agent-later", item[2], item[3]))
+    result = stop_with(sid, events, receipt)
+    check(label, result.get("decision") == "block" and expect_reason in result.get("reason", ""), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", "VERDICT: REVISE")
+add_review(events, 132, "review-2", "VERDICT: REVISE")
+add_review(events, 134, "review-3", "VERDICT: ESCALATE")
+add_background_review(events, 136, "bg-closure", "agent-closure")
+events.extend(agent_notification(140, "agent-closure", closure_text("READY")))
+events.append(entry(145, "assistant", [{"type": "tool_use", "id": "stop-closure", "name": "TaskStop",
+                                        "input": {"task_id": "agent-closure"}}]))
+result = stop_with(sid, events, PR_READY)
+check("a closure lane stopped after stating READY is activity after the terminal READY",
+      result.get("decision") == "block" and "continued after terminal READY" in result.get("reason", ""), result)
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events.extend(agent_notification(150, "agent-closure", closure_text("READY")))
+result = stop_with(sid, events, PR_READY)
+check("READY stated again after the stop does not hide the stop",
+      result.get("decision") == "block" and "continued after terminal READY" in result.get("reason", ""), result)
+
+# C-002: a rollout line that is valid JSON of the wrong type must not fail the scan
+check("json_record returns a dict for a non-dict JSON line that passes the token guard",
+      gate.json_record('"message"') == {} and gate.json_record('["agent_message"]') == {}
+      and gate.json_record('{"message": "hi"}') == {"message": "hi"},
+      (gate.json_record('"message"'), gate.json_record('["agent_message"]')))
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_background_review(events, 130, "bg-review", "agent-resumed")
+events.extend(agent_notification(135, "agent-resumed", "", "killed"))
+events.extend(agent_notification(140, "agent-resumed", review_text("APPROVED")))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a lane killed and then resumed to its verdict is that verdict",
+      result.get("continue") is True and "decision" not in result, result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_background_review(events, 90, "bg-review-old", "agent-early")
+events.extend(agent_notification(140, "agent-early", review_text("APPROVED")))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("a lane launched before the candidate opened lends it no verdict",
+      result.get("decision") == "block", result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_background_review(events, time.time() - 100, "bg-review", "agent-running")
+result = stop_with(sid, events, "Waiting for the review lane.")
+check("a background review lane still running lets the turn end",
+      result.get("continue") is True and "decision" not in result, result)
 
 # --- the acknowledgement's note lines: exact wording, nothing riding on them, no search on a near miss
 NOTE_LINE = "Session cwd remains C:/tmp; directory changes made by the backgrounded command do not apply to subsequent commands."

@@ -47,7 +47,7 @@ Resolved from the 2.1.179 binary, not from convention:
 | `policySettings` | managed settings | enterprise, wins over everything |
 
 `~/.claude/settings.local.json` is **not** a global file. It is the project-local file of the
-`C:\Users\you` directory and applies only to sessions started there — which is why the
+`C:\Users\in` directory and applies only to sessions started there — which is why the
 permissions Claude Code auto-saved from prompts in the home directory do not carry to other
 projects. Every genuinely global parameter belongs in `~/.claude/settings.json`.
 
@@ -72,7 +72,7 @@ inventory script that measures the listing cost lives with the stage-2 backup.
 |---|---|---|
 | `hooks/code_work_gate_mark.py` | `PreToolUse`/`PostToolUse`/`PostToolUseFailure` on edits and shell | Marks the candidate (paths, class, risk floor); on `PostToolUse` injects one line when a candidate opens or its floor rises, and records a Codex outage from a finished foreground `codex exec` call (the Stop hook records it for a background lane, from the stderr capture the command named, when its notification brings no verdict). A verdict expires through an unresolved pre-command snapshot only for a write-capable command: anything not proven read-only (an allowlist per pipeline segment — `ls`, `cat`, `grep`, `wc`, git's reading subcommands…; any redirect other than a discarded or merged stderr, substitution, heredoc or script block counts as writing). The marker also keeps a fingerprint of its lasting paths at every durable change (`content_marks`), so a verdict given before an edit that was reverted byte for byte still covers the candidate. An unattributed change under a root the command neither ran in nor names (another session's edit seen through the shared home) raises no floor. A cycle the same branch resumes after the idle limit keeps its rounds and its spent block and wait budgets alike — the accepted trade for not losing review evidence overnight. |
 | `hooks/code_work_gate_prompt.py` | `UserPromptSubmit` | One line naming the open candidate's class, floor and receipt shape; silent when nothing is open. |
-| `hooks/code_work_gate_stop.py` | `Stop` | The finite validator: skill invoked, one simplify lane for HIGH, legal review transitions, fresh approval for HIGH, receipt; three blocks per unchanged candidate. A backgrounded Codex lane is bound at its `<task-notification>` to the verdict one briefed Codex session stated in the rollout log between launch and notification (the output file is not evidence); a turn may end while the session's own background task is in flight (eight waits per candidate, two hours per task, `TaskStop`/`failed` recorded as failed activity). |
+| `hooks/code_work_gate_stop.py` | `Stop` | The finite validator: skill invoked, one simplify lane for HIGH, legal review transitions, fresh approval for HIGH, receipt; three blocks per unchanged candidate. A backgrounded Codex lane is bound at its `<task-notification>` to the verdict one briefed Codex session stated in the rollout log between launch and notification (the output file is not evidence); a backgrounded native reviewer is judged from the result its notification carries, filed at the launch, and whatever the lane does after stating its verdict — stopped, killed, resumed without one — is activity after it; a closure result with no round-3 ESCALATE before it is review activity, never a closure; a turn may end while the session's own background task is in flight (eight waits per candidate, two hours per task, `TaskStop`/`failed` recorded as failed activity). |
 | `state/gate-events.jsonl` | written by the gate hooks | Append-only ledger of gate decisions (`close`, `wait`, `block`, `review`, `durable`), one JSON line each, rotated once at 1 MB. Read it to see why a session was blocked without replaying the transcript. |
 | `hooks/codex_lane.py` | CLI + used by the marker | Circuit breaker for the Codex lane: `check` prints `CODEX_LANE: available` or the recorded outage; `record`/`clear` by hand. State in `state/codex-lane.json`. |
 | `hooks/gate_inbox.py` | CLI + `SessionStart` (digest) | Anomaly inbox `state/gate-anomalies.jsonl`: `report` files an agent's disagreement with a block (with the marker, the state, the session's ledger tail and the Stop hook's own view of the transcript); `scan` derives anomalies from the ledger by fixed rules; `list`/`show`/`ack` triage; `register` makes the calling session the gate-ops session (`state/gate-ops-session.json`) that `report` tells the agent to message with `mcp__ccd_session_mgmt__send_message`; `digest` injects the unresolved ones into a session started from `~/.claude` as the fallback. |
@@ -164,9 +164,9 @@ delivery outright, and a chip must not be held hostage to a send that cannot suc
 ## Windows tooling
 
 Raw ripgrep when plain `rg` is unavailable:
-the absolute path to `rg.exe`.
+`C:\tools\ripgrep-15.1.0-x86_64-pc-windows-msvc\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe`.
 Python for hooks and scripts:
-the absolute path to the interpreter the hooks were installed with.
+`C:\Users\in\AppData\Local\Programs\Python\Python312\python.exe`.
 Route shell specifics through the `local-windows-tooling` skill.
 
 ## GitLab credentials in a Claude Code session

@@ -18,6 +18,7 @@ cycle is retired as unverified, preventing an infinite Stop loop.
 import datetime
 import fnmatch
 import hashlib
+import html
 import glob
 import json
 import math
@@ -74,6 +75,8 @@ PRE_CANDIDATE_TOKENS = (
 NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
+# An agent's notification carries its final message, HTML-escaped, as the result.
+NOTIFICATION_RESULT_RE = re.compile(r"<result>(.*?)</result>", re.S)
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
@@ -395,9 +398,10 @@ def json_record(line):
     if '"message"' not in line and '"agent_message"' not in line:
         return {}
     try:
-        return json.loads(line)
+        record = json.loads(line)
     except Exception:
         return {}
+    return record if isinstance(record, dict) else {}
 
 
 def record_time(line):
@@ -513,8 +517,15 @@ def packet_of_launch(command, call_id):
     if not launch["path"]:
         return True, ""
     capture = cwg.read_json(cwg.packet_capture_path(_SESSION["key"], str(call_id or "")))
-    text = capture.get("text") if isinstance(capture, dict) else ""
-    if not isinstance(text, str) or capture.get("truncated"):
+    # A missing capture reads as None, not a dict — a launch whose PreToolUse mark hook was
+    # cancelled (it can run tens of seconds) leaves none. Guard the whole record before any
+    # field access: dereferencing None here aborted the entire Stop scan, and everything after
+    # the aborting notification went unread, so a later in-flight task earned no wait and the
+    # turn was blocked with no receipt instead.
+    if not isinstance(capture, dict) or capture.get("truncated"):
+        return True, ""
+    text = capture.get("text")
+    if not isinstance(text, str):
         return True, ""
     role = reviewer_role()
     distinctive = " ".join((text.replace(role, " ") if role else text).split())
@@ -600,6 +611,49 @@ def record_control(evidence, stamp, control, malformed=False):
     evidence["review_events"].append((stamp, control_kind, control_value))
 
 
+def judge_background_agents(evidence, launches, notices_by_task):
+    """File each backgrounded native review lane once all its notifications are read.
+
+    The verdict is the control line in the notification's result — the harness's own record of
+    the agent's final message, HTML-escaped there — filed at the launch exactly as a background
+    Codex verdict is: nothing edited after the launch was read by the lane, so a durable edit
+    since then expires it. An agent notifies once per stop, and one that paused to wait for its
+    own background suite reports first without a verdict, so the first notice that states a
+    verdict is the lane's verdict. Everything the lane says after it — a resumed agent
+    stopped, killed, answering without a verdict, or stating a verdict again — is activity
+    after the verdict, exactly as a second foreground call would be. No verdict at all is the
+    same activity a foreground result without one is; a lane whose last word was a kill or a
+    stop is a failed lane.
+    """
+    for task_id, notices in notices_by_task.items():
+        launch = launches[task_id]
+        notices = sorted(notices, key=lambda item: item[0])
+        first = next(
+            (index for index, (_, _, control) in enumerate(notices)
+             if control is not None and control[0] in ("ordinary", "closure")),
+            None,
+        )
+        if first is not None:
+            stamp, _, control = notices[first]
+            record_control(evidence, launch["started"], control)
+            review_note(at=stamp, engine="native-background", verdict=control[1],
+                        task=task_id)
+            notices = notices[first + 1:]
+            reason = "the lane went on after stating its verdict"
+        else:
+            reason = "no verdict in the lane's completion notifications"
+        if not notices:
+            continue
+        last_stamp, last_status, _ = notices[-1]
+        if last_status == "completed":
+            record_control(evidence, last_stamp, ("malformed", None), malformed=True)
+        else:
+            evidence["review_failures"].append(last_stamp)
+            record_control(evidence, last_stamp, ("failure", None), malformed=True)
+        review_note(at=last_stamp, engine="native-background", verdict=None, task=task_id,
+                    status=last_status, reason=reason)
+
+
 def transcript_evidence(path, since, skill_since=None):
     """Collect protocol evidence for a candidate.
 
@@ -633,6 +687,11 @@ def transcript_evidence(path, since, skill_since=None):
     # the call that started it. A marked Codex launch that went to the background is judged
     # when its notification arrives, from the output file the harness wrote for it.
     background_calls = {}
+    # Native review agents launched into the background, keyed by the agent id the harness
+    # gave at launch, with every notification each one sent: judged after the scan, since an
+    # agent that stops to wait for its own background suite notifies without a verdict first.
+    background_agents = {}
+    agent_notices = {}
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
             for raw in stream:
@@ -663,6 +722,26 @@ def transcript_evidence(path, since, skill_since=None):
                             if task_id.startswith("__orphan"):
                                 continue
                             evidence["background_done"][task_id] = (stamp, status)
+                            if (
+                                task_id in background_agents and not stamp + 1 < since
+                                and entry.get("type") in ("user", "attachment")
+                            ):
+                                # One notice per physical delivery: the absorbed command
+                                # (`attachment`) or the idle turn (`user`). The enqueue and the
+                                # later `absorbed_mid_turn` remove are the same text as
+                                # bookkeeping and would double-count a single delivery, or —
+                                # since the remove can lag — invent a second verdict; a resumed
+                                # agent's identical verdict is a new attachment, counted as
+                                # activity after the first. Only a completed lane's result is a
+                                # result; a killed or failed one's control is never read.
+                                found = NOTIFICATION_RESULT_RE.search(notice)
+                                control = (
+                                    reviewer_control(html.unescape(found.group(1) if found else ""))
+                                    if status == "completed" else None
+                                )
+                                agent_notices.setdefault(task_id, []).append(
+                                    (stamp, status, control)
+                                )
                             call = background_calls.pop(task_id, None)
                             if not call or stamp + 1 < since:
                                 continue
@@ -732,6 +811,10 @@ def transcript_evidence(path, since, skill_since=None):
                             stopped = str(payload.get("task_id") or "")
                             if stopped:
                                 evidence["background_done"][stopped] = (stamp, "stopped")
+                                if stopped in background_agents:
+                                    agent_notices.setdefault(stopped, []).append(
+                                        (stamp, "stopped", None)
+                                    )
                                 call = background_calls.pop(stopped, None)
                                 if call:
                                     # A review lane stopped by hand is failed lane activity,
@@ -827,6 +910,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 "label": call.get("label", "") if call else "",
                                 "review": bool(call and call["kind"] == "review"),
                             }
+                            if call and call["kind"] == "review":
+                                background_agents[launched.group(1)] = call
                             continue
                     if call is None:
                         continue
@@ -891,6 +976,7 @@ def transcript_evidence(path, since, skill_since=None):
                     if control[0] in ("ordinary", "closure"):
                         review_note(at=stamp,
                                       engine="native", verdict=control[1])
+        judge_background_agents(evidence, background_agents, agent_notices)
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
         # record: an approval early in the cycle would otherwise outlive the REVISE that
@@ -1380,11 +1466,27 @@ def evaluate_receipt(receipt, entry, evidence):
 
     current = lambda stamp: content_covers(entry, stamp, durable_ts)  # noqa: E731
     review_start = active_review_start(evidence, lambda stamp: not current(stamp))
-    ordinary_reviews = [
+    # Sorted by the moment each verdict is filed at: a background lane's verdict is filed at
+    # its launch once its notification is read, after every result that returned in between.
+    ordinary_reviews = sorted(
         item for item in evidence["ordinary_reviews"] if item[0] > review_start
-    ]
+    )
     ordinary_verdicts = [verdict for _, verdict in ordinary_reviews]
-    closure_verdicts = [verdict for _, verdict in evidence["closure_reviews"]]
+    # A closure validation exists only after the round-3 ESCALATE whose recovery it checks. A
+    # closure packet sent before one — round 3 ended REVISE, the packet offered the wrong
+    # shape — is a reviewer result of the wrong kind: it stays review activity, which retires
+    # an earlier approval, but it is neither terminal nor the start of a closure phase.
+    # Counting it as one left the candidate no legal move: the block that refused the closure
+    # named an ordinary APPROVED as the remedy, and the next block called that approval
+    # activity after a terminal READY (report 77226dfa).
+    escalated_at = max(
+        (stamp for stamp, verdict in ordinary_reviews if verdict == "ESCALATE"), default=None
+    )
+    closure_reviews = sorted(
+        item for item in evidence["closure_reviews"]
+        if escalated_at is not None and item[0] > escalated_at
+    )
+    closure_verdicts = [verdict for _, verdict in closure_reviews]
 
     if len(ordinary_verdicts) > MAX_REVIEW_ROUNDS:
         return False, "ordinary review exceeded MAX_REVIEW_ROUNDS={}".format(
@@ -1443,7 +1545,7 @@ def evaluate_receipt(receipt, entry, evidence):
             ).format(SIMPLIFY_LANE, " (the last attempt failed)" if attempted else "")
 
     ordinary_ts, ordinary_verdict = latest(ordinary_reviews)
-    closure_ts, closure_verdict = latest(evidence["closure_reviews"])
+    closure_ts, closure_verdict = latest(closure_reviews)
     failed_ts = max(evidence["review_failures"], default=0.0)
     current_failure = current(failed_ts)
     required_external_calls = [
@@ -1489,11 +1591,6 @@ def evaluate_receipt(receipt, entry, evidence):
         stamp > closure_ts for stamp, _, _ in evidence["review_events"]
     ):
         return False, "review activity continued after terminal READY"
-    if evidence["closure_reviews"]:
-        if ordinary_verdict != "ESCALATE":
-            return False, "closure validation requires round-3 ESCALATE"
-        if any(stamp <= ordinary_ts for stamp, _ in evidence["closure_reviews"]):
-            return False, "closure validation must occur after round-3 ESCALATE"
 
     expected_escalation = (
         ["REVISE"] * (MAX_REVIEW_ROUNDS - 1) + ["ESCALATE"]
@@ -1539,6 +1636,11 @@ def evaluate_receipt(receipt, entry, evidence):
 
     if kind == "pr-ready":
         if not (closure_verdict == "READY" and current(closure_ts)):
+            if evidence["closure_reviews"] and not closure_reviews:
+                return False, (
+                    "pr-ready lacks a CLOSURE_VALIDATION: READY after round-3 ESCALATE "
+                    "(a closure packet sent before the ESCALATE is not a closure validation)"
+                )
             return False, "pr-ready lacks current CLOSURE_VALIDATION: READY"
         return True, "pr-ready"
 
@@ -1607,7 +1709,8 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "completion requires one adversarial APPROVED result newer than the final edit to a "
             "lasting artifact, from the Codex lane (/adversarial-review, launched in the "
             "background; run `codex_lane.py check` first and skip straight to the native lane "
-            "on a recorded outage) or the native reviewer (/adversarial-review-internal). "
+            "on a recorded outage) or the native reviewer (/adversarial-review-internal, in "
+            "the foreground or launched in the background and judged at its notification). "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
         )
