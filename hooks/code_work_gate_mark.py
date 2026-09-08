@@ -888,13 +888,19 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
             cycle["head_at_start"] = head_commit(cwd)
             cycle["refs_at_start"] = cwg.refs_digest(cwd)
     if last_durable_ts == now:
-        # A change the snapshot could not attribute may have touched anything, so the content
-        # after it is unknown; a named edit leaves the lasting paths' bytes to be measured.
-        fingerprint = (
-            None if (unattributed_risk or not cwg.durable_paths(incoming))
-            else content_fingerprint(paths)
-        )
-        content_marks = content_marks_after(content_marks, now, fingerprint)
+        # A change the snapshot could not attribute may have touched anything, so it is a
+        # barrier — but the bytes of the recorded paths are still measurable, and measuring
+        # them is what lets a verdict stated afterwards be shown to cover. Recording no
+        # fingerprint at all used to erase the baseline: a verdict that followed such a
+        # command could never be proved current, and the next named edit — a `git add` of the
+        # very bytes the reviewer read — retired it (reports 877f7bf2, f5f9116f, 3d343b8b,
+        # dfa8a850). So the flag and the measurement are now separate. Measuring on every
+        # unattributed change costs the git calls the old short-circuit saved; the cost is
+        # bounded by FINGERPRINT_MAX_FILES and is skipped outright while the candidate holds no
+        # durable path, which is the common case for a shell mutation before any edit.
+        unknown = bool(unattributed_risk or not cwg.durable_paths(incoming))
+        fingerprint = content_fingerprint(paths)
+        content_marks = content_marks_after(content_marks, now, fingerprint, unknown)
         cwg.log_event(
             "durable", session=cwg.session_key(data.get("session_id")),
             reason=("edit" if cwg.durable_paths(incoming) else
@@ -1150,11 +1156,29 @@ def staged_divergences(directory, names):
     return divergent
 
 
-def content_marks_after(marks, now, fingerprint):
-    """The marks with this change appended: a new one only when the content actually differs."""
+def content_marks_after(marks, now, fingerprint, unknown=False):
+    """The marks with this change appended: a new one when the content or the barrier state moves.
+
+    `unknown` says the change could not be attributed, so it is a barrier no verdict older than
+    it may cross. It is recorded beside the measurement rather than instead of it: the bytes of
+    the recorded paths are still what they are, and a verdict stated after the barrier is judged
+    against them. An unattributed change always gets its own mark, and so does the first
+    measurement after one, so neither transition is swallowed by the equal-content shortcut.
+    A fingerprint that could not be measured at all never counts as equal to an earlier
+    unmeasurable one either, attributed or not: two blanks say nothing about the same bytes.
+    """
     kept = [mark for mark in (marks or []) if isinstance(mark, dict)]
-    if not kept or fingerprint is None or kept[-1].get("fp") != fingerprint:
-        kept.append({"ts": now, "fp": fingerprint})
+    mark = {"ts": now, "fp": fingerprint}
+    if unknown:
+        mark["unknown"] = True
+    if (
+        not kept
+        or unknown
+        or fingerprint is None
+        or kept[-1].get("fp") != fingerprint
+        or kept[-1].get("unknown")
+    ):
+        kept.append(mark)
     return kept[-CONTENT_MARKS_KEPT:]
 
 

@@ -1376,6 +1376,14 @@ for label, command, expect_high in (
             data = cwg.read_json(marker) or {}
             check(label, bool(data.get("unattributed_durable")) is expect_high
                   and (foreign.replace(chr(92), "/").lower() not in [x.lower() for x in data.get("paths") or []]), data)
+            if expect_high:
+                # The whole marker is written or nothing is: record_paths runs behind a fail-open
+                # `except`, so a mistake here leaves no marker and silently disables the gate
+                # instead of blocking. Assert the real event reached the mark, flagged. `fp` may
+                # legitimately be None — this candidate holds no measurable durable path yet.
+                recorded = data.get("content_marks") or []
+                check("an unattributed event writes a flagged mark instead of failing the hook open",
+                      bool(recorded) and recorded[-1].get("unknown") is True, recorded)
             os.remove(foreign)
             cwg.retire_claims(other)
         finally:
@@ -1509,10 +1517,17 @@ with tempfile.TemporaryDirectory(prefix="cwg_unborn_") as unborn:
 
 # --- a verdict covers content: an edit reverted byte-for-byte leaves the approval in place
 def marker_with_marks(sid, marks):
+    """`marks` are (ts, fp) or (ts, fp, unknown) — the third field flags an unattributed change."""
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=marks[-1][0], durable_ts=marks[-1][0])
     marker, _ = gate_paths(sid)
     data = cwg.read_json(marker)
-    data["content_marks"] = [{"ts": stamp, "fp": fp} for stamp, fp in marks]
+    written = []
+    for mark in marks:
+        record = {"ts": mark[0], "fp": mark[1]}
+        if len(mark) > 2 and mark[2]:
+            record["unknown"] = True
+        written.append(record)
+    data["content_marks"] = written
     cwg.write_json(marker, data)
 
 
@@ -1527,6 +1542,10 @@ for label, marks, verdict_at, expect in (
      [(110.0, "fpA"), (150.0, None), (160.0, "fpB"), (170.0, "fpA")], 120.0, False),
     ("a verdict given once the content was measured again covers a later edit-and-revert",
      [(110.0, "fpA"), (150.0, None), (160.0, "fpA"), (170.0, "fpB"), (180.0, "fpA")], 165.0, True),
+    ("an unattributed change before the verdict keeps its measurement as the baseline",
+     [(110.0, "fpA"), (150.0, "fpA", True), (180.0, "fpA")], 160.0, True),
+    ("an unattributed change after the verdict is a barrier even though it measured the content",
+     [(110.0, "fpA"), (180.0, "fpA", True)], 160.0, False),
     ("a marker without content marks keeps the strict timestamp rule",
      [], 120.0, False),
 ):
@@ -1545,6 +1564,22 @@ for label, marks, verdict_at, expect in (
         check(label, allowed is expect, result)
     finally:
         cleanup(sid, locals().get("transcript"))
+
+marks = marker_hook.content_marks_after([], 100.0, "fpA")
+marks = marker_hook.content_marks_after(marks, 110.0, "fpA")
+check("an unchanged measurement adds no mark", len(marks) == 1, marks)
+marks = marker_hook.content_marks_after(marks, 120.0, "fpA", True)
+check("an unattributed change is marked and still carries its measurement",
+      len(marks) == 2 and marks[-1]["fp"] == "fpA" and marks[-1].get("unknown") is True, marks)
+marks = marker_hook.content_marks_after(marks, 130.0, "fpA")
+check("the first measurement after a barrier is recorded, not swallowed as unchanged",
+      len(marks) == 3 and not marks[-1].get("unknown") and marks[-1]["fp"] == "fpA", marks)
+marks = marker_hook.content_marks_after(marks, 140.0, None, True)
+check("an unattributed change git could not measure is still a barrier",
+      len(marks) == 4 and marks[-1]["fp"] is None and marks[-1].get("unknown") is True, marks)
+marks = marker_hook.content_marks_after(marks, 150.0, None, False)
+check("an attributed edit that could not be measured never counts as equal to an earlier blank",
+      len(marks) == 5 and marks[-1]["fp"] is None and not marks[-1].get("unknown"), marks)
 
 with tempfile.TemporaryDirectory(prefix="cwg_marks_") as tree:
     sid = session()

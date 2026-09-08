@@ -1384,6 +1384,15 @@ def latest(events):
     return max(events, default=(0.0, None), key=lambda item: item[0])
 
 
+def unknown_mark(mark):
+    """Whether a content mark is a barrier: an unattributed change, or an unmeasurable one.
+
+    COMPAT: markers written before the flag existed encoded a barrier as a missing fingerprint,
+    so a mark without a string `fp` still reads as one.
+    """
+    return bool(mark.get("unknown")) or not isinstance(mark.get("fp"), str)
+
+
 def content_at(entry, stamp):
     """The fingerprint the candidate's lasting paths had at this moment, or None when unknown."""
     current = None
@@ -1406,7 +1415,10 @@ def content_covers(entry, stamp, durable_ts):
     the last durable change covers it. A change the snapshot could not attribute is a barrier
     in its own right: the fingerprint measures only the recorded paths, so an equal fingerprint
     after such a change proves nothing about what it touched, and only a fresh verdict crosses
-    it.
+    it. Before a verdict such a change is no barrier at all — the reviewer read the state it
+    left behind — so the mark keeps its measurement and still serves as the baseline. Recording
+    no measurement there erased the baseline outright, and the next named edit (a `git add` of
+    the very bytes the reviewer read) then retired a verdict nothing had invalidated.
     """
     if stamp >= durable_ts:
         return True
@@ -1420,7 +1432,7 @@ def content_covers(entry, stamp, durable_ts):
     if now_fp is None or content_at(entry, stamp) != now_fp:
         return False
     return not any(
-        float(mark["ts"]) > stamp and not isinstance(mark.get("fp"), str) for mark in marks
+        float(mark["ts"]) > stamp and unknown_mark(mark) for mark in marks
     )
 
 
