@@ -1736,9 +1736,12 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     cwg.retire_claims(session_key_)
     try:
         import code_work_gate_mark as mark
-    except ImportError:
-        # The marker may be replaced or broken independently; the cycle still closes. A fault
-        # inside the sweep itself is a defect and is left to surface.
+    except Exception:
+        # Only the import is forgiven, and every way it can fail: the marker is edited in this
+        # very repository, so a half-written file raises SyntaxError rather than ImportError,
+        # and letting that escape would abandon the close after the block budget was already
+        # reset - the candidate would never retire and the three-block cap would stop biting.
+        # The sweep itself stays outside: a fault in it is a defect and must surface.
         mark = None
     if mark is not None:
         mark.forget_stale_captures(session_key_)
