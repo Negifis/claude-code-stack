@@ -1122,6 +1122,39 @@ REPLAY_CLEAN = "clean"
 REPLAY_RESOLVED = "resolved"
 
 
+def replaced_tip(cwd, branch, finishes):
+    """(tip the rebase replaced, commit it replayed onto) from this branch own reflog.
+
+    A branch ref moves once per rebase, at the finish, whatever HEAD was doing: the entry that
+    many finishes down is the rebase that this command started with, and the entry below it is
+    what the branch pointed at before any of it. The finish also records what it replayed onto,
+    which is the other end of the range the resolution has to be looked for in; a git that stops
+    recording it costs the scope, not the judgement. Entries that are not finishes are stepped
+    over, because a command that committed after its rebase moved the branch again.
+    """
+    listing = cwg.git_text(
+        cwd, ["reflog", "show", "--format=%H %gs", "-n", str(REBASE_REFLOG_SCAN), branch],
+        timeout=5,
+    )
+    if listing is None:
+        return None, None
+    entries = [line.partition(" ") for line in listing.splitlines()]
+    marker = "(finish): {} onto ".format(branch)
+    at = -1
+    for _ in range(finishes):
+        at = next((step for step, (_, _, message) in enumerate(entries)
+                   if step > at and marker in message), None)
+        if at is None:
+            return None, None
+    if at + 1 >= len(entries):
+        return None, None
+    replaced = entries[at + 1][0]
+    onto = entries[at][2].rsplit(" ", 1)[-1]
+    if not re.fullmatch(r"[0-9a-f]{40}", replaced):
+        return None, None
+    return replaced, (onto if re.fullmatch(r"[0-9a-f]{40}", onto) else None)
+
+
 def finished_rebase(cwd, before_head):
     """What a completed rebase did to the candidate's commits, or None when none finished here.
 
@@ -1136,7 +1169,7 @@ def finished_rebase(cwd, before_head):
     it reads `-`, which is right: nobody wrote anything.
 
     Detection is deliberately narrow, because outside a rebase the same signals mean other
-    things. The reflog must show a rebase that finished inside this command's window - an
+    things. HEAD's reflog must show a rebase that finished inside this command's window - an
     aborted one says `(abort)` and leaves HEAD where it was, one stopped at a conflict says
     nothing yet and leaves `rebase-merge` behind, and both keep the behaviour they already had -
     and anything git cannot answer inside its budget returns None, which is also today's
@@ -1144,13 +1177,14 @@ def finished_rebase(cwd, before_head):
     because `git pull --rebase`, which is how a branch is usually brought forward, writes the
     whole pull command line as the reflog action and only then `(finish): returning to`.
 
-    The tip the patches are compared against is the rebase own starting point, read from the
-    entry the reflog keeps directly below the `(start): checkout` it wrote - the value HEAD held
-    before the rebase touched it. Not the commit this command started on, which for a conflict
-    stopped in one command and continued in the next is the half-rebased state and would read as
-    a faithful replay of nothing; and not `ORIG_HEAD`, which names the same commit until any
-    bare `git reset` during the stop overwrites it and hands the resolution the same false clean.
-    A rebase whose start has fallen out of the scan is not judged at all.
+    What the patches are compared against is the tip that was replaced, and that is read from the
+    reflog of the branch the finish names, never from HEAD's own movement. The branch ref moves
+    exactly once per rebase, at the finish, so the entry below that one is what the branch
+    pointed at before - true of `git rebase <upstream> <branch>` run from somewhere else, where
+    HEAD was never on the rebased branch at all, and unaffected by a bare `git reset` during a
+    stop, which rewrites `ORIG_HEAD` but no branch. One command can finish several rebases of
+    one branch; they are one replay to the candidate, so the oldest finish inside the window
+    decides. A rebase of a detached HEAD, or one whose branch keeps no reflog, is not judged.
 
     RESIDUAL RISK, accepted deliberately: a clean rebase still changes the bytes of a candidate
     file whenever the upstream touched the same file and git combined both edits textually
@@ -1173,20 +1207,12 @@ def finished_rebase(cwd, before_head):
     # The entry that still names the commit the command started on closes the window: it predates
     # the command, and so does everything below it.
     window = next((at for at, (commit, _, _) in enumerate(entries) if commit == before_head), None)
-    if window is None or not any(
-        "(finish): returning to" in message for _, _, message in entries[:window]
-    ):
+    if window is None:
         return None
-    # The rebase this command finished began at the oldest start inside its window - two rebases
-    # chained in one command are one replay to the candidate - or, when the rebase began in an
-    # earlier command, at the first start below the window.
-    starts = [at for at, (_, _, message) in enumerate(entries) if "(start): checkout" in message]
-    inside = [at for at in starts if at <= window]
-    start = inside[-1] if inside else next((at for at in starts if at > window), None)
-    if start is None or start + 1 >= len(entries):
-        return None
-    base, started_from = entries[start][0], entries[start + 1][0]
-    if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in (base, started_from)):
+    finishes = [
+        message for _, _, message in entries[:window] if "(finish): returning to" in message
+    ]
+    if not finishes:
         return None
     # Asked only once the reflog says a rebase finished, because an ordinary commit moves HEAD
     # too and would otherwise pay for these every time.
@@ -1194,6 +1220,12 @@ def finished_rebase(cwd, before_head):
         located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
         if located is None or os.path.exists(os.path.join(cwd, located.strip())):
             return None
+    branch = finishes[-1].split("returning to ", 1)[-1].strip()
+    if not branch.startswith("refs/heads/"):
+        return None
+    started_from, base = replaced_tip(cwd, branch, len(finishes))
+    if not started_from:
+        return None
     compared = cwg.git_run(cwd, ["cherry", head, started_from], timeout=10)
     if not compared or compared[0] != 0:
         return None
@@ -1206,20 +1238,22 @@ def finished_rebase(cwd, before_head):
     # Both ends of the resolution, and only those: the commit that had to be resolved names the
     # files the conflict was in, and its replacement names whatever the resolver added while
     # resolving it. The replacements are the commits the replay wrote that no old patch-id
-    # accounts for - a commit replayed faithfully beside the resolved one stays out.
-    written = cwg.git_text(
-        cwd,
-        ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
-         "{}..{}".format(base, head)],
-        timeout=10,
-    )
-    reproduced = cwg.git_run(cwd, ["cherry", started_from, head], timeout=10)
-    if written is None or not reproduced or reproduced[0] != 0:
-        return {"clean": False, "resolved": []}
-    faithful = {
-        line.split()[1] for line in reproduced[1].splitlines() if line.startswith("- ")
-    }
-    diverged += [commit for commit in written.split() if commit not in faithful]
+    # accounts for - a commit replayed faithfully beside the resolved one stays out. A finish
+    # that did not say what it replayed onto contributes the first half alone.
+    if base:
+        written = cwg.git_text(
+            cwd,
+            ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
+             "{}..{}".format(base, head)],
+            timeout=10,
+        )
+        reproduced = cwg.git_run(cwd, ["cherry", started_from, head], timeout=10)
+        if written is None or not reproduced or reproduced[0] != 0:
+            return {"clean": False, "resolved": []}
+        faithful = {
+            line.split()[1] for line in reproduced[1].splitlines() if line.startswith("- ")
+        }
+        diverged += [commit for commit in written.split() if commit not in faithful]
     root = (cwg.git_text(cwd, ["rev-parse", "--show-toplevel"], timeout=5) or "").strip()
     names = set()
     for commit in diverged:

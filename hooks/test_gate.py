@@ -6719,6 +6719,36 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_second_") as tree:
     finally:
         cleanup(sid)
 
+# `git rebase <upstream> <branch>` run from somewhere else never puts HEAD on the branch being
+# rebased, so nothing in HEAD own movement names the tip that was replaced.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_named_") as tree:
+    git = replay_repo(tree, "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10)
+                      + "l5" + chr(10) + "upstream" + chr(10))
+    sid = session()
+    try:
+        reviewed = "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10) + "l5"
+        landed_candidate(sid, tree, git, content=reviewed + chr(10) + "feature")
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+        git("checkout", "-q", "up")
+
+        def rebase_named():
+            git("rebase", "up", "feat")
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write(reviewed + chr(10) + "feature" + chr(10))
+            git("add", "-A")
+            git("rebase", "--continue", GIT_EDITOR="true")
+
+        mark_shell(sid, tree, "git rebase up feat && resolve", action=rebase_named)
+        entry, after = replay_marks(sid)
+        raised = [mark for mark in entry.get("content_marks") or []
+                  if mark.get("unknown") and float(mark["ts"]) > verdict_ts]
+        check("a resolution is seen even when HEAD was never on the branch being rebased",
+              after == at_verdict and raised and not replay_covers(entry, verdict_ts),
+              (at_verdict, after, entry.get("content_marks")))
+    finally:
+        cleanup(sid)
+
 # `git pull --rebase` writes the whole pull command line as the reflog action, so a finish that
 # is not spelled `rebase (finish)` has to be recognised all the same.
 with tempfile.TemporaryDirectory(prefix="cwg_rebase_pull_") as origin:
