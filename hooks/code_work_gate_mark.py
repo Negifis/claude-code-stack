@@ -1125,12 +1125,15 @@ REPLAY_RESOLVED = "resolved"
 def replayed_branch(cwd, branch, finishes):
     """(tip this branch rebase produced, tip it replaced, commit it replayed onto), or None.
 
-    A branch ref moves once per rebase, at the finish, whatever HEAD was doing: the entry this
-    branch own `finishes` count down is where this command first rebased it, and the entry below
-    that one is what the branch pointed at before any of it. The finish also records what it
-    replayed onto, which is the other end of the range the resolution has to be looked for in; a
-    git that stops recording it costs the scope, not the judgement. Entries that are not finishes
-    are stepped over, because a command that committed after its rebase moved the branch again.
+    A branch ref moves once per rebase, at the finish, whatever HEAD was doing. The two ends come
+    from the two ends of this command run of finishes: the newest one produced the tip the branch
+    carries now, and the entry below the oldest one - this branch own `finishes` count down - is
+    what the branch pointed at before any of it. Taking both from the oldest compared a branch
+    rebased twice in one command only as far as its first rebase. The newest finish also records
+    what it replayed onto, which is the other end of the range the replacements are looked for in;
+    a git that stops recording it costs the scope, not the judgement. Entries that are not
+    finishes are stepped over, because a command that committed after its rebase moved the branch
+    again.
 
     The replaced tip is read as the entry below rather than as the finish own old value, which
     the reflog format cannot print: an automatic `gc` firing inside this very command could
@@ -1146,16 +1149,17 @@ def replayed_branch(cwd, branch, finishes):
         return None
     entries = [line.partition(" ") for line in listing.splitlines()]
     marker = "(finish): {} onto ".format(branch)
-    at = -1
+    at, newest = -1, None
     for _ in range(finishes):
         at = next((step for step, (_, _, message) in enumerate(entries)
                    if step > at and marker in message), None)
         if at is None:
             return None
+        newest = at if newest is None else newest
     if at + 1 >= len(entries):
         return None
-    tip, replaced = entries[at][0], entries[at + 1][0]
-    onto = entries[at][2].rsplit(" ", 1)[-1]
+    tip, replaced = entries[newest][0], entries[at + 1][0]
+    onto = entries[newest][2].rsplit(" ", 1)[-1]
     if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in (tip, replaced)):
         return None
     return tip, replaced, (onto if re.fullmatch(r"[0-9a-f]{40}", onto) else None)

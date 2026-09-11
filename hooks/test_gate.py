@@ -6749,6 +6749,42 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_named_") as tree:
     finally:
         cleanup(sid)
 
+# One command rebasing the same branch twice, with the conflict in the second rebase: the tip to
+# compare against is the one the last finish produced, not the one the first left behind.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_twice_") as tree:
+    git = replay_repo(tree, None)
+    sid = session()
+    try:
+        reviewed = "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10) + "l5"
+        landed_candidate(sid, tree, git, content=reviewed + chr(10) + "feature")
+        # A second upstream, which the branch will be rebased onto after `up` and which takes the
+        # line the candidate took.
+        git("checkout", "-q", "-b", "later", "up")
+        with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+            stream.write(reviewed + chr(10) + "upstream" + chr(10))
+        git("commit", "-qam", "upstream takes the same line")
+        git("checkout", "-q", "feat")
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+
+        def rebase_twice():
+            git("rebase", "up")
+            git("rebase", "later")
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write(reviewed + chr(10) + "feature" + chr(10))
+            git("add", "-A")
+            git("rebase", "--continue", GIT_EDITOR="true")
+
+        mark_shell(sid, tree, "git rebase up && git rebase later && resolve", action=rebase_twice)
+        entry, after = replay_marks(sid)
+        raised = [mark for mark in entry.get("content_marks") or []
+                  if mark.get("unknown") and float(mark["ts"]) > verdict_ts]
+        check("a resolution in the second rebase of one command is still a barrier",
+              after == at_verdict and raised and not replay_covers(entry, verdict_ts),
+              (at_verdict, after, entry.get("content_marks")))
+    finally:
+        cleanup(sid)
+
 # One command rebasing a stack: two branches finished, the lower one carrying a finish from an
 # earlier command. Counting finishes without asking which branch they belong to judged the topmost
 # branch against the bottom one history, where the resolution is not.
