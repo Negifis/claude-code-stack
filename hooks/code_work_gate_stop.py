@@ -1418,7 +1418,8 @@ def latest(events):
 
 
 def unknown_mark(mark):
-    """Whether a content mark is a barrier: an unattributed change, or an unmeasurable one.
+    """Whether a content mark is a barrier: a change nobody could attribute, one that could not
+    be measured, or a conflict resolved by hand, whose bytes cannot vouch for the choice made.
 
     COMPAT: markers written before the flag existed encoded a barrier as a missing fingerprint,
     so a mark without a string `fp` still reads as one.

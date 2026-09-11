@@ -6609,13 +6609,18 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_resolved_") as tree:
             # The editor git would open on the replayed commit message, answered by `true`.
             git("rebase", "--continue", GIT_EDITOR="true")
 
+        opened_on = git("rev-parse", "HEAD").stdout.strip()
         mark_shell(sid, tree, "git rebase up && git rebase --continue", action=resolve)
         entry, after = replay_marks(sid)
         resolution = cwg.normalize_path(os.path.join(tree, "hooks", "cand.py"))
         check("a rebase resolved by hand retires the verdict it was approved under",
               not replay_covers(entry, verdict_ts) and after != at_verdict, (at_verdict, after))
-        check("the delta is scoped to the file the resolution diff names",
-              entry.get("content_paths") == [resolution]
+        check("the delta is scoped to the files the resolution diff names",
+              marker_hook.finished_rebase(tree, opened_on) == {"clean": False,
+                                                               "resolved": [resolution]},
+              marker_hook.finished_rebase(tree, opened_on))
+        check("the resolution joins the candidate and anchors freshness",
+              resolution in (entry.get("content_paths") or [])
               and float(entry.get("last_durable_ts") or 0.0) > verdict_ts, entry)
     finally:
         cleanup(sid)
@@ -6641,6 +6646,72 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_and_write_") as tree:
               not replay_covers(entry, verdict_ts), entry)
     finally:
         cleanup(sid)
+
+# The conflict is stopped in one command and continued in another, and the resolver keeps the
+# reviewed side: the bytes that come out are the bytes the verdict was given for, and only the
+# diverged patch-id says a person chose to drop what the upstream wanted there.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_kept_") as tree:
+    git = replay_repo(tree, "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10)
+                      + "l5" + chr(10) + "upstream" + chr(10))
+    sid = session()
+    try:
+        reviewed = "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10) + "l5"
+        landed_candidate(sid, tree, git, content=reviewed + chr(10) + "feature")
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+        mark_shell(sid, tree, "git rebase up", action=lambda: git("rebase", "up"))
+
+        def keep_ours():
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write(reviewed + chr(10) + "feature" + chr(10))
+            git("add", "-A")
+
+        mark_shell(sid, tree, "resolve && git add -A", action=keep_ours)
+        mark_shell(sid, tree, "git rebase --continue",
+                   action=lambda: git("rebase", "--continue", GIT_EDITOR="true"))
+        entry, after = replay_marks(sid)
+        raised = [mark for mark in entry.get("content_marks") or []
+                  if mark.get("unknown") and float(mark["ts"]) > verdict_ts]
+        check("a resolution that reproduces the reviewed bytes is still a barrier",
+              after == at_verdict and raised and not replay_covers(entry, verdict_ts),
+              (at_verdict, after, entry.get("content_marks")))
+    finally:
+        cleanup(sid)
+
+# `git pull --rebase` writes the whole pull command line as the reflog action, so a finish that
+# is not spelled `rebase (finish)` has to be recognised all the same.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_pull_") as origin:
+    replay_repo(origin, "upstream" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10)
+                + "l5" + chr(10) + "l6" + chr(10))
+    with tempfile.TemporaryDirectory(prefix="cwg_rebase_pulled_") as tree:
+        clone = os.path.join(tree, "clone")
+        subprocess.run(["git", "clone", "--quiet", "--branch", "main", origin, clone], check=True)
+
+        def git(*arguments, **environment):
+            return subprocess.run(
+                ["git", "-C", clone] + list(GIT_IDENTITY) + list(arguments),
+                check=False, capture_output=True, text=True, encoding="utf-8",
+                env=dict(os.environ, **environment) if environment else None,
+            )
+
+        sid = session()
+        try:
+            landed_candidate(sid, clone, git)
+            verdict_ts = time.time()
+            _, at_verdict = replay_marks(sid)
+            mark_shell(sid, clone, "git pull --rebase origin up",
+                       action=lambda: git("pull", "--rebase", "origin", "up"))
+            entry, replayed = replay_marks(sid)
+            check("a clean pull --rebase re-anchors the candidate like any other replay",
+                  replayed == marker_hook.content_fingerprint(entry.get("content_paths"))
+                  and replayed != at_verdict, (at_verdict, replayed))
+            carried_into_index(sid, clone, git, "carried.py")
+            entry, _ = replay_marks(sid)
+            check("a verdict stated before a clean pull --rebase still covers the candidate",
+                  replay_covers(entry, verdict_ts)
+                  and float(entry.get("last_durable_ts") or 0.0) > verdict_ts, entry)
+        finally:
+            cleanup(sid)
 
 # An interrupted rebase is not a finished one: the repository is back where the candidate opened
 # and the operational track still reads that from git, exactly as before.

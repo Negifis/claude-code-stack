@@ -870,10 +870,11 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     `replay` is what a rebase this command finished did to the candidate. `REPLAY_CLEAN` means
     every replaced commit came back with its patch-id intact, so the candidate is the same work
     on a new base: its measurement is re-anchored on the replayed bytes and nothing is expired.
-    `REPLAY_OPAQUE` means a commit diverged - a conflict was resolved by hand - and this command
-    could not name where, so it counts as a change nothing can be attributed to. A divergence
-    that could be named arrives as ordinary rewritten paths instead, which is what scopes the
-    delta to the resolution.
+    `REPLAY_RESOLVED` means a commit diverged, so a conflict was resolved by hand. That is a
+    barrier no earlier verdict crosses, and deliberately not a question of bytes: the resolver
+    who keeps the reviewed side reproduces the reviewed bytes exactly while dropping what the
+    upstream wanted there, and no reviewer read that choice. The files the resolution names
+    arrive with it as ordinary rewritten paths, which is what scopes the delta.
 
     `unresolved` means a mutation was observed but the snapshot could not name what it touched,
     so it may have been a source edit made through the shell. `snapshot_roots` bounds what an
@@ -909,7 +910,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         if replayed is None:
             # A rebase whose result cannot be measured is not evidence that the candidate
             # survived it, so it is recorded as the unattributable change it has become.
-            replay = REPLAY_OPAQUE
+            replay = REPLAY_RESOLVED
         else:
             content_marks = reanchored(content_marks, replayed, now)
     for normalized in cwg.durable_paths(rewrote):
@@ -942,7 +943,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         now
         if cwg.durable_paths(incoming)
         or unattributed_risk
-        or replay == REPLAY_OPAQUE
+        or replay == REPLAY_RESOLVED
         or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
@@ -972,7 +973,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         # rewritten no lasting byte, which is the common case for a shell mutation before any
         # edit.
         unknown = bool(
-            unattributed_risk or replay == REPLAY_OPAQUE or not cwg.durable_paths(incoming)
+            unattributed_risk or replay == REPLAY_RESOLVED or not cwg.durable_paths(incoming)
         )
         fingerprint = content_fingerprint(content_paths)
         content_marks = content_marks_after(content_marks, now, fingerprint, unknown)
@@ -980,7 +981,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
             "durable", session=cwg.session_key(data.get("session_id")),
             reason=("edit" if cwg.durable_paths(incoming) else
                     "unattributed" if unattributed_risk else
-                    "rebase-resolution" if replay == REPLAY_OPAQUE else
+                    "rebase-resolution" if replay == REPLAY_RESOLVED else
                     "unresolved-write-capable"),
             paths=[p for p in cwg.durable_paths(incoming)][:5],
             tool=str(data.get("tool_name") or ""),
@@ -1105,9 +1106,9 @@ def on_home_ground(path, cwd, snapshot_roots, data):
     return bool(HOME_REFERENCE_RE.search(command))
 
 
-def head_commit(cwd):
-    """The commit HEAD points at in this working directory, or None outside a repository."""
-    head = (cwg.git_text(cwd, ["rev-parse", "HEAD"], timeout=5) or "").strip()
+def head_commit(cwd, rev="HEAD"):
+    """The commit this revision names in this working directory, or None when it names none."""
+    head = (cwg.git_text(cwd, ["rev-parse", "--verify", "-q", rev], timeout=5) or "").strip()
     return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
@@ -1118,7 +1119,7 @@ REBASE_REFLOG_SCAN = 60
 REBASE_REPLACED_LIMIT = 100
 # What a finished rebase did to the candidate, for `record_paths`.
 REPLAY_CLEAN = "clean"
-REPLAY_OPAQUE = "opaque"
+REPLAY_RESOLVED = "resolved"
 
 
 def finished_rebase(cwd, before_head):
@@ -1136,10 +1137,17 @@ def finished_rebase(cwd, before_head):
 
     Detection is deliberately narrow, because outside a rebase the same signals mean other
     things. The reflog must show a rebase that finished inside this command's window - an
-    aborted one says `rebase (abort)` and leaves HEAD where it was, one stopped at a conflict
-    says nothing yet and leaves `rebase-merge` behind, and both keep the behaviour they already
-    had - and anything git cannot answer inside its budget returns None, which is also today's
-    behaviour.
+    aborted one says `(abort)` and leaves HEAD where it was, one stopped at a conflict says
+    nothing yet and leaves `rebase-merge` behind, and both keep the behaviour they already had -
+    and anything git cannot answer inside its budget returns None, which is also today's
+    behaviour. The finish is recognised by its own wording rather than by the word `rebase`,
+    because `git pull --rebase`, which is how a branch is usually brought forward, writes the
+    whole pull command line as the reflog action and only then `(finish): returning to`.
+
+    Patches are compared against `ORIG_HEAD`, the tip the rebase started from, rather than
+    against the commit this command started on: a conflict stopped in one command and continued
+    in the next would otherwise be compared with the half-rebased state and read as a faithful
+    replay of nothing.
 
     RESIDUAL RISK, accepted deliberately: a clean rebase still changes the bytes of a candidate
     file whenever the upstream touched the same file and git combined both edits textually
@@ -1159,13 +1167,18 @@ def finished_rebase(cwd, before_head):
     if listing is None:
         return None
     finished = False
+    base = None
     for line in listing.splitlines():
         commit, _, message = line.partition(" ")
+        # The commit the replay was laid onto, read before the window can close on it: a rebase
+        # continued in a later command started exactly there.
+        if base is None and "(start): checkout" in message:
+            base = commit
         # The entry that still names the commit the command started on closes the window: it
         # predates the command, and so does everything below it.
         if commit == before_head:
             break
-        finished = finished or (message.startswith("rebase") and "(finish)" in message)
+        finished = finished or "(finish): returning to" in message
     else:
         return None
     if not finished:
@@ -1176,7 +1189,8 @@ def finished_rebase(cwd, before_head):
         located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
         if located is None or os.path.exists(os.path.join(cwd, located.strip())):
             return None
-    compared = cwg.git_run(cwd, ["cherry", head, before_head], timeout=10)
+    started_from = head_commit(cwd, "ORIG_HEAD") or before_head
+    compared = cwg.git_run(cwd, ["cherry", head, started_from], timeout=10)
     if not compared or compared[0] != 0:
         return None
     replaced = compared[1].splitlines()
@@ -1185,23 +1199,31 @@ def finished_rebase(cwd, before_head):
     diverged = [line.split()[1] for line in replaced if line.startswith("+ ")]
     if not diverged:
         return {"clean": True, "resolved": []}
+    # Both ends of the resolution: the commit that had to be resolved names the files the
+    # conflict was in, and the commits the replay wrote name whatever the resolver added while
+    # resolving it. A replay whose base could not be read contributes the first half alone.
+    if base:
+        written = cwg.git_text(
+            cwd,
+            ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
+             "{}..{}".format(base, head)],
+            timeout=10,
+        )
+        diverged += (written or "").split()
     root = (cwg.git_text(cwd, ["rev-parse", "--show-toplevel"], timeout=5) or "").strip()
     names = set()
     for commit in diverged:
         touched = cwg.git_text(
-            cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", commit], timeout=5
+            cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit], timeout=5
         )
         if touched is None or not root:
-            # A resolution this command made and cannot name: the caller records it as a change
-            # nothing can be attributed to, which is what an unnameable write already is here.
+            # A resolution this command made and cannot name. The caller records it all the
+            # same, because a conflict someone resolved is never nothing.
             return {"clean": False, "resolved": []}
-        names.update(touched.splitlines())
+        names.update(touched.split(chr(0)))
     resolved = sorted({
         normalized
-        for normalized in (
-            cwg.normalize_path(os.path.join(root, name.strip()))
-            for name in names if name.strip()
-        )
+        for normalized in (cwg.normalize_path(os.path.join(root, name)) for name in names if name)
         if cwg.is_gated(normalized)
     })
     return {"clean": False, "resolved": resolved}
@@ -1370,8 +1392,9 @@ def staged_divergences(directory, names):
 def content_marks_after(marks, now, fingerprint, unknown=False):
     """The marks with this change appended: a new one when the content or the barrier state moves.
 
-    `unknown` says the change could not be attributed, so it is a barrier no verdict older than
-    it may cross. It is recorded beside the measurement rather than instead of it: the bytes of
+    `unknown` says the change cannot be vouched for by the bytes it left behind - nobody could
+    attribute it, nothing could be measured, or a conflict was resolved by hand - so it is a
+    barrier no verdict older than it may cross. It is recorded beside the measurement rather than instead of it: the bytes of
     the recorded paths are still what they are, and a verdict stated after the barrier is judged
     against them. An unattributed change always gets its own mark, and so does the first
     measurement after one, so neither transition is swallowed by the equal-content shortcut.
@@ -1556,16 +1579,16 @@ def main():
                 replayed = finished_rebase(cwd, before.get("head")) or {}
                 if replayed.get("clean"):
                     replay = REPLAY_CLEAN
-                elif replayed.get("resolved"):
+                elif replayed:
+                    replay = REPLAY_RESOLVED
                     # The resolution diff, and nothing else: the commits whose patch-id survived
                     # are the same work on a new base. These paths are this command's by
                     # construction - the rebase ran in it - so they skip the ownership question
-                    # the snapshot delta has to ask.
+                    # the snapshot delta has to ask. Naming them scopes the delta; the barrier
+                    # the marker raises for a resolution does not depend on being able to.
                     shell_paths = (shell_paths or []) + replayed["resolved"]
                     rewrote = rewrote + replayed["resolved"]
-                    observed = True
-                elif replayed:
-                    replay = REPLAY_OPAQUE
+                    observed = observed or bool(replayed["resolved"])
 
         try:
             if cwg.is_gated(path):

@@ -156,10 +156,16 @@ of an approved candidate needs nothing; one resolved by hand is a delta candidat
 resolution diff gets the delta lane and a delta round. Clean means patch equivalence: the
 gate reads the reflog for a rebase that finished, asks `git cherry` whether every replaced
 commit came back with its patch-id intact, and on a faithful replay re-measures the candidate
-and moves the verdict's support onto the replayed bytes instead of expiring it. The residual
-risk is accepted deliberately: an upstream commit that changed the same file without
-conflicting is now part of the candidate's bytes, and no reviewer has read that combination.
-No conflict, no second review.
+and moves the verdict's support onto the replayed bytes instead of expiring it. A commit that
+diverged is a barrier whatever the bytes say, because a resolver who keeps the reviewed side
+reproduces the reviewed bytes exactly while dropping what the upstream wanted there.
+
+Three limits, the first accepted deliberately. A clean rebase still changes a candidate file
+when the upstream touched the same file and git combined both edits without conflicting: no
+reviewer has read that combination and none is asked for — no conflict, no second review.
+Patch-ids ignore whitespace, so a resolution that only re-indented what it replayed reads as a
+faithful replay. And only a rebase is recognised from the reflog: after a merge, judge the
+candidate yourself.
 
 ```
 MAX_REVIEW_ROUNDS = 3
