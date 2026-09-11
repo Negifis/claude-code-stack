@@ -171,10 +171,13 @@ ENV_ASSIGNMENT_RE = re.compile(r"^\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s*")
 WRAPPER_RE = re.compile(r"^(?:timeout\s+(?:-\S+\s+)*\S+|time|nohup|command|builtin)\s+")
 # A verdict covers content, not edit events: the marker keeps a fingerprint of its lasting
 # paths at every durable change, so an edit that was reverted leaves the approved content — and
-# the approval — in place. Bounded so a wide candidate costs nothing: past these limits the
-# fingerprint is unknown and freshness falls back to the timestamp rule.
-FINGERPRINT_MAX_FILES = 64
+# the approval — in place. The index listings cost git calls per directory, so a candidate
+# wider than INDEXED_FILES is measured on content alone rather than not at all; only a file or a
+# total too large to read leaves the fingerprint unknown, and freshness then falls back to the
+# timestamp rule.
+FINGERPRINT_INDEXED_FILES = 64
 FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
+FINGERPRINT_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 CONTENT_MARKS_KEPT = 32
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
@@ -615,7 +618,21 @@ def rewritten(before, after):
     ]
 
 
-def changed_snapshot_paths(before, after):
+def snapshot_changes(before, after):
+    """Every gated path two snapshots of one repository disagree on, each paired with whether
+    the command rewrote its bytes - or None when nothing is provable.
+
+    Staging and committing move a file between the worktree, the index and HEAD without touching
+    a byte of it, and every such move makes the two snapshots disagree about it. The path stays
+    the candidate's to answer for - it keeps its risk and its work class - but this command did
+    not change it, and letting it into the fingerprint's domain is what retired approvals of the
+    very bytes being committed (reports 42f294ba, 877f7bf2, f5f9116f).
+
+    A path that left the listing - committed, or clean again - is measured against the file on
+    disk now, which `git commit` leaves exactly as the snapshot recorded it. A path that only
+    appeared counts as rewritten: nothing recorded what it held before, and one extra review
+    round is the safe side of that ignorance.
+    """
     if (
         not before
         or not after
@@ -624,13 +641,19 @@ def changed_snapshot_paths(before, after):
         or after.get("overflow")
     ):
         return None
-    changed = rewritten(before, after)
+    before_files = before.get("files") or {}
+    after_files = after.get("files") or {}
     root = after["root"]
-    return [
-        os.path.join(root, *path.split("/"))
-        for path in changed
-        if cwg.is_gated(path) and not SYNCED_AGENT_TREE_RE.search("/" + path)
-    ]
+    changes = []
+    for relative in rewritten(before, after):
+        if not cwg.is_gated(relative) or SYNCED_AGENT_TREE_RE.search("/" + relative):
+            continue
+        absolute = os.path.join(root, *relative.split("/"))
+        was = (before_files.get(relative) or {}).get("token")
+        landed = after_files.get(relative)
+        now = landed.get("token") if landed else file_token(absolute)
+        changes.append((absolute, was is None or was != now))
+    return changes
 
 
 def head_pointer(directory):
@@ -739,6 +762,7 @@ def cycle_start(marker, now, identity, incoming):
         "identity": identity,
         "last_durable_ts": 0.0,
         "unattributed_durable": False,
+        "content_paths": [],
         "content_marks": [],
         "head_at_start": None,
         "refs_at_start": None,
@@ -765,6 +789,14 @@ def cycle_start(marker, now, identity, incoming):
             "identity": stored if mismatch else (identity or stored),
             "last_durable_ts": float(carried) if cwg.valid_ts(carried) else 0.0,
             "unattributed_durable": bool(existing.get("unattributed_durable")),
+            # COMPAT: a marker written before the domain was recorded separately measured every
+            # diagnostic path, so that is what its fingerprints describe. Seeding the domain
+            # from them keeps a candidate open across the upgrade comparable with itself.
+            "content_paths": list(
+                existing["content_paths"]
+                if existing.get("content_paths") is not None
+                else existing.get("paths") or []
+            ),
             "content_marks": list(existing.get("content_marks") or []),
             "head_at_start": existing.get("head_at_start"),
             "refs_at_start": existing.get("refs_at_start"),
@@ -814,7 +846,7 @@ def outside_snapshot(paths, roots, watched=()):
 
 def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
                  watched_roots=(), unattributed_risk=None, write_capable_command=True,
-                 opening=None):
+                 opening=None, content_changed=None):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
     `unattributed_risk` is the grade of a lasting change seen during this command that no
@@ -824,6 +856,15 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     the cycle under the operational contract would be a way out of the gate rather than a
     narrower question. Sticky for the cycle: a later resolvable command does not make an earlier
     unattributable one go away.
+
+    `content_changed` names the subset of `candidate_paths` whose bytes this command actually
+    rewrote; None means all of them, which is what a tool that writes a file reports. Only that
+    subset joins the fingerprint's domain, and the domain is what makes two measurements taken
+    at different moments comparable at all: a path that enters it later moves every fingerprint
+    with it, so a `git add` or a `git commit` naming a file it did not rewrite would retire the
+    approval of the bytes being committed. Everything else the path carries - its risk, its work
+    class, the freshness anchor - is unchanged, because the repository really did gain those
+    bytes and the candidate still answers for them.
 
     `unresolved` means a mutation was observed but the snapshot could not name what it touched,
     so it may have been a source edit made through the shell. `snapshot_roots` bounds what an
@@ -843,6 +884,15 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     for normalized in incoming:
         if normalized not in paths:
             paths.append(normalized)
+    if content_changed is None:
+        rewrote = incoming
+    else:
+        named = {cwg.normalize_path(path) for path in content_changed}
+        rewrote = [path for path in incoming if path in named]
+    content_paths = cycle["content_paths"]
+    for normalized in cwg.durable_paths(rewrote):
+        if normalized not in content_paths:
+            content_paths.append(normalized)
     observed_risk = cwg.minimum_risk(paths)
     minimum_risk_seen = cwg.max_risk(
         cycle["minimum_risk_seen"], observed_risk, unattributed_risk
@@ -896,10 +946,11 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         # very bytes the reviewer read — retired it (reports 877f7bf2, f5f9116f, 3d343b8b,
         # dfa8a850). So the flag and the measurement are now separate. Measuring on every
         # unattributed change costs the git calls the old short-circuit saved; the cost is
-        # bounded by FINGERPRINT_MAX_FILES and is skipped outright while the candidate holds no
-        # durable path, which is the common case for a shell mutation before any edit.
+        # bounded by the fingerprint's own budgets and is nothing at all while the candidate has
+        # rewritten no lasting byte, which is the common case for a shell mutation before any
+        # edit.
         unknown = bool(unattributed_risk or not cwg.durable_paths(incoming))
-        fingerprint = content_fingerprint(paths)
+        fingerprint = content_fingerprint(content_paths)
         content_marks = content_marks_after(content_marks, now, fingerprint, unknown)
         cwg.log_event(
             "durable", session=cwg.session_key(data.get("session_id")),
@@ -921,6 +972,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "path_overflow": overflow,
         "identity": cycle["identity"],
         "unattributed_durable": unattributed_durable,
+        "content_paths": content_paths[-128:],
         "content_marks": content_marks,
         "head_at_start": cycle.get("head_at_start"),
         "refs_at_start": cycle.get("refs_at_start"),
@@ -1043,10 +1095,19 @@ def content_fingerprint(paths):
     that matches neither HEAD nor the file on disk is part of the record — something was put in
     the index that nobody reviewed — while staging or committing the reviewed bytes changes
     nothing: `git add` and `git commit` after an approval are not edits.
+
+    The index is read only while the candidate is narrow enough for it to be cheap: those
+    listings cost git calls per directory, and a wider candidate is measured on its content
+    alone, carrying a marker of its own so such a measurement can never equal an indexed one.
+    Refusing to measure a wide candidate at all is what made the promise above unkeepable for
+    every large one (report eedcca07): a mass restore had left 128 paths in the marker, nothing
+    was measured from then on, and the first durable event after the approval — the commit of
+    the approved bytes — retired it. An empty set of paths is a measurement too: a candidate
+    that has changed no lasting byte yet is not an unknown one.
     """
     durable = sorted(set(cwg.durable_paths(paths)))
-    if not durable or len(durable) > FINGERPRINT_MAX_FILES:
-        return None
+    indexed = len(durable) <= FINGERPRINT_INDEXED_FILES
+    budget = FINGERPRINT_MAX_TOTAL_BYTES
     digest = hashlib.sha256()
 
     def add(kind, *fields):
@@ -1056,6 +1117,8 @@ def content_fingerprint(paths):
             digest.update(struct.pack(">Q", len(data)))
             digest.update(data)
 
+    if not indexed:
+        add(b"T", "content")
     by_dir = {}
     for path in durable:
         try:
@@ -1067,12 +1130,15 @@ def content_fingerprint(paths):
             if os.path.isdir(path):
                 add(b"D", path)
                 continue
-            if os.path.getsize(path) > FINGERPRINT_MAX_BYTES:
+            size = os.path.getsize(path)
+            budget -= size
+            if size > FINGERPRINT_MAX_BYTES or budget < 0:
                 return None
             with open(path, "rb") as stream:
                 content = stream.read()
             add(b"F", path, os.stat(path).st_mode & 0o777, content)
-            by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
+            if indexed:
+                by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
         except OSError:
             return None
     for directory, names in sorted(by_dir.items()):
@@ -1294,16 +1360,22 @@ def main():
             shell_started = before.get("ts")
             cwg.remove(snapshot_file)
             after = shell_snapshot(cwd)
-            repo_paths = changed_snapshot_paths(before.get("git"), after["git"])
+            repo_changes = snapshot_changes(before.get("git"), after["git"])
             config_paths = changed_config_paths(before.get("config"), after["config"])
+            # Of everything the snapshots disagree on, the paths whose bytes this command
+            # rewrote. A watched home has no index to move a file through, so every change
+            # there is one.
+            rewrote = []
             # Each source answers for its own tree, so one of them proving nothing narrows what
             # the command is known not to have touched instead of discarding the other's answer.
-            if repo_paths is not None:
-                shell_paths = list(repo_paths)
+            if repo_changes is not None:
+                shell_paths = [path for path, _ in repo_changes]
+                rewrote = [path for path, bytes_moved in repo_changes if bytes_moved]
                 snapshot_roots.append((after["git"] or {}).get("root"))
                 home_ground = True
             if config_paths is not None:
                 shell_paths = (shell_paths or []) + config_paths
+                rewrote = rewrote + config_paths
                 config_roots = after["config"].get("roots") or []
                 watched_roots.extend(config_roots)
                 home_ground = home_ground or any(
@@ -1341,6 +1413,7 @@ def main():
                     record_paths(data, shell_paths, snapshot_roots=snapshot_roots,
                                  watched_roots=watched_roots, unattributed_risk=floor,
                                  write_capable_command=write_capable(data),
+                                 content_changed=rewrote,
                                  opening={"head": before.get("head"), "refs": before.get("refs")})
                 elif observed or not home_ground or policy == SHELL_UNKNOWN:
                     # An empty delta is not proof of no write: ignored files, and paths
