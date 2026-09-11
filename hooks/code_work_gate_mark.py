@@ -1106,10 +1106,13 @@ def on_home_ground(path, cwd, snapshot_roots, data):
     return bool(HOME_REFERENCE_RE.search(command))
 
 
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
 def head_commit(cwd):
     """The commit HEAD points at in this working directory, or None outside a repository."""
     head = (cwg.git_text(cwd, ["rev-parse", "HEAD"], timeout=5) or "").strip()
-    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+    return head if COMMIT_SHA_RE.fullmatch(head) else None
 
 
 # How far back the reflog is read to bound one command's effect on HEAD, and how many replaced
@@ -1160,9 +1163,9 @@ def replayed_branch(cwd, branch, finishes):
         return None
     tip, replaced = entries[newest][0], entries[at + 1][0]
     onto = entries[newest][2].rsplit(" ", 1)[-1]
-    if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in (tip, replaced)):
+    if not all(COMMIT_SHA_RE.fullmatch(commit) for commit in (tip, replaced)):
         return None
-    return tip, replaced, (onto if re.fullmatch(r"[0-9a-f]{40}", onto) else None)
+    return tip, replaced, (onto if COMMIT_SHA_RE.fullmatch(onto) else None)
 
 
 def finished_rebase(cwd, before_head):
@@ -1187,12 +1190,12 @@ def finished_rebase(cwd, before_head):
     because `git pull --rebase`, which is how a branch is usually brought forward, writes the
     whole pull command line as the reflog action and only then `(finish): returning to`.
 
-    What the patches are compared against is the tip that was replaced, and that is read from the
-    reflog of the branch the finish names, never from HEAD's own movement. The branch ref moves
-    exactly once per rebase, at the finish, so the entry below that one is what the branch
-    pointed at before - true of `git rebase <upstream> <branch>` run from somewhere else, where
-    HEAD was never on the rebased branch at all, and unaffected by a bare `git reset` during a
-    stop, which rewrites `ORIG_HEAD` but no branch. One command can finish several rebases, of
+    What the patches are compared against is the tip that was replaced, read from the reflog of
+    the branch the finish names and never from HEAD's own movement - see `replayed_branch` for
+    how both ends of that comparison are found. Reading it from the branch is what makes
+    `git rebase <upstream> <branch>` run from somewhere else judgeable at all, HEAD having never
+    been on the rebased branch, and what keeps a bare `git reset` during a stop - which rewrites
+    `ORIG_HEAD` but no branch - from moving the comparison. One command can finish several rebases, of
     one branch or of a stack of them; each is judged from its own reflog by how often this
     command finished that branch, and one divergence anywhere is a resolution. A rebase of a
     detached HEAD, or one whose branch keeps no reflog, is not judged.
