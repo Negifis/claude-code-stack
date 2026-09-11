@@ -6749,6 +6749,55 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_named_") as tree:
     finally:
         cleanup(sid)
 
+# One command rebasing a stack: two branches finished, the lower one carrying a finish from an
+# earlier command. Counting finishes without asking which branch they belong to judged the topmost
+# branch against the bottom one history, where the resolution is not.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_stack_") as tree:
+    git = replay_repo(tree, None)
+    sid = session()
+    try:
+        git("checkout", "-q", "-b", "lower", "main")
+        with open(os.path.join(tree, "hooks", "lower.py"), "w", encoding="utf-8") as stream:
+            stream.write("lower = True" + chr(10))
+        git("add", "-A")
+        git("commit", "-q", "-m", "lower")
+        # The earlier command that leaves `lower` with a finish of its own.
+        git("rebase", "up")
+        with open(os.path.join(tree, "hooks", "other.py"), "w", encoding="utf-8") as stream:
+            stream.write("upstream again" + chr(10))
+        git("checkout", "-q", "up")
+        git("commit", "-qam", "upstream again")
+        git("checkout", "-q", "-b", "upper", "lower")
+        reviewed = "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10) + "l5"
+        landed_candidate(sid, tree, git, content=reviewed + chr(10) + "feature")
+        # The upstream commit the replay of `upper` will collide with.
+        git("checkout", "-q", "up")
+        with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+            stream.write(reviewed + chr(10) + "upstream" + chr(10))
+        git("commit", "-qam", "upstream takes the same line")
+        git("checkout", "-q", "upper")
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+
+        def rebase_the_stack():
+            git("rebase", "up", "lower")
+            git("rebase", "lower", "upper")
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write(reviewed + chr(10) + "feature" + chr(10))
+            git("add", "-A")
+            git("rebase", "--continue", GIT_EDITOR="true")
+
+        mark_shell(sid, tree, "git rebase up lower && git rebase lower upper && resolve",
+                   action=rebase_the_stack)
+        entry, after = replay_marks(sid)
+        raised = [mark for mark in entry.get("content_marks") or []
+                  if mark.get("unknown") and float(mark["ts"]) > verdict_ts]
+        check("a resolution in the upper branch of a rebased stack is still a barrier",
+              after == at_verdict and raised and not replay_covers(entry, verdict_ts),
+              (at_verdict, after, entry.get("content_marks")))
+    finally:
+        cleanup(sid)
+
 # `git pull --rebase` writes the whole pull command line as the reflog action, so a finish that
 # is not spelled `rebase (finish)` has to be recognised all the same.
 with tempfile.TemporaryDirectory(prefix="cwg_rebase_pull_") as origin:

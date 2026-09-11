@@ -1122,22 +1122,28 @@ REPLAY_CLEAN = "clean"
 REPLAY_RESOLVED = "resolved"
 
 
-def replaced_tip(cwd, branch, finishes):
-    """(tip the rebase replaced, commit it replayed onto) from this branch own reflog.
+def replayed_branch(cwd, branch, finishes):
+    """(tip this branch rebase produced, tip it replaced, commit it replayed onto), or None.
 
-    A branch ref moves once per rebase, at the finish, whatever HEAD was doing: the entry that
-    many finishes down is the rebase that this command started with, and the entry below it is
-    what the branch pointed at before any of it. The finish also records what it replayed onto,
-    which is the other end of the range the resolution has to be looked for in; a git that stops
-    recording it costs the scope, not the judgement. Entries that are not finishes are stepped
-    over, because a command that committed after its rebase moved the branch again.
+    A branch ref moves once per rebase, at the finish, whatever HEAD was doing: the entry this
+    branch own `finishes` count down is where this command first rebased it, and the entry below
+    that one is what the branch pointed at before any of it. The finish also records what it
+    replayed onto, which is the other end of the range the resolution has to be looked for in; a
+    git that stops recording it costs the scope, not the judgement. Entries that are not finishes
+    are stepped over, because a command that committed after its rebase moved the branch again.
+
+    The replaced tip is read as the entry below rather than as the finish own old value, which
+    the reflog format cannot print: an automatic `gc` firing inside this very command could
+    expire that entry, having just made it unreachable, and the comparison would then be made
+    against something older and shrink. It takes an untouched branch, a 30-day expiry window and
+    an auto-gc in the same breath, and it costs a review round, never a missed one.
     """
     listing = cwg.git_text(
         cwd, ["reflog", "show", "--format=%H %gs", "-n", str(REBASE_REFLOG_SCAN), branch],
         timeout=5,
     )
     if listing is None:
-        return None, None
+        return None
     entries = [line.partition(" ") for line in listing.splitlines()]
     marker = "(finish): {} onto ".format(branch)
     at = -1
@@ -1145,14 +1151,14 @@ def replaced_tip(cwd, branch, finishes):
         at = next((step for step, (_, _, message) in enumerate(entries)
                    if step > at and marker in message), None)
         if at is None:
-            return None, None
+            return None
     if at + 1 >= len(entries):
-        return None, None
-    replaced = entries[at + 1][0]
+        return None
+    tip, replaced = entries[at][0], entries[at + 1][0]
     onto = entries[at][2].rsplit(" ", 1)[-1]
-    if not re.fullmatch(r"[0-9a-f]{40}", replaced):
-        return None, None
-    return replaced, (onto if re.fullmatch(r"[0-9a-f]{40}", onto) else None)
+    if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in (tip, replaced)):
+        return None
+    return tip, replaced, (onto if re.fullmatch(r"[0-9a-f]{40}", onto) else None)
 
 
 def finished_rebase(cwd, before_head):
@@ -1182,9 +1188,10 @@ def finished_rebase(cwd, before_head):
     exactly once per rebase, at the finish, so the entry below that one is what the branch
     pointed at before - true of `git rebase <upstream> <branch>` run from somewhere else, where
     HEAD was never on the rebased branch at all, and unaffected by a bare `git reset` during a
-    stop, which rewrites `ORIG_HEAD` but no branch. One command can finish several rebases of
-    one branch; they are one replay to the candidate, so the oldest finish inside the window
-    decides. A rebase of a detached HEAD, or one whose branch keeps no reflog, is not judged.
+    stop, which rewrites `ORIG_HEAD` but no branch. One command can finish several rebases, of
+    one branch or of a stack of them; each is judged from its own reflog by how often this
+    command finished that branch, and one divergence anywhere is a resolution. A rebase of a
+    detached HEAD, or one whose branch keeps no reflog, is not judged.
 
     RESIDUAL RISK, accepted deliberately: a clean rebase still changes the bytes of a candidate
     file whenever the upstream touched the same file and git combined both edits textually
@@ -1220,34 +1227,47 @@ def finished_rebase(cwd, before_head):
         located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
         if located is None or os.path.exists(os.path.join(cwd, located.strip())):
             return None
-    branch = finishes[-1].split("returning to ", 1)[-1].strip()
-    if not branch.startswith("refs/heads/"):
+    branches = [message.split("returning to ", 1)[-1].strip() for message in finishes]
+    if any(not branch.startswith("refs/heads/") for branch in branches):
         return None
-    started_from, base = replaced_tip(cwd, branch, len(finishes))
-    if not started_from:
-        return None
-    compared = cwg.git_run(cwd, ["cherry", head, started_from], timeout=10)
-    if not compared or compared[0] != 0:
-        return None
-    replaced = compared[1].splitlines()
-    if len(replaced) > REBASE_REPLACED_LIMIT:
-        return None
-    diverged = [line.split()[1] for line in replaced if line.startswith("+ ")]
+    diverged, replays, unreadable = [], [], False
+    for branch in sorted(set(branches)):
+        # Each branch is judged from its own reflog, by how often this command finished that
+        # branch. Counting finishes across branches made a chain that rebases a stack judge the
+        # last branch against the first one history.
+        replayed = replayed_branch(cwd, branch, branches.count(branch))
+        if replayed is None:
+            unreadable = True
+            continue
+        tip, started_from, base = replayed
+        compared = cwg.git_run(cwd, ["cherry", tip, started_from], timeout=10)
+        if not compared or compared[0] != 0:
+            return None
+        replaced = compared[1].splitlines()
+        if len(replaced) > REBASE_REPLACED_LIMIT:
+            return None
+        gone = [line.split()[1] for line in replaced if line.startswith("+ ")]
+        if gone:
+            diverged += gone
+            replays.append((tip, started_from, base))
     if not diverged:
-        return {"clean": True, "resolved": []}
+        # A branch whose reflog could not be read says nothing about itself, so neither can this.
+        return None if unreadable else {"clean": True, "resolved": []}
     # Both ends of the resolution, and only those: the commit that had to be resolved names the
     # files the conflict was in, and its replacement names whatever the resolver added while
     # resolving it. The replacements are the commits the replay wrote that no old patch-id
     # accounts for - a commit replayed faithfully beside the resolved one stays out. A finish
     # that did not say what it replayed onto contributes the first half alone.
-    if base:
+    for tip, started_from, base in replays:
+        if not base:
+            continue
         written = cwg.git_text(
             cwd,
             ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
-             "{}..{}".format(base, head)],
+             "{}..{}".format(base, tip)],
             timeout=10,
         )
-        reproduced = cwg.git_run(cwd, ["cherry", started_from, head], timeout=10)
+        reproduced = cwg.git_run(cwd, ["cherry", started_from, tip], timeout=10)
         if written is None or not reproduced or reproduced[0] != 0:
             return {"clean": False, "resolved": []}
         faithful = {
