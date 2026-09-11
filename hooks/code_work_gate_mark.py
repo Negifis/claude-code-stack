@@ -1107,6 +1107,13 @@ def on_home_ground(path, cwd, snapshot_roots, data):
 
 
 COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+# A branch that moved for a reason other than the replay itself: a commit landed after the
+# finish, or between two of them. `git cherry` only asks whether every replaced commit came
+# back, never whether the new side carries something extra, so such a commit would ride into the
+# verdict's base unseen - and, unlike the same write without a rebase, it would stay there
+# because the re-anchor makes the measurement match. It is not "unreadable" and must not be
+# silent: the bytes are real and nobody reviewed them.
+REPLAY_MOVED = "replay-moved"
 
 
 def head_commit(cwd):
@@ -1161,6 +1168,8 @@ def replayed_branch(cwd, branch, finishes):
         newest = at if newest is None else newest
     if at + 1 >= len(entries):
         return None
+    if newest != 0 or any(marker not in entries[step][2] for step in range(newest, at + 1)):
+        return REPLAY_MOVED
     tip, replaced = entries[newest][0], entries[at + 1][0]
     onto = entries[newest][2].rsplit(" ", 1)[-1]
     if not all(COMMIT_SHA_RE.fullmatch(commit) for commit in (tip, replaced)):
@@ -1237,12 +1246,15 @@ def finished_rebase(cwd, before_head):
     branches = [message.split("returning to ", 1)[-1].strip() for message in finishes]
     if any(not branch.startswith("refs/heads/") for branch in branches):
         return None
-    diverged, replays, unreadable = [], [], False
+    diverged, replays, unreadable, moved = [], [], False, False
     for branch in sorted(set(branches)):
         # Each branch is judged from its own reflog, by how often this command finished that
         # branch. Counting finishes across branches made a chain that rebases a stack judge the
         # last branch against the first one history.
         replayed = replayed_branch(cwd, branch, branches.count(branch))
+        if replayed == REPLAY_MOVED:
+            moved = True
+            continue
         if replayed is None:
             unreadable = True
             continue
@@ -1258,6 +1270,11 @@ def finished_rebase(cwd, before_head):
             diverged += gone
             replays.append((tip, started_from, base))
     if not diverged:
+        if moved:
+            # The replay itself was faithful, but the branch carries something the replay did not
+            # write. Naming its files would take a second comparison this does not have, so the
+            # barrier stands without a scope.
+            return {"clean": False, "resolved": []}
         # A branch whose reflog could not be read says nothing about itself, so neither can this.
         return None if unreadable else {"clean": True, "resolved": []}
     # Both ends of the resolution, and only those: the commit that had to be resolved names the

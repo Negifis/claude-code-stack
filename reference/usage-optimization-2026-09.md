@@ -258,4 +258,4 @@ reviewer launched into the background (the user had interrupted the foreground l
 `VERDICT: APPROVED` in its completion notification, which the hook never read. Fixed: a
 backgrounded native lane is judged from the result its notification carries — HTML-unescaped,
 one verdict across however many notifications the agent sent — and filed at the launch, exactly
-as the Codex binding is. `test_gate.py`: 1170 → 1486.
+as the Codex binding is. `test_gate.py`: 1170 → 1488.

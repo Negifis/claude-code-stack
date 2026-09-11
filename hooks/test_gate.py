@@ -6896,4 +6896,47 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_abort_") as tree:
         cleanup(sid)
 
 
+# --- a commit the same command added after a clean rebase is not part of the replay
+# `git cherry` only asks whether every replaced commit came back; it never asks whether the new
+# side carries something extra. Without this, a write committed in the same breath as the rebase
+# rode into the verdict's base and stayed there, because the re-anchor made the measurement match.
+def rebase_with_extra(sneak):
+    with tempfile.TemporaryDirectory(prefix="cwg_rebase_sneak_") as tree:
+        def run(*args):
+            return subprocess.run(["git", "-C", tree] + list(args), capture_output=True, text=True)
+
+        def put(name, text):
+            with open(os.path.join(tree, name), "w", encoding="utf-8") as stream:
+                stream.write(text + chr(10))
+
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "a@b.c")
+        run("config", "user.name", "t")
+        put("base.txt", "base")
+        run("add", ".")
+        run("commit", "-q", "-m", "base")
+        run("checkout", "-q", "-b", "feat")
+        put("cand.py", "reviewed")
+        run("add", ".")
+        run("commit", "-q", "-m", "my work")
+        run("checkout", "-q", "main")
+        put("up.py", "up")
+        run("add", ".")
+        run("commit", "-q", "-m", "upstream")
+        opened_on = run("rev-parse", "HEAD").stdout.strip()
+        run("checkout", "-q", "feat")
+        run("rebase", "-q", "main")
+        if sneak:
+            put("cand.py", "reviewed" + chr(10) + "sneaked")
+            run("commit", "-q", "-am", "sneak")
+        return marker_hook.finished_rebase(tree, opened_on) or {}
+
+
+check("a clean rebase alone is a faithful replay",
+      rebase_with_extra(False).get("clean") is True, "clean rebase")
+check("a commit added after the rebase in the same command is a barrier, not a faithful replay",
+      rebase_with_extra(True).get("clean") is False, "rebase then commit")
+
+
+
 print("PASS: {} assertions".format(PASSED))
