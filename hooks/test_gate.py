@@ -4863,6 +4863,73 @@ for path in (
 ):
     check("home bookkeeping is ephemeral: {}".format(path), cwg.is_ephemeral(path), path)
 
+
+# A chip's git worktree is created under the configuration home, but it is a checkout of a
+# project rather than the agent's own bookkeeping. Every file in it is graded by path exactly
+# as the same file is in an ordinary worktree; before that, a delegated session's whole diff
+# looked ephemeral, so its candidate stayed OPERATIONAL and no review could close it.
+CHIP_TREE = "C:/Users/in/.claude/state/chips/trees/wa-tg-tun-new-fix-a1b2c3d4"
+ORDINARY_TREE = "C:/Users/in/Desktop/Projects/wa-tg-tun-new"
+for relative in (
+    "backend/src/core/ConnectionManager.ts",
+    "hooks/code_work_gate_common.py",
+    "docker-compose.yml",
+    "CLAUDE.md",
+):
+    chip_path = "{}/{}".format(CHIP_TREE, relative)
+    ordinary_path = "{}/{}".format(ORDINARY_TREE, relative)
+    check(
+        "a chip worktree holds gated source: {}".format(relative),
+        cwg.is_gated(chip_path) and not cwg.is_ephemeral(chip_path),
+        chip_path,
+    )
+    check(
+        "a chip worktree file is a lasting artifact: {}".format(relative),
+        cwg.work_class([chip_path]) == cwg.WORK_PERSISTENT,
+        chip_path,
+    )
+    check(
+        "an ordinary worktree is graded exactly the same: {}".format(relative),
+        cwg.is_gated(ordinary_path)
+        and gate.minimum_risk([chip_path]) == gate.minimum_risk([ordinary_path]),
+        (gate.minimum_risk([chip_path]), gate.minimum_risk([ordinary_path])),
+    )
+
+for path in (
+    "/home/dev/.claude/state/chips/trees/app-fix-a1b2c3d4/src/main.go",
+    "/home/dev/.claude/state/chips/trees/app-fix-a1b2c3d4/deploy/helm/values.yaml",
+):
+    check("a chip worktree in a posix home is source too: {}".format(path), cwg.is_gated(path), path)
+    check(
+        "a posix chip worktree file is a lasting artifact: {}".format(path),
+        cwg.work_class([path]) == cwg.WORK_PERSISTENT,
+        path,
+    )
+
+check(
+    "a test file inside a chip worktree keeps its own risk class",
+    gate.minimum_risk(["{}/backend/tests/connection.test.ts".format(CHIP_TREE)])
+    == gate.minimum_risk(["{}/backend/tests/connection.test.ts".format(ORDINARY_TREE)])
+    == "LOW",
+)
+
+# The exemption stops at the tree directory: the rest of `state` is the hooks' own bookkeeping
+# and stays throwaway, including the chip cards and the index beside the worktrees themselves.
+for path in (
+    "C:/Users/in/.claude/state/chips/trees/by-tree.json",
+    "C:/Users/in/.claude/state/chips/a1b2c3d4.json",
+    "C:/Users/in/.claude/state/gate-events.jsonl",
+    "C:/Users/in/.claude/state/checkpoints/proj.md",
+    "C:/Users/in/.claude/plans/rollout.md",
+    "/home/dev/.claude/state/chips/by-parent/parent.json",
+):
+    check("state outside a chip worktree stays ungated: {}".format(path), not cwg.is_gated(path), path)
+    check("state outside a chip worktree stays throwaway: {}".format(path), cwg.is_ephemeral(path), path)
+
+# The boundary is the tree directory: the worktree's own root is where the checkout begins, not
+# a file in it, so naming it alone is still bookkeeping.
+check("the tree directory itself stays throwaway", cwg.is_ephemeral(CHIP_TREE), CHIP_TREE)
+
 sid = session()
 try:
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=100.0, last_ts=140.0, durable_ts=110.0)
