@@ -153,7 +153,13 @@ reverted byte for byte, nor does staging or committing the approved bytes — th
 content, not edit events (a file still in conflict when reviewed is the exception: `git add` is
 its resolution step, so resolve and stage before the review). A clean merge or rebase
 of an approved candidate needs nothing; one resolved by hand is a delta candidate whose
-resolution diff gets the delta lane and a delta round.
+resolution diff gets the delta lane and a delta round. Clean means patch equivalence: the
+gate reads the reflog for a rebase that finished, asks `git cherry` whether every replaced
+commit came back with its patch-id intact, and on a faithful replay re-measures the candidate
+and moves the verdict's support onto the replayed bytes instead of expiring it. The residual
+risk is accepted deliberately: an upstream commit that changed the same file without
+conflicting is now part of the candidate's bytes, and no reviewer has read that combination.
+No conflict, no second review.
 
 ```
 MAX_REVIEW_ROUNDS = 3

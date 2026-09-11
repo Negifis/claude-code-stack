@@ -6480,4 +6480,194 @@ finally:
     cleanup(sid)
 
 
+# --- a rebase that finished: patch equivalence decides whether the verdict survives it
+# A completed rebase leaves both snapshots agreeing — the worktree is clean before it and clean
+# after it — so nothing but the reflog and the patch-ids of the replaced commits can tell a
+# faithful replay from a conflict someone resolved by hand. Real rebases in throwaway
+# repositories, because that is the only thing these code paths read.
+def replay_repo(directory, upstream, base="l1\nl2\nl3\nl4\nl5\nl6\n"):
+    """A repository whose `up` branch moved ahead, checked out on the candidate's branch.
+
+    `upstream` is what `up` leaves in hooks/cand.py, or None to move a file the candidate
+    never touches.
+    """
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-C", directory, "-c", "user.name=Code Work Gate",
+             "-c", "user.email=gate@example.invalid"] + list(arguments),
+            check=False, capture_output=True, text=True, encoding="utf-8",
+        )
+
+    subprocess.run(["git", "init", "--quiet", directory], check=True)
+    os.makedirs(os.path.join(directory, "hooks"))
+    for name, content in (("cand.py", base), ("other.py", "o\n")):
+        with open(os.path.join(directory, "hooks", name), "w", encoding="utf-8") as stream:
+            stream.write(content)
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    git("branch", "-M", "main")
+    git("checkout", "-q", "-b", "up")
+    name, content = ("cand.py", upstream) if upstream else ("other.py", "upstream\n")
+    with open(os.path.join(directory, "hooks", name), "w", encoding="utf-8") as stream:
+        stream.write(content)
+    git("commit", "-qam", "upstream")
+    git("checkout", "-q", "-b", "feat", "main")
+    return git
+
+
+def landed_candidate(sid, tree, git, content="l1\nl2\nl3\nl4\nl5\nfeature"):
+    """One reviewed edit, staged and committed, as a session reaches an approval."""
+    mark_edit(sid, tree, "hooks/cand.py", content)
+    mark_shell(sid, tree, "git add -A", action=lambda: git("add", "-A"))
+    mark_shell(sid, tree, "git commit -m feature",
+               action=lambda: git("commit", "-q", "-m", "feature"))
+
+
+def replay_marks(sid):
+    """The marker and the fingerprint its last content mark records."""
+    entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+    marks = entry.get("content_marks") or []
+    return entry, (marks[-1].get("fp") if marks else None)
+
+
+def carried_into_index(sid, tree, git, name):
+    """A lasting event that is not an edit: a file carried into the index, which re-measures the
+    candidate without changing a byte of it. This is where a stale baseline surfaces."""
+    with open(os.path.join(tree, "hooks", name), "w", encoding="utf-8") as stream:
+        stream.write("carried = True\n")
+    mark_shell(sid, tree, "git add -A", action=lambda: git("add", "-A"))
+
+
+def replay_covers(entry, stamp):
+    return gate.content_covers(entry, stamp, float(entry.get("last_durable_ts") or 0.0))
+
+
+# The upstream moved the head of the very file the candidate edited the foot of: git replays the
+# commit without a conflict and the bytes on disk move all the same.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_clean_") as tree:
+    git = replay_repo(tree, "upstream\nl2\nl3\nl4\nl5\nl6\n")
+    sid = session()
+    try:
+        landed_candidate(sid, tree, git)
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+        mark_shell(sid, tree, "git rebase up", action=lambda: git("rebase", "up"))
+        entry, replayed = replay_marks(sid)
+        on_disk = marker_hook.content_fingerprint(entry.get("content_paths"))
+        check("a clean rebase re-anchors the candidate's measurement on the replayed bytes",
+              replayed == on_disk and replayed != at_verdict and replayed is not None,
+              (at_verdict, replayed, on_disk))
+        check("a clean rebase raises no barrier and moves no freshness anchor",
+              not any(mark.get("unknown") for mark in entry.get("content_marks") or [])
+              and float(entry.get("last_durable_ts") or 0.0) < verdict_ts, entry)
+        carried_into_index(sid, tree, git, "carried.py")
+        entry, _ = replay_marks(sid)
+        check("a verdict stated before a clean rebase still covers the candidate after it",
+              replay_covers(entry, verdict_ts)
+              and float(entry.get("last_durable_ts") or 0.0) > verdict_ts, entry)
+        mark_edit(sid, tree, "hooks/cand.py", "l1\nl2\nl3\nl4\nl5\nedited by hand")
+        entry, _ = replay_marks(sid)
+        check("an edit made after a clean rebase still retires the verdict",
+              not replay_covers(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+
+# The upstream touched a file the candidate never had: the replay leaves its bytes alone.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_apart_") as tree:
+    git = replay_repo(tree, None)
+    sid = session()
+    try:
+        landed_candidate(sid, tree, git)
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+        mark_shell(sid, tree, "git rebase up", action=lambda: git("rebase", "up"))
+        carried_into_index(sid, tree, git, "carried.py")
+        entry, after = replay_marks(sid)
+        check("a rebase that left the candidate's files alone measures the same bytes and covers",
+              after == at_verdict and replay_covers(entry, verdict_ts), (at_verdict, after))
+    finally:
+        cleanup(sid)
+
+# The conflict is raised, resolved and continued inside one command, so the tree is clean on both
+# sides of it and only the diverged patch-id says a person wrote something here.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_resolved_") as tree:
+    git = replay_repo(tree, "l1\nl2\nl3\nl4\nl5\nupstream\n")
+    sid = session()
+    try:
+        landed_candidate(sid, tree, git)
+        verdict_ts = time.time()
+        _, at_verdict = replay_marks(sid)
+
+        def resolve():
+            git("rebase", "up")
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write("l1\nl2\nl3\nl4\nl5\nresolved by hand\n")
+            git("add", "-A")
+            subprocess.run(
+                ["git", "-C", tree, "-c", "user.name=Code Work Gate",
+                 "-c", "user.email=gate@example.invalid", "rebase", "--continue"],
+                check=False, capture_output=True, text=True,
+                env=dict(os.environ, GIT_EDITOR="true"),
+            )
+
+        mark_shell(sid, tree, "git rebase up && git rebase --continue", action=resolve)
+        entry, after = replay_marks(sid)
+        resolution = cwg.normalize_path(os.path.join(tree, "hooks", "cand.py"))
+        check("a rebase resolved by hand retires the verdict it was approved under",
+              not replay_covers(entry, verdict_ts) and after != at_verdict, (at_verdict, after))
+        check("the delta is scoped to the file the resolution diff names",
+              entry.get("content_paths") == [resolution]
+              and float(entry.get("last_durable_ts") or 0.0) > verdict_ts, entry)
+    finally:
+        cleanup(sid)
+
+# One command, two things: a faithful replay and a write of its own. A single measurement taken
+# afterwards cannot tell them apart, so the write decides and the verdict goes.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_and_write_") as tree:
+    git = replay_repo(tree, "upstream" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4"
+                      + chr(10) + "l5" + chr(10) + "l6" + chr(10))
+    sid = session()
+    try:
+        landed_candidate(sid, tree, git)
+        verdict_ts = time.time()
+
+        def replay_and_write():
+            git("rebase", "up")
+            with open(os.path.join(tree, "hooks", "cand.py"), "a", encoding="utf-8") as stream:
+                stream.write("formatted = True" + chr(10))
+
+        mark_shell(sid, tree, "git rebase up && format hooks/cand.py", action=replay_and_write)
+        entry, _ = replay_marks(sid)
+        check("a command that replayed and also wrote is not re-anchored on its own write",
+              not replay_covers(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+
+# An interrupted rebase is not a finished one: the repository is back where the candidate opened
+# and the operational track still reads that from git, exactly as before.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_abort_") as tree:
+    git = replay_repo(tree, "l1\nl2\nl3\nl4\nl5\nupstream\n")
+    sid = session()
+    try:
+        git("checkout", "-q", "-b", "aborting")
+        with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+            stream.write("l1\nl2\nl3\nl4\nl5\nfeature\n")
+        git("commit", "-qam", "feature")
+        opened_on = git("rev-parse", "HEAD").stdout.strip()
+
+        def abort():
+            git("rebase", "up")
+            git("rebase", "--abort")
+
+        mark_shell(sid, tree, "git rebase up; git rebase --abort", action=abort)
+        entry, after = replay_marks(sid)
+        check("an aborted rebase leaves the candidate where it opened, with nothing measured",
+              entry.get("head_at_start") == opened_on and after is None
+              and not entry.get("content_paths"), entry)
+        check("an aborted rebase still reads as a repository that changed nothing lasting",
+              gate.restored_to_head(entry), entry)
+    finally:
+        cleanup(sid)
+
+
 print("PASS: {} assertions".format(PASSED))
