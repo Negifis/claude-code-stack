@@ -133,6 +133,10 @@ def cleanup(sid, transcript=None):
     # A claim file outlives its marker by design, so a leftover one would make the next test's
     # session look like a concurrent writer and silently suppress its attribution.
     cwg.remove(cwg.claim_path(cwg.session_key(sid)))
+    # A packet capture outlives its candidate by design — the notification it binds can arrive
+    # after the cycle closed — so closing no longer sweeps one and the suite has to.
+    for capture in glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")):
+        cwg.remove(capture)
     if transcript:
         cwg.remove(transcript)
     # Rollout logs are evidence: one left behind would prove a Codex run for the next test.
@@ -1692,8 +1696,8 @@ for label, packet_on_disk, rewrite_after, other_packet, expect_bound in (
         bound = result.get("continue") is True and "decision" not in result
         check(label, bound is expect_bound, result)
         if expect_bound:
-            check("closing the candidate discards its packet captures",
-                  not glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")), sid)
+            check("closing the candidate keeps the packet captures, to be dropped by their own expiry",
+                  glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")), sid)
     finally:
         cleanup(sid, locals().get("transcript"))
 
@@ -6004,6 +6008,273 @@ check(
     any("Bash" in matcher for matcher in marker_events.get("PostToolUseFailure") or ()),
     marker_events,
 )
+
+
+# --- a capture outlives the candidate it was taken under, and the role is cut out of a packet
+# --- however it was assembled (report dd10c5ca, and the unbound round it followed)
+def rollout_records(records):
+    """One rollout log written record by record: (stamp, role, text).
+
+    `log_codex_run` writes a single round, briefed with the role's body. Neither of the two
+    shapes this section needs is expressible there: a session resumed for a second round holds
+    two briefs and two answers in the one file the first round opened, and a packet assembled
+    from the whole role file has to reach the log spelled exactly as the launch fed it.
+    """
+    day = os.path.join(CODEX_HOME, "sessions", *time.strftime("%Y %m %d").split())
+    os.makedirs(day, exist_ok=True)
+    path = os.path.join(day, "rollout-{}.jsonl".format(uuid.uuid4().hex))
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps({"timestamp": iso(records[0][0]), "type": "session_meta"}) + "\n")
+        for stamp, role, text in records:
+            stream.write(json.dumps({
+                "timestamp": iso(stamp), "type": "response_item",
+                "payload": {"type": "message", "role": role, "content": [{
+                    "type": "input_text" if role == "developer" else "output_text", "text": text,
+                }]},
+            }) + "\n")
+    last = max(stamp for stamp, _, _ in records)
+    os.utime(path, (last, last))
+    return path
+
+
+def review_notes(sid):
+    """What this session filed in the gate ledger about its review lanes, in order."""
+    path = cwg.event_log_path()
+    lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+    notes = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if record.get("kind") == "review" and record.get("session") == cwg.session_key(sid):
+            notes.append(record)
+    return notes
+
+
+def packet_launch(packet_file):
+    """The launch as the shell spells it, feeding the packet on stdin."""
+    path = packet_file.replace(chr(92), "/")
+    if re.match(r"^[A-Za-z]:/", path):
+        path = "/" + path[0].lower() + path[2:]
+    return 'codex exec - < "{}"  # CODE_WORK_GATE_REVIEW'.format(path)
+
+
+def write_packet(task_id, text):
+    path = os.path.join(AGENT_HOME, "packet-" + task_id + ".md")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    return path
+
+
+with open(os.path.join(os.path.dirname(HERE), "agents", "adversarial-reviewer.md"),
+          encoding="utf-8") as stream:
+    # The role file whole: what a packet carries when it was assembled by copying that file,
+    # front matter included, rather than the body the hook reads to tell a briefed session.
+    REVIEWER_FILE_TEXT = stream.read()
+BACKGROUND_HIGH = "[gate] verified: HIGH; Codex reviewed in the background"
+
+for label, role_in_packet, rival, expect_bound in (
+    ("opening on the whole role file, front matter and all", REVIEWER_FILE_TEXT, False, True),
+    ("opening on the role body alone", reviewer_role_text(), False, True),
+    ("opening on the whole role file, with another chat given the same words",
+     REVIEWER_FILE_TEXT, True, False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "bform" + uuid.uuid4().hex[:4]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        fed = role_in_packet + "\n\n" + PACKET_A
+        command = packet_launch(write_packet(task_id, fed))
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800,
+             durable_ts=now - 800)
+        capture_launch(sid, "codex-" + task_id, command)
+        events = [skill_use(now - 890, "development-verification", "skill-dev")]
+        simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+        events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(now - 699, "codex-" + task_id,
+                                  DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(now - 600, task_id, out_file, "completed"))
+        rollout_records([(now - 690, "developer", fed),
+                         (now - 650, "assistant", codex_cli_output(review_text("APPROVED")))])
+        if rival:
+            rollout_records([
+                (now - 688, "developer", fed),
+                (now - 648, "assistant",
+                 codex_cli_output(review_text("APPROVED", subject="another chat's candidate"))),
+            ])
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": BACKGROUND_HIGH})
+        bound = result.get("continue") is True and "decision" not in result
+        check("a packet " + label + " binds what it should", bound is expect_bound, result)
+        if rival:
+            check("the rival chat leaves the launch with no single session to bind to",
+                  any("no single briefed Codex verdict" in (note.get("reason") or "")
+                      for note in review_notes(sid)), review_notes(sid))
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+# The role file as an older copy of it: the body is intact, so a session given it is still
+# briefed, but the front matter differs — the whole-file cut misses and only the body cut lands,
+# leaving that front matter beside the brief. It is common to every packet built from that copy,
+# so it must never be what names a session, however short the brief beside it.
+DRIFTED_ROLE_FILE = REVIEWER_FILE_TEXT.replace("---", "---\nreview-packet-variant: 1", 1)
+check("the drifted role file still carries the role body verbatim",
+      reviewer_role_text() in DRIFTED_ROLE_FILE and DRIFTED_ROLE_FILE != REVIEWER_FILE_TEXT,
+      DRIFTED_ROLE_FILE[:64])
+SHORT_BRIEF = "Round 1 packet: the session store rotates ids on privilege change."
+
+for label, assembled, expected in (
+    ("the role file whole, then the brief", REVIEWER_FILE_TEXT + "\n\n" + PACKET_A, PACKET_A),
+    ("the role body, then the brief", reviewer_role_text() + "\n\n" + PACKET_A, PACKET_A),
+    ("a drifted copy of the role file, then the brief", DRIFTED_ROLE_FILE + "\n\n" + PACKET_A, PACKET_A),
+    ("no role at all", PACKET_A, PACKET_A),
+    ("nothing but the role", REVIEWER_FILE_TEXT, ""),
+    # The packet contract puts the role first and verbatim, so there is nothing below it to name
+    # a session by. Binding the words above it instead would name the session by a brief the
+    # reviewer read before it was told what it was reviewing.
+    ("the brief above the role", PACKET_A + "\n\n" + REVIEWER_FILE_TEXT, ""),
+):
+    packet = cwg.normalized(assembled)
+    distinctive = gate.distinctive_of(packet)
+    check("a packet assembled as " + label + " is named by its own words",
+          distinctive == cwg.normalized(expected), distinctive[:80])
+    check("what names a packet assembled as " + label + " is one unbroken run of it",
+          distinctive in packet, distinctive[:80])
+
+for label, brief, rival_brief, rival_verdict, expect_bound in (
+    # Ours never answers; the rival was given the same drifted front matter and a brief of its
+    # own. Binding by that front matter would hand this launch the rival's approval.
+    ("a drifted front matter never stands in for a brief too short to name a session",
+     SHORT_BRIEF, PACKET_B, "APPROVED", False),
+    # Both were given that front matter, only one this brief.
+    ("a packet whose front matter drifted still binds by the brief below it",
+     PACKET_A, PACKET_B, "REVISE", True),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "bdrift" + uuid.uuid4().hex[:4]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        fed = DRIFTED_ROLE_FILE + "\n\n" + brief
+        command = packet_launch(write_packet(task_id, fed))
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800,
+             durable_ts=now - 800)
+        capture_launch(sid, "codex-" + task_id, command)
+        events = [skill_use(now - 890, "development-verification", "skill-dev")]
+        simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+        events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(now - 699, "codex-" + task_id,
+                                  DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(now - 600, task_id, out_file, "completed"))
+        if expect_bound:
+            rollout_records([(now - 690, "developer", fed),
+                             (now - 650, "assistant", codex_cli_output(review_text("APPROVED")))])
+        rollout_records([
+            (now - 688, "developer", DRIFTED_ROLE_FILE + "\n\n" + rival_brief),
+            (now - 648, "assistant", codex_cli_output(
+                review_text(rival_verdict, subject="another chat's candidate"))),
+        ])
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": BACKGROUND_HIGH})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound, result)
+        if not expect_bound:
+            check("a brief too short to name a session leaves the launch nothing to bind by",
+                  any("nothing to bind by at launch" in (note.get("reason") or "")
+                      for note in review_notes(sid)), review_notes(sid))
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    task_id = "bsurv" + uuid.uuid4().hex[:4]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    fed = REVIEWER_FILE_TEXT + "\n\n" + PACKET_A
+    command = packet_launch(write_packet(task_id, fed))
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800,
+         durable_ts=now - 800)
+    capture_launch(sid, "codex-" + task_id, command)
+    captured = glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*"))
+    check("the launch is captured before it runs", len(captured) == 1, captured)
+
+    # A long session closes some other candidate while the lane is still running: the reviewer
+    # notifies after that, and the capture is the only thing that can name its session.
+    closing = write_transcript(base_events())
+    seed(sid, [cwg.SHELL_MUTATION_PATH])
+    closed = run(STOP_HOOK, {
+        "session_id": sid, "transcript_path": closing,
+        "last_assistant_message": "[gate] no-change: read-only inspection, nothing was modified",
+    })
+    check("the candidate in between closes",
+          closed.get("continue") is True and "decision" not in closed, closed)
+    check("closing a candidate leaves the captures of launches still in flight",
+          glob.glob(cwg.packet_capture_path(cwg.session_key(sid), "*")) == captured, sid)
+    cwg.remove(closing)
+
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800,
+         durable_ts=now - 800)
+    events = [skill_use(now - 890, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+    events.append(tool_result(now - 699, "codex-" + task_id,
+                              DETACHED_ACK.format(id=task_id, out=out_file)))
+    events.append(notification(now - 600, task_id, out_file, "completed"))
+    rollout_records([(now - 690, "developer", fed),
+                     (now - 650, "assistant", codex_cli_output(review_text("APPROVED")))])
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": BACKGROUND_HIGH})
+    check("a capture outlives the candidate it was taken under and still binds at the notification",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    now = time.time()
+    first = "bres1" + uuid.uuid4().hex[:4]
+    second = "bres2" + uuid.uuid4().hex[:4]
+    out_first = os.path.join(tasks_dir, first + ".output")
+    out_second = os.path.join(tasks_dir, second + ".output")
+    fed_first = REVIEWER_FILE_TEXT + "\n\n" + PACKET_A
+    fed_second = REVIEWER_FILE_TEXT + "\n\n" + PACKET_B
+    launch_first = packet_launch(write_packet(first, fed_first))
+    launch_second = packet_launch(write_packet(second, fed_second))
+    seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 1500, last_ts=now - 1400,
+         durable_ts=now - 1400)
+    capture_launch(sid, "codex-" + first, launch_first)
+    capture_launch(sid, "codex-" + second, launch_second)
+    events = [skill_use(now - 1490, "development-verification", "skill-dev")]
+    simplify_wave(events, now - 1480, "simplify", SIMPLIFY_LENSES)
+    for task_id, command, out_file, at in ((first, launch_first, out_first, now - 1200),
+                                           (second, launch_second, out_second, now - 900)):
+        events.append(bash_use(at, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(at + 1, "codex-" + task_id,
+                                  DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(at + 100, task_id, out_file, "completed"))
+    # `codex exec resume` appends to the first round's log: both rounds live in this one file,
+    # and each has to be read within its own launch-to-notification window.
+    rollout_records([
+        (now - 1190, "developer", fed_first),
+        (now - 1150, "assistant", codex_cli_output(review_text("REVISE"))),
+        (now - 890, "developer", fed_second),
+        (now - 850, "assistant", codex_cli_output(review_text("APPROVED"))),
+    ])
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                             "last_assistant_message": BACKGROUND_HIGH})
+    check("two rounds resumed into one rollout close the candidate",
+          result.get("continue") is True and "decision" not in result, result)
+    verdicts = [(note.get("task"), note.get("verdict")) for note in review_notes(sid)]
+    check("each resumed round binds the verdict of its own window",
+          verdicts == [(first, "REVISE"), (second, "APPROVED")], verdicts)
+finally:
+    cleanup(sid, locals().get("transcript"))
 
 
 print("PASS: {} assertions".format(PASSED))
