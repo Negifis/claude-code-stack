@@ -178,6 +178,9 @@ WRAPPER_RE = re.compile(r"^(?:timeout\s+(?:-\S+\s+)*\S+|time|nohup|command|built
 FINGERPRINT_INDEXED_FILES = 64
 FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
 FINGERPRINT_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+# How much path history one marker keeps: the candidate's own paths and the fingerprint's domain
+# are truncated alike, so the two stay comparable.
+MARKER_PATH_CAP = 128
 CONTENT_MARKS_KEPT = 32
 SHELL_READ_ONLY = "READ_ONLY"
 SHELL_VALIDATION = "VALIDATION"
@@ -859,12 +862,10 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
 
     `content_changed` names the subset of `candidate_paths` whose bytes this command actually
     rewrote; None means all of them, which is what a tool that writes a file reports. Only that
-    subset joins the fingerprint's domain, and the domain is what makes two measurements taken
-    at different moments comparable at all: a path that enters it later moves every fingerprint
-    with it, so a `git add` or a `git commit` naming a file it did not rewrite would retire the
-    approval of the bytes being committed. Everything else the path carries - its risk, its work
-    class, the freshness anchor - is unchanged, because the repository really did gain those
-    bytes and the candidate still answers for them.
+    subset joins the fingerprint's domain - see `snapshot_changes` for why a path the command
+    only moved between the worktree, the index and HEAD must stay out of it. Everything else the
+    path carries - its risk, its work class, the freshness anchor - is unchanged, because the
+    repository really did gain those bytes and the candidate still answers for them.
 
     `unresolved` means a mutation was observed but the snapshot could not name what it touched,
     so it may have been a source edit made through the shell. `snapshot_roots` bounds what an
@@ -967,12 +968,12 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "last_durable_ts": last_durable_ts,
         "last_path": str(candidate_paths[-1]),
         "edits": cycle["edits"] + 1,
-        "paths": paths[-128:],
+        "paths": paths[-MARKER_PATH_CAP:],
         "minimum_risk_seen": minimum_risk_seen,
         "path_overflow": overflow,
         "identity": cycle["identity"],
         "unattributed_durable": unattributed_durable,
-        "content_paths": content_paths[-128:],
+        "content_paths": content_paths[-MARKER_PATH_CAP:],
         "content_marks": content_marks,
         "head_at_start": cycle.get("head_at_start"),
         "refs_at_start": cycle.get("refs_at_start"),

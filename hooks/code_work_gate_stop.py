@@ -1736,9 +1736,12 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     cwg.retire_claims(session_key_)
     try:
         import code_work_gate_mark as mark
+    except ImportError:
+        # The marker may be replaced or broken independently; the cycle still closes. A fault
+        # inside the sweep itself is a defect and is left to surface.
+        mark = None
+    if mark is not None:
         mark.forget_stale_captures(session_key_)
-    except Exception:
-        pass
 
     current = cwg.read_json(marker)
     if current is None or current.get("last_ts") == candidate_ts:
