@@ -4369,12 +4369,12 @@ def candidate_repo(directory, branch):
     commit_paths(directory, "src/seed.py", "seed")
 
 
-def mark_edit(sid, repo, relative):
+def mark_edit(sid, repo, relative, content="changed = True"):
     """One gated edit reported through the marker hook, as PostToolUse delivers it."""
     target = os.path.join(repo, *relative.split("/"))
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8") as stream:
-        stream.write("changed = True\n")
+        stream.write(content + chr(10))
     run(MARK_HOOK, {
         "session_id": sid,
         "hook_event_name": "PostToolUse",
@@ -6342,6 +6342,142 @@ try:
           verdicts == [(first, "REVISE"), (second, "APPROVED")], verdicts)
 finally:
     cleanup(sid, locals().get("transcript"))
+# --- staging and committing already approved bytes leave the fingerprint where it was
+# The gate measures content, not edit events, so a candidate whose files only moved between the
+# worktree, the index and HEAD is still the candidate the reviewer read. These run through the
+# hook rather than through content_fingerprint alone, because what used to move was never a file:
+# it was the set of paths the fingerprint is taken over, which `git add` grew (report 42f294ba).
+with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
+    def repo_git(*args):
+        return subprocess.run(["git", "-C", tree] + list(args), check=False,
+                              capture_output=True, text=True, encoding="utf-8")
+
+    repo_git("init", "-q")
+    repo_git("config", "user.email", "gate@example.invalid")
+    repo_git("config", "user.name", "Code Work Gate")
+    os.makedirs(os.path.join(tree, "hooks"))
+    reviewed = os.path.join(tree, "hooks", "reviewed.py")
+    carried = os.path.join(tree, "hooks", "carried.py")
+    for seeded in (reviewed, carried):
+        with open(seeded, "w", encoding="utf-8") as stream:
+            stream.write("print('base')" + chr(10))
+    repo_git("add", "-A")
+    repo_git("commit", "-q", "-m", "base")
+
+    def mark_git(sid, *args):
+        """A git command as production delivers it: the snapshot pair around the work."""
+        mark_shell(sid, tree, " ".join(("git",) + args), action=lambda: repo_git(*args))
+
+    def measured(sid):
+        """The marker and the fingerprint its last content mark recorded."""
+        entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+        marks = entry.get("content_marks") or []
+        return entry, (marks[-1].get("fp") if marks else None)
+
+    def still_covers(entry, stamp):
+        return gate.content_covers(entry, stamp, float(entry.get("last_durable_ts") or 0.0))
+
+    sid = session()
+    try:
+        mark_edit(sid, tree, "hooks/reviewed.py", "print('reviewed')")
+        # A lasting write this candidate never had attributed to it - the copy a mirror script
+        # makes, another session's file in a shared home - which the commit below then names.
+        with open(carried, "w", encoding="utf-8") as stream:
+            stream.write("print('carried')" + chr(10))
+        verdict_ts = time.time()
+        _, at_verdict = measured(sid)
+        mark_git(sid, "add", "-A")
+        _, at_staged = measured(sid)
+        mark_git(sid, "commit", "-q", "-m", "landed")
+        entry, at_landed = measured(sid)
+        pending = repo_git("status", "--porcelain").stdout
+        check("staging and committing the reviewed bytes never move the fingerprint",
+              at_verdict == at_staged == at_landed and at_verdict is not None,
+              (at_verdict, at_staged, at_landed))
+        check("the commit did name a lasting path the candidate had not recorded",
+              len(entry.get("paths") or []) == 2 and len(entry.get("content_paths") or []) == 1,
+              entry)
+        check("no byte on disk moved while the candidate was staged and committed", pending == "", pending)
+        check("a verdict stated before the commit still covers the candidate",
+              still_covers(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+
+    sid = session()
+    try:
+        mark_edit(sid, tree, "hooks/reviewed.py", "print('first')")
+        verdict_ts = time.time()
+        mark_git(sid, "add", "-A")
+        mark_edit(sid, tree, "hooks/reviewed.py", "print('second')")
+        entry, _ = measured(sid)
+        check("a change to the reviewed bytes still retires the verdict",
+              not still_covers(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+        repo_git("checkout", "-q", "--", ".")
+        repo_git("reset", "-q")
+
+    sid = session()
+    try:
+        mark_edit(sid, tree, "hooks/reviewed.py", "print('staged')")
+        mark_git(sid, "add", "-A")
+        mark_edit(sid, tree, "hooks/reviewed.py", "print('on disk')")
+        verdict_ts = time.time()
+        _, at_verdict = measured(sid)
+        mark_git(sid, "commit", "-q", "-m", "stale index")
+        entry, after_commit = measured(sid)
+        check("committing a stale index still reads as a change of content",
+              after_commit != at_verdict and not still_covers(entry, verdict_ts),
+              (at_verdict, after_commit))
+    finally:
+        cleanup(sid)
+        repo_git("checkout", "-q", "--", ".")
+        repo_git("reset", "-q")
+
+    # Wider than the indexed tier, where nothing used to be measured at all: content alone is a
+    # measurement, so a large candidate keeps its approval across its own commit (report
+    # eedcca07, a mass restore that left 128 paths in the marker).
+    sid = session()
+    try:
+        wide = ["hooks/wide{}.py".format(index)
+                for index in range(marker_hook.FINGERPRINT_INDEXED_FILES + 6)]
+
+        def write_wide():
+            for relative in wide:
+                with open(os.path.join(tree, *relative.split("/")), "w", encoding="utf-8") as stream:
+                    stream.write("print('wide')" + chr(10))
+
+        mark_shell(sid, tree, "python -c write_wide", action=write_wide)
+        entry, at_verdict = measured(sid)
+        verdict_ts = time.time()
+        check("a candidate wider than the indexed tier is measured, not unknown",
+              at_verdict is not None
+              and len(entry.get("content_paths") or []) > marker_hook.FINGERPRINT_INDEXED_FILES,
+              entry)
+        mark_git(sid, "add", "-A")
+        mark_git(sid, "commit", "-q", "-m", "wide")
+        entry, at_landed = measured(sid)
+        check("a wide candidate keeps its approval across staging and committing",
+              at_landed == at_verdict and still_covers(entry, verdict_ts), (at_verdict, at_landed))
+        with open(os.path.join(tree, *wide[0].split("/")), "w", encoding="utf-8") as stream:
+            stream.write("print('wide, changed')" + chr(10))
+        check("a wide candidate still notices a byte that changed",
+              marker_hook.content_fingerprint(entry.get("content_paths")) != at_landed, at_landed)
+    finally:
+        cleanup(sid)
+        repo_git("checkout", "-q", "--", ".")
+
+sid = session()
+try:
+    marker, _ = gate_paths(sid)
+    legacy = {"first_ts": time.time(), "last_ts": time.time(), "last_path": "c:/repo/a.py",
+              "paths": ["c:/repo/a.py", "c:/repo/b.py"], "edits": 2}
+    check("seed legacy marker", cwg.write_json(marker, legacy), legacy)
+    resumed = marker_hook.cycle_start(marker, time.time(), None, ["c:/repo/a.py"])
+    check("a marker written before the domain existed keeps measuring what it measured",
+          resumed["content_paths"] == legacy["paths"], resumed)
+finally:
+    cleanup(sid)
 
 
 print("PASS: {} assertions".format(PASSED))
