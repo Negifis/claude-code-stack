@@ -72,9 +72,17 @@ TEMP_ROOT = (
 )
 # The agent's own bookkeeping, scoped to the home configuration. A repository that commits
 # .claude/plans or .claude/state is publishing files people read later, so those stay gated.
+#
+# One directory under `state` is not bookkeeping: `state/chips/trees/<tree>/` holds a chip's
+# git worktree, an ordinary checkout of a project that is merely created under the
+# configuration home. Its files are source, and grading them as throwaway silently switched
+# the gate off for every delegated session — the marker recorded the paths but no lasting
+# artifact, so a fully reviewed HIGH change closed as an OPERATIONAL candidate. The exemption
+# stops at the tree directory itself: a chip card (`state/chips/<id>.json`), the index under
+# `trees/`, checkpoints and hook state stay throwaway.
 HOME_BOOKKEEPING = (
     r"(?:^|/)(?:users|home)/[^/]+/(?:\.claude|\.codex|\.agents)/"
-    r"(?:state|plans)(?:/|$)"
+    r"(?:state(?!/chips/trees/[^/]+/)|plans)(?:/|$)"
 )
 EPHEMERAL_PATH_RE = re.compile(
     TEMP_ROOT + r"[^/]+$|"
