@@ -6662,6 +6662,11 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_kept_") as tree:
         mark_shell(sid, tree, "git rebase up", action=lambda: git("rebase", "up"))
 
         def keep_ours():
+            # The over-eager `git add -A` and the bare `git reset` that undoes it are how a
+            # resolution usually starts, and that reset rewrites ORIG_HEAD to the half-rebased
+            # commit - which is why the rebase start is read from the reflog instead.
+            git("add", "-A")
+            git("reset")
             with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
                 stream.write(reviewed + chr(10) + "feature" + chr(10))
             git("add", "-A")
@@ -6675,6 +6680,42 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_kept_") as tree:
         check("a resolution that reproduces the reviewed bytes is still a barrier",
               after == at_verdict and raised and not replay_covers(entry, verdict_ts),
               (at_verdict, after, entry.get("content_marks")))
+    finally:
+        cleanup(sid)
+
+# The conflict is on the second commit, so the rebase start lies below the window the continuing
+# command opens, and the resolver adds a file while resolving.
+with tempfile.TemporaryDirectory(prefix="cwg_rebase_second_") as tree:
+    git = replay_repo(tree, "l1" + chr(10) + "l2" + chr(10) + "l3" + chr(10) + "l4" + chr(10)
+                      + "l5" + chr(10) + "upstream" + chr(10))
+    sid = session()
+    try:
+        mark_edit(sid, tree, "hooks/first.py", "first = True")
+        mark_shell(sid, tree, "git commit -am first",
+                   action=lambda: (git("add", "-A"), git("commit", "-q", "-m", "first")))
+        landed_candidate(sid, tree, git)
+        verdict_ts = time.time()
+        mark_shell(sid, tree, "git rebase up", action=lambda: git("rebase", "up"))
+        opened_on = git("rev-parse", "HEAD").stdout.strip()
+
+        def resolve_and_add():
+            with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
+                stream.write("l1" + chr(10) + "resolved" + chr(10))
+            with open(os.path.join(tree, "hooks", "added.py"), "w", encoding="utf-8") as stream:
+                stream.write("added = True" + chr(10))
+            git("add", "-A")
+
+        mark_shell(sid, tree, "resolve && git add -A", action=resolve_and_add)
+        mark_shell(sid, tree, "git rebase --continue",
+                   action=lambda: git("rebase", "--continue", GIT_EDITOR="true"))
+        scope = marker_hook.finished_rebase(tree, opened_on)
+        entry, _ = replay_marks(sid)
+        check("the scope covers what the resolver added, not only what the conflict was in",
+              scope == {"clean": False, "resolved": [
+                  cwg.normalize_path(os.path.join(tree, "hooks", name))
+                  for name in ("added.py", "cand.py")]}, scope)
+        check("a conflict on a later commit still retires the verdict",
+              not replay_covers(entry, verdict_ts), entry)
     finally:
         cleanup(sid)
 

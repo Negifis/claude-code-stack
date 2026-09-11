@@ -979,9 +979,9 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         content_marks = content_marks_after(content_marks, now, fingerprint, unknown)
         cwg.log_event(
             "durable", session=cwg.session_key(data.get("session_id")),
-            reason=("edit" if cwg.durable_paths(incoming) else
+            reason=("rebase-resolution" if replay == REPLAY_RESOLVED else
+                    "edit" if cwg.durable_paths(incoming) else
                     "unattributed" if unattributed_risk else
-                    "rebase-resolution" if replay == REPLAY_RESOLVED else
                     "unresolved-write-capable"),
             paths=[p for p in cwg.durable_paths(incoming)][:5],
             tool=str(data.get("tool_name") or ""),
@@ -1106,9 +1106,9 @@ def on_home_ground(path, cwd, snapshot_roots, data):
     return bool(HOME_REFERENCE_RE.search(command))
 
 
-def head_commit(cwd, rev="HEAD"):
-    """The commit this revision names in this working directory, or None when it names none."""
-    head = (cwg.git_text(cwd, ["rev-parse", "--verify", "-q", rev], timeout=5) or "").strip()
+def head_commit(cwd):
+    """The commit HEAD points at in this working directory, or None outside a repository."""
+    head = (cwg.git_text(cwd, ["rev-parse", "HEAD"], timeout=5) or "").strip()
     return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
@@ -1144,10 +1144,13 @@ def finished_rebase(cwd, before_head):
     because `git pull --rebase`, which is how a branch is usually brought forward, writes the
     whole pull command line as the reflog action and only then `(finish): returning to`.
 
-    Patches are compared against `ORIG_HEAD`, the tip the rebase started from, rather than
-    against the commit this command started on: a conflict stopped in one command and continued
-    in the next would otherwise be compared with the half-rebased state and read as a faithful
-    replay of nothing.
+    The tip the patches are compared against is the rebase own starting point, read from the
+    entry the reflog keeps directly below the `(start): checkout` it wrote - the value HEAD held
+    before the rebase touched it. Not the commit this command started on, which for a conflict
+    stopped in one command and continued in the next is the half-rebased state and would read as
+    a faithful replay of nothing; and not `ORIG_HEAD`, which names the same commit until any
+    bare `git reset` during the stop overwrites it and hands the resolution the same false clean.
+    A rebase whose start has fallen out of the scan is not judged at all.
 
     RESIDUAL RISK, accepted deliberately: a clean rebase still changes the bytes of a candidate
     file whenever the upstream touched the same file and git combined both edits textually
@@ -1166,22 +1169,24 @@ def finished_rebase(cwd, before_head):
     )
     if listing is None:
         return None
-    finished = False
-    base = None
-    for line in listing.splitlines():
-        commit, _, message = line.partition(" ")
-        # The commit the replay was laid onto, read before the window can close on it: a rebase
-        # continued in a later command started exactly there.
-        if base is None and "(start): checkout" in message:
-            base = commit
-        # The entry that still names the commit the command started on closes the window: it
-        # predates the command, and so does everything below it.
-        if commit == before_head:
-            break
-        finished = finished or "(finish): returning to" in message
-    else:
+    entries = [line.partition(" ") for line in listing.splitlines()]
+    # The entry that still names the commit the command started on closes the window: it predates
+    # the command, and so does everything below it.
+    window = next((at for at, (commit, _, _) in enumerate(entries) if commit == before_head), None)
+    if window is None or not any(
+        "(finish): returning to" in message for _, _, message in entries[:window]
+    ):
         return None
-    if not finished:
+    # The rebase this command finished began at the oldest start inside its window - two rebases
+    # chained in one command are one replay to the candidate - or, when the rebase began in an
+    # earlier command, at the first start below the window.
+    starts = [at for at, (_, _, message) in enumerate(entries) if "(start): checkout" in message]
+    inside = [at for at in starts if at <= window]
+    start = inside[-1] if inside else next((at for at in starts if at > window), None)
+    if start is None or start + 1 >= len(entries):
+        return None
+    base, started_from = entries[start][0], entries[start + 1][0]
+    if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in (base, started_from)):
         return None
     # Asked only once the reflog says a rebase finished, because an ordinary commit moves HEAD
     # too and would otherwise pay for these every time.
@@ -1189,7 +1194,6 @@ def finished_rebase(cwd, before_head):
         located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
         if located is None or os.path.exists(os.path.join(cwd, located.strip())):
             return None
-    started_from = head_commit(cwd, "ORIG_HEAD") or before_head
     compared = cwg.git_run(cwd, ["cherry", head, started_from], timeout=10)
     if not compared or compared[0] != 0:
         return None
@@ -1199,17 +1203,23 @@ def finished_rebase(cwd, before_head):
     diverged = [line.split()[1] for line in replaced if line.startswith("+ ")]
     if not diverged:
         return {"clean": True, "resolved": []}
-    # Both ends of the resolution: the commit that had to be resolved names the files the
-    # conflict was in, and the commits the replay wrote name whatever the resolver added while
-    # resolving it. A replay whose base could not be read contributes the first half alone.
-    if base:
-        written = cwg.git_text(
-            cwd,
-            ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
-             "{}..{}".format(base, head)],
-            timeout=10,
-        )
-        diverged += (written or "").split()
+    # Both ends of the resolution, and only those: the commit that had to be resolved names the
+    # files the conflict was in, and its replacement names whatever the resolver added while
+    # resolving it. The replacements are the commits the replay wrote that no old patch-id
+    # accounts for - a commit replayed faithfully beside the resolved one stays out.
+    written = cwg.git_text(
+        cwd,
+        ["rev-list", "--max-count={}".format(REBASE_REPLACED_LIMIT),
+         "{}..{}".format(base, head)],
+        timeout=10,
+    )
+    reproduced = cwg.git_run(cwd, ["cherry", started_from, head], timeout=10)
+    if written is None or not reproduced or reproduced[0] != 0:
+        return {"clean": False, "resolved": []}
+    faithful = {
+        line.split()[1] for line in reproduced[1].splitlines() if line.startswith("- ")
+    }
+    diverged += [commit for commit in written.split() if commit not in faithful]
     root = (cwg.git_text(cwd, ["rev-parse", "--show-toplevel"], timeout=5) or "").strip()
     names = set()
     for commit in diverged:
