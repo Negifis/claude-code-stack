@@ -19,7 +19,6 @@ import datetime
 import fnmatch
 import hashlib
 import html
-import glob
 import json
 import math
 import os
@@ -266,6 +265,16 @@ def reviewer_role():
     opening lines pass as briefed. Neither lane can attest that the reviewer obeyed its role —
     only that the role was the one on disk.
     """
+    return reviewer_role_texts()[1]
+
+
+def reviewer_role_texts():
+    """(whole_file, body_below_front_matter) of the reviewer role, normalized.
+
+    A packet carries the role in one of two spellings: the file as it sits on disk, front matter
+    and all, or only the body — which is what the harness delivers to the native lane and so what
+    marks a session briefed. Both have to be known to tell a packet's own words from the role's.
+    """
     # Cached for the process, which is one Stop event: an unreadable role file therefore fails
     # every session in that run rather than being retried, and the lane falls back to native.
     if "role" not in _CODEX_ROLE:
@@ -275,11 +284,12 @@ def reviewer_role():
         )
         try:
             with open(path, encoding="utf-8", errors="replace") as stream:
-                body = stream.read().split("---", 2)[-1]
+                whole = stream.read()
         except OSError:
-            body = ""
-        _CODEX_ROLE["role"] = normalized(body)
-    return _CODEX_ROLE["role"]
+            whole = ""
+        _CODEX_ROLE["file"] = normalized(whole)
+        _CODEX_ROLE["role"] = normalized(whole.split("---", 2)[-1]) if whole else ""
+    return _CODEX_ROLE["file"], _CODEX_ROLE["role"]
 
 
 def message_text(payload):
@@ -497,6 +507,30 @@ def codex_produced(text, started, finished, since):
 PACKET_MIN_CHARS = 200
 
 
+def distinctive_of(packet):
+    """The run of a packet's own words after the reviewer role: what names one session.
+
+    Every review is given the same role, so only the rest of the packet tells one session from
+    another — and it has to stay a single unbroken run of the packet's text, because that is what
+    the rollout log records verbatim. Both spellings of the role are cut, the file before its
+    body: a packet assembled from the whole role file, front matter included, has only its body
+    recognized otherwise, and cutting that from the middle splices the front matter onto the
+    brief — a string no record holds, which is how real reviews went unbound.
+
+    The last run is the answer, not the longest. The packet contract puts the role first and
+    verbatim, so the brief is what follows it. Taking the longest would hand a packet whose front
+    matter did not match this machine's file — an older copy pasted in, a line edited since —
+    that unmatched front matter as its identity, and front matter is common to every packet built
+    the same way: it would bind the verdict of whichever session happened to answer, not of the
+    one given this brief. A short run binds nothing, which the caller enforces.
+    """
+    parts = [packet]
+    for role in reviewer_role_texts():
+        if role:
+            parts = [piece for part in parts for piece in part.split(role)]
+    return " ".join(parts[-1].split())
+
+
 def packet_of_launch(command, call_id):
     """(fed_on_stdin, distinctive_packet_text) for a Codex launch, from the marker hook's capture.
 
@@ -527,8 +561,7 @@ def packet_of_launch(command, call_id):
     text = capture.get("text")
     if not isinstance(text, str):
         return True, ""
-    role = reviewer_role()
-    distinctive = " ".join((text.replace(role, " ") if role else text).split())
+    distinctive = distinctive_of(text)
     if len(distinctive) < PACKET_MIN_CHARS:
         return True, ""
     return True, distinctive
@@ -1695,11 +1728,17 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
 
     # The attribution registry outlives no candidate: what this session announced is only ever
     # read by a command running at the same time, and the cycle it belonged to is over. The
-    # packet captures go with it: every Stop re-reads the transcript, so a capture has to
-    # outlive the notification it binds, but not the candidate.
+    # packet captures do outlive it. A background lane is launched under one candidate and
+    # notifies whenever it finishes, which in a long session is often after that candidate has
+    # closed; a capture discarded with the cycle left its verdict bound to nothing, forever. So
+    # a capture is dropped only by its own day-long expiry, which this closing is an occasion to
+    # apply — otherwise nothing sweeps a session that launches no further review.
     cwg.retire_claims(session_key_)
-    for capture in glob.glob(cwg.packet_capture_path(session_key_, "*")):
-        cwg.remove(capture)
+    try:
+        import code_work_gate_mark as mark
+        mark.forget_stale_captures(session_key_)
+    except Exception:
+        pass
 
     current = cwg.read_json(marker)
     if current is None or current.get("last_ts") == candidate_ts:
