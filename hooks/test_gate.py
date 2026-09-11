@@ -4349,14 +4349,17 @@ def switch_branch(directory, branch):
     subprocess.run(["git", "-C", directory, "checkout", "--quiet", "-b", branch], check=True)
 
 
+# Every throwaway repository in this file commits under the same identity, so git never falls
+# back to the machine's own and the tests stay reproducible on a bare checkout.
+GIT_IDENTITY = ("-c", "user.name=Code Work Gate", "-c", "user.email=gate@example.invalid")
+
+
 def commit_paths(directory, relative, message):
     subprocess.run(["git", "-C", directory, "add", "--", relative], check=True)
-    subprocess.run([
-        "git", "-C", directory,
-        "-c", "user.name=Code Work Gate",
-        "-c", "user.email=gate@example.invalid",
-        "commit", "--quiet", "-m", message,
-    ], check=True)
+    subprocess.run(
+        ["git", "-C", directory] + list(GIT_IDENTITY) + ["commit", "--quiet", "-m", message],
+        check=True,
+    )
 
 
 def candidate_repo(directory, branch):
@@ -6491,11 +6494,11 @@ def replay_repo(directory, upstream, base="l1\nl2\nl3\nl4\nl5\nl6\n"):
     `upstream` is what `up` leaves in hooks/cand.py, or None to move a file the candidate
     never touches.
     """
-    def git(*arguments):
+    def git(*arguments, **environment):
         return subprocess.run(
-            ["git", "-C", directory, "-c", "user.name=Code Work Gate",
-             "-c", "user.email=gate@example.invalid"] + list(arguments),
+            ["git", "-C", directory] + list(GIT_IDENTITY) + list(arguments),
             check=False, capture_output=True, text=True, encoding="utf-8",
+            env=dict(os.environ, **environment) if environment else None,
         )
 
     subprocess.run(["git", "init", "--quiet", directory], check=True)
@@ -6603,12 +6606,8 @@ with tempfile.TemporaryDirectory(prefix="cwg_rebase_resolved_") as tree:
             with open(os.path.join(tree, "hooks", "cand.py"), "w", encoding="utf-8") as stream:
                 stream.write("l1\nl2\nl3\nl4\nl5\nresolved by hand\n")
             git("add", "-A")
-            subprocess.run(
-                ["git", "-C", tree, "-c", "user.name=Code Work Gate",
-                 "-c", "user.email=gate@example.invalid", "rebase", "--continue"],
-                check=False, capture_output=True, text=True,
-                env=dict(os.environ, GIT_EDITOR="true"),
-            )
+            # The editor git would open on the replayed commit message, answered by `true`.
+            git("rebase", "--continue", GIT_EDITOR="true")
 
         mark_shell(sid, tree, "git rebase up && git rebase --continue", action=resolve)
         entry, after = replay_marks(sid)

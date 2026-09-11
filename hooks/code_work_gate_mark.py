@@ -1153,10 +1153,6 @@ def finished_rebase(cwd, before_head):
     head = head_commit(cwd)
     if not head or head == before_head:
         return None
-    for name in ("rebase-merge", "rebase-apply"):
-        located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
-        if located is None or os.path.exists(os.path.join(cwd, located.strip())):
-            return None
     listing = cwg.git_text(
         cwd, ["reflog", "-n", str(REBASE_REFLOG_SCAN), "--format=%H %gs"], timeout=5
     )
@@ -1174,6 +1170,12 @@ def finished_rebase(cwd, before_head):
         return None
     if not finished:
         return None
+    # Asked only once the reflog says a rebase finished, because an ordinary commit moves HEAD
+    # too and would otherwise pay for these every time.
+    for name in ("rebase-merge", "rebase-apply"):
+        located = cwg.git_text(cwd, ["rev-parse", "--git-path", name], timeout=3)
+        if located is None or os.path.exists(os.path.join(cwd, located.strip())):
+            return None
     compared = cwg.git_run(cwd, ["cherry", head, before_head], timeout=10)
     if not compared or compared[0] != 0:
         return None
