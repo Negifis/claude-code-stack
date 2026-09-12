@@ -70,10 +70,12 @@ inventory script that measures the listing cost lives with the stage-2 backup.
 
 | Piece | Event | Role |
 |---|---|---|
-| `hooks/code_work_gate_mark.py` | `PreToolUse`/`PostToolUse`/`PostToolUseFailure` on edits and shell | Marks the candidate (paths, class, risk floor); on `PostToolUse` injects one line when a candidate opens or its floor rises, and records a Codex outage from a finished `codex exec` call. |
+| `hooks/code_work_gate_mark.py` | `PreToolUse`/`PostToolUse`/`PostToolUseFailure` on edits and shell | Marks the candidate (paths, class, risk floor); on `PostToolUse` injects one line when a candidate opens or its floor rises, and records a Codex outage from a finished foreground `codex exec` call (the Stop hook records it for a background lane, from the stderr capture the command named, when its notification brings no verdict). A verdict expires through an unresolved pre-command snapshot only for a write-capable command: anything not proven read-only (an allowlist per pipeline segment — `ls`, `cat`, `grep`, `wc`, git's reading subcommands…; any redirect other than a discarded or merged stderr, substitution, heredoc or script block counts as writing). The marker also keeps a fingerprint of its lasting paths at every durable change (`content_marks`), so a verdict given before an edit that was reverted byte for byte still covers the candidate. An unattributed change under a root the command neither ran in nor names (another session's edit seen through the shared home) raises no floor. A cycle the same branch resumes after the idle limit keeps its rounds and its spent block and wait budgets alike — the accepted trade for not losing review evidence overnight. |
 | `hooks/code_work_gate_prompt.py` | `UserPromptSubmit` | One line naming the open candidate's class, floor and receipt shape; silent when nothing is open. |
-| `hooks/code_work_gate_stop.py` | `Stop` | The finite validator: skill invoked, one simplify lane for HIGH, legal review transitions, fresh approval for HIGH, receipt; three blocks per unchanged candidate. |
+| `hooks/code_work_gate_stop.py` | `Stop` | The finite validator: skill invoked, one simplify lane for HIGH, legal review transitions, fresh approval for HIGH, receipt; three blocks per unchanged candidate. A backgrounded Codex lane is bound at its `<task-notification>` to the verdict one briefed Codex session stated in the rollout log between launch and notification (the output file is not evidence); a backgrounded native reviewer is judged from the result its notification carries, filed at the launch, and whatever the lane does after stating its verdict — stopped, killed, resumed without one — is activity after it; a closure result with no round-3 ESCALATE before it is review activity, never a closure; a turn may end while the session's own background task is in flight (eight waits per candidate, two hours per task, `TaskStop`/`failed` recorded as failed activity). |
+| `state/gate-events.jsonl` | written by the gate hooks | Append-only ledger of gate decisions (`close`, `wait`, `block`, `review`, `durable`), one JSON line each, rotated once at 1 MB. Read it to see why a session was blocked without replaying the transcript. |
 | `hooks/codex_lane.py` | CLI + used by the marker | Circuit breaker for the Codex lane: `check` prints `CODEX_LANE: available` or the recorded outage; `record`/`clear` by hand. State in `state/codex-lane.json`. |
+| `hooks/gate_inbox.py` | CLI + `SessionStart` (digest) | Anomaly inbox `state/gate-anomalies.jsonl`: `report` files an agent's disagreement with a block (with the marker, the state, the session's ledger tail and the Stop hook's own view of the transcript); `scan` derives anomalies from the ledger by fixed rules; `list`/`show`/`ack` triage; `register` makes the calling session the gate-ops session (`state/gate-ops-session.json`) that `report` tells the agent to message with `mcp__ccd_session_mgmt__send_message`; `digest` injects the unresolved ones into a session started from `~/.claude` as the fallback. |
 | `hooks/test_gate.py` | by hand | Regression suite for all of the above. |
 
 The simplify pass is one lane, `agents/simplify-reviewer.md` (Sonnet, medium, `maxTurns: 40`),
@@ -121,14 +123,43 @@ records the parent's verdict after the parent has checked the result, and `--acc
 child session for `archive_session`. Its regression suite is `hooks/chip_handoff_test.py`.
 
 State lives in `state/chips/<chip-id>.json`, found through two index directories:
-`by-tree/<tree-key>` for the child's own worktree and `by-parent/<sessionId>` for the parent's
-reminder, so each hook path costs one keyed file open and never a directory scan.
+`by-tree/<tree-key>` for the child's own worktree and `by-parent/<id>` for the parent's
+reminder, so each hook path costs a keyed file open and never a directory scan. `by-parent`
+holds only what is still pending — acceptance removes the entry — so `status` reads the cards
+themselves instead. A directory is deliberately not an index: two sessions share a checkout
+routinely, and an operational chip runs in its parent's own directory, so treating possession
+of a directory as parent authority would let a stranger, or the chip's own child, accept it.
+Every write to a card or an index happens under `state/chips/.lock` (`chip_lock`, a mkdir lock
+with a 3s wait and a 60s staleness break); a writer that cannot take it drops its bookkeeping
+rather than bury another party's verdict.
 
-Two registrations in `settings.json`: `Stop` (`hook-stop`), which blocks a chip session at most
-three times when its final message carries a `[gate]` receipt but the work was never handed
-back, and otherwise reminds the parent once — without blocking — that a reported chip is
-unverified; and `PostToolUse` on `mcp__ccd_session_mgmt__send_message` (`hook-notified`), which
-records that the parent was told and which session told it.
+**Two id spaces, and they do not convert.** A hook payload carries only the transcript session
+id (`state/session-index.jsonl`, `~/.claude/projects/**/<id>.jsonl`); the session-management
+tools use a `local_…` id that is a different uuid entirely. So `by-parent` is written under
+both — the `local_…` id the parent passes to `open`, and the transcript id `open` reads from
+`CLAUDE_CODE_SESSION_ID` — and `archive_session` only ever accepts the `local_…` form, which
+the child must supply itself via `finish --child-session`. A transcript id recorded by a hook
+is kept separately as `child_hook_session` and is never offered as an archive target.
+
+`open` is not something anybody has to remember: `hook-spawn` runs as a `PreToolUse` hook on
+`mcp__ccd_session__spawn_task`, cuts the chip there and returns `updatedInput` carrying the
+handoff block and the chip's worktree as the child's `cwd`. It picks code mode whenever the
+parent's directory is a repository. Both ids of a session are resolved through the app's own
+registry (`%APPDATA%/Claude/claude-code-sessions/**/local_<id>.json`, which pairs `sessionId`
+with `cliSessionId`), cached in `state/session-map.json` for five minutes; that is also what
+lets a resumed parent — new transcript id, same `local_…` id — still be reminded about chips it
+opened earlier.
+
+The chip is cut before the tool runs, because the child needs its directory to exist the moment it starts, so it stays `pending` until `hook-spawned` (PostToolUse) confirms the spawn landed; `hook-spawn-failed` (PostToolUseFailure) and a 10-minute sweep on the next spawn remove a chip whose tool was denied or cancelled, worktree and branch included. Idempotency is keyed on a `<!-- chip:<id> -->` token in the footer, not on the visible heading, so a task that merely quotes the heading is still registered.
+
+Six registrations in `settings.json`: `PreToolUse` on the spawn tool (`hook-spawn`), `PostToolUse` and `PostToolUseFailure` on it (`hook-spawned`, `hook-spawn-failed`); `Stop`
+(`hook-stop`), which blocks a chip session at
+most three times when its final message carries a `[gate]` receipt but the work was neither
+handed back nor even attempted, and otherwise lists — without blocking, and repeating until
+each is closed — the chips waiting for the acceptance of the session that opened them; and
+`mcp__ccd_session_mgmt__send_message` on both `PostToolUse` (`hook-notified`) and
+`PostToolUseFailure` (`hook-notify-failed`), because a parent that runs unattended refuses
+delivery outright, and a chip must not be held hostage to a send that cannot succeed.
 
 ## Windows tooling
 

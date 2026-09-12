@@ -165,10 +165,19 @@ def stderr_file_of(command):
     match = STDERR_REDIRECT_RE.search(text)
     if not match:
         return None
-    raw = match.group(1)
-    assignments = {name: value.strip("\"'") for name, value in ASSIGNMENT_RE.findall(text)}
-    raw = VARIABLE_RE.sub(lambda m: assignments.get(m.group(1), m.group(0)), raw)
-    return windows_path(raw)
+    return windows_path(resolve_variables(text, match.group(1)))
+
+
+def resolve_variables(command, token):
+    """`token` with `$VAR`/`${VAR}` replaced from assignments in the same command text.
+
+    A variable the command does not assign stays as written, so a caller can tell an unresolved
+    path from a real one.
+    """
+    assignments = {
+        name: value.strip("\"'") for name, value in ASSIGNMENT_RE.findall(str(command or ""))
+    }
+    return VARIABLE_RE.sub(lambda m: assignments.get(m.group(1), m.group(0)), str(token or ""))
 
 
 def newest_capture(started=None, now=None):

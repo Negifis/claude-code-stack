@@ -72,9 +72,17 @@ TEMP_ROOT = (
 )
 # The agent's own bookkeeping, scoped to the home configuration. A repository that commits
 # .claude/plans or .claude/state is publishing files people read later, so those stay gated.
+#
+# One directory under `state` is not bookkeeping: `state/chips/trees/<tree>/` holds a chip's
+# git worktree, an ordinary checkout of a project that is merely created under the
+# configuration home. Its files are source, and grading them as throwaway silently switched
+# the gate off for every delegated session — the marker recorded the paths but no lasting
+# artifact, so a fully reviewed HIGH change closed as an OPERATIONAL candidate. The exemption
+# stops at the tree directory itself: a chip card (`state/chips/<id>.json`), the index under
+# `trees/`, checkpoints and hook state stay throwaway.
 HOME_BOOKKEEPING = (
     r"(?:^|/)(?:users|home)/[^/]+/(?:\.claude|\.codex|\.agents)/"
-    r"(?:state|plans)(?:/|$)"
+    r"(?:state(?!/chips/trees/[^/]+/)|plans)(?:/|$)"
 )
 EPHEMERAL_PATH_RE = re.compile(
     TEMP_ROOT + r"[^/]+$|"
@@ -217,6 +225,85 @@ def candidate_shape(entry):
         "files": len(set(lasting)),
         "first_ts": float(entry.get("first_ts")),
     }
+
+
+# One line per gate decision, so a verdict that "expired" or a block that surprised the parent
+# can be read back instead of reconstructed from a transcript. Bounded: rotated once at this size.
+EVENT_LOG_LIMIT = 1024 * 1024
+
+
+def config_home():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def normalized(text):
+    return " ".join(str(text or "").split()).lower()
+
+
+def packet_capture_path(session_key_, tool_use_id):
+    """Where the marker hook keeps what a Codex launch fed on stdin, for the Stop hook to bind by."""
+    return os.path.join(tempfile.gettempdir(), "cwg_packet_{}_{}.json".format(session_key_, tool_use_id))
+
+
+def git_run(cwd, arguments, timeout):
+    """(exit code, stdout) of `git -C cwd …`, or None when git could not be run — a hang too."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd] + list(arguments), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.returncode, proc.stdout
+
+
+def git_text(cwd, arguments, timeout):
+    """`git -C cwd …` stdout as text, or None on any failure."""
+    result = git_run(cwd, arguments, timeout)
+    return result[1] if result and result[0] == 0 else None
+
+
+def refs_digest(cwd, timeout=3):
+    """A digest of every ref and what it points at, or None outside a repository.
+
+    A commit on a side branch, a tag, a stash, a push that moved a remote-tracking ref: each
+    changes this, while an aborted rebase or an undone edit leaves it as it was.
+    """
+    import hashlib
+    listing = git_text(cwd, ["for-each-ref", "--format=%(refname) %(objectname)"], timeout)
+    return hashlib.sha256(listing.encode("utf-8", "replace")).hexdigest() if listing is not None else None
+
+
+def identity_root(identity):
+    """The repository root half of a candidate identity (`<root>#<branch>`), or empty."""
+    return str(identity or "").partition("#")[0]
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def event_log_path():
+    return os.path.join(config_home(), "state", "gate-events.jsonl")
+
+
+def log_event(kind, **fields):
+    """Append one gate event; never raises, never blocks a hook on its own bookkeeping."""
+    try:
+        path = event_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > EVENT_LOG_LIMIT:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        record = {"ts": time.time(), "kind": kind}
+        record.update(fields)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def receipt_requirements(floor):
