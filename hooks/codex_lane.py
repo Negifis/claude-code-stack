@@ -4,7 +4,9 @@ Codex lane circuit breaker.
 The transcripts of 2026-08 show the Codex review lane failing to deliver a verdict in about
 60% of its launches, almost always for one of two deterministic reasons the CLI prints itself:
 the ChatGPT usage limit ("You've hit your usage limit ... try again at 3:30 PM") or a model
-at capacity. Each failed launch still cost the parent several turns at full context, and then
+at capacity. A model newer than the installed CLI is refused just as deterministically, on
+every launch until the CLI is upgraded. Each failed launch still cost the parent several turns
+at full context, and then
 the native lane ran anyway. So the failure is recorded once, with the time the CLI itself
 named, and every later candidate checks the record before launching Codex instead of
 rediscovering the outage the expensive way.
@@ -35,9 +37,13 @@ LIMIT_PLAIN_RE = re.compile(r"^ERR(?:OR)?:\s*You've hit your usage limit", re.IG
 CAPACITY_RE = re.compile(
     r"^ERR(?:OR)?:\s*(?:Selected )?model is at capacity", re.IGNORECASE | re.MULTILINE
 )
+# A model newer than the installed CLI is refused on every launch until the CLI is upgraded.
+UPGRADE_RE = re.compile(
+    r"^ERR(?:OR)?:[^\n]*requires a newer version of Codex", re.IGNORECASE | re.MULTILINE
+)
 # When the CLI names no retry time, this is how long a launch is not worth trying again.
 DEFAULT_OUTAGE = 30 * 60.0
-# A usage-limit message without a time: the limit windows are hours, not minutes.
+# A usage-limit message without a time, or a CLI too old for the model: hours, not minutes.
 DEFAULT_LIMIT_OUTAGE = 3 * 3600.0
 # The longest a single record may idle the lane, whatever time the CLI named: a wrong parse
 # then costs one failed launch later, not a day of native-only reviews.
@@ -119,6 +125,8 @@ def outage_from_text(text, now=None):
         return now_ts + DEFAULT_LIMIT_OUTAGE, "codex usage limit"
     if CAPACITY_RE.search(text):
         return now_ts + DEFAULT_OUTAGE, "codex model at capacity"
+    if UPGRADE_RE.search(text):
+        return now_ts + DEFAULT_LIMIT_OUTAGE, "codex CLI too old for the model, upgrade @openai/codex"
     return None
 
 

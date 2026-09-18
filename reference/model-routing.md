@@ -10,7 +10,7 @@ requirement.
 |---|---|---|
 | Deterministic lookup, evidence collection, one named command | `haiku` (pass explicitly) | low |
 | Repository exploration | `Explore` profile: Sonnet, `maxTurns: 50` | medium |
-| Bounded simplify pass | `simplify-reviewer` profile: Sonnet, `maxTurns: 40` | medium |
+| Bounded simplify pass | `simplify-reviewer` for STANDARD, the three `simplify-*-reviewer` lenses for HIGH: Sonnet, `maxTurns: 40` | medium |
 | Routine implementation, focused QA, web research | `general-purpose` with `model: "sonnet"` passed explicitly | medium/high |
 | Architecture, security, root cause, adversarial review | `adversarial-reviewer` profile: Fable, `maxTurns: 60`; or Opus/Fable by explicit choice | high |
 | Orchestration, integration, final decision, user answer | primary agent | session default |
@@ -49,10 +49,21 @@ exists or that the most expensive tier is required for every review.
 
 External Codex is a distinct runtime and the default adversarial-review engine, because a
 verdict from another model is worth more than a second opinion from this one — when it is
-available: `hooks/codex_lane.py check` reports a recorded usage-limit or capacity outage, and
-the round then goes to the native reviewer without a launch. For implementation it stays
+available. When `hooks/codex_lane.py check` reports a recorded outage, the round goes to the
+native reviewer instead, without a Codex launch. For implementation it stays
 selective: broad or mechanical multi-file work, patch/test/debug loops, an independent
 implementation pass — not every multi-file change. Never run Claude and Codex over the same
 lane in the same round.
+
+There is no third engine, and driving the ChatGPT web app would not make one. Among the things
+OpenAI's Terms of Use say you may not do is «Осуществлять автоматическое или программное
+извлечение данных или Выходных данных»; they separately forbid circumventing rate limits or
+protective measures, and the termination clause reserves suspending or deleting the account for
+breaching them (https://openai.com/policies/terms-of-use/, effective 1 January 2026). That is the
+account Codex authenticates through, and this machine holds no OpenAI API key to fall back on.
+The engineering objection points the same way: evidence produced and judged inside one session is
+not independent — the same distinction a browser draws when it marks script-dispatched events
+untrusted. When Codex cannot review, the fallback is the native reviewer, and the fix for a CLI
+too old for its model is upgrading the CLI.
 
 See codex-routing.md for the routing details.

@@ -16,16 +16,16 @@ template — it is a stack in daily use on Windows, published as-is.
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (1377 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (1781 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
 | `skills/` | 16 skills for engineering workflow, verification, writing, delegation, chips and task start |
-| `agents/` | The adversarial reviewer, the single `simplify-reviewer` lane, and an `Explore` profile that overrides the built-in one |
+| `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
 | `tools/` | `worktree-audit.mjs` — parks unsaved work and prunes stale worktrees (the `Setup` maintenance hook) |
 | `reference/` | On-demand docs the model reads only when relevant — model routing, Codex routing, config layout, and the September 2026 usage optimization with its measured baseline |
 | `output-styles/` | `dense` — the terse output style the whole setup assumes |
 | `rules/` | Path-scoped rules (UI/UX rules that load only for front-end files) |
 | `CLAUDE.md` | The global instructions the hooks enforce |
-| `install.py` | The installer, with its own suite in `test_install.py` (80 assertions) |
+| `install.py` | The installer, with its own suite in `test_install.py` (71 assertions) |
 
 ---
 
@@ -40,8 +40,9 @@ It does **not** perform judgment. It checks a small set of facts that either app
 transcript or don't:
 
 - the `development-verification` skill was invoked once for this session;
-- for a high-risk candidate, one foreground `simplify-reviewer` result exists for the
-  candidate (the three legacy lens names are still accepted);
+- a standard-risk candidate has one foreground `simplify-reviewer` result, and a high-risk one
+  a foreground result from each of the three lenses (`simplify-reuse-reviewer`,
+  `simplify-quality-reviewer`, `simplify-efficiency-reviewer`);
 - for a high-risk candidate, an independent adversarial review produced a verdict, and that
   verdict is *newer* than the last change to a lasting artifact;
 - the review verdict came from a session that was actually briefed with the reviewer role —
@@ -63,8 +64,9 @@ The gate also speaks *before* the Stop event. `code_work_gate_mark.py` announces
 once when it opens and once when its risk floor rises, and `code_work_gate_prompt.py` names
 the open candidate and its receipt on every prompt, so the receipt shape is known long before
 the model tries to finish. `codex_lane.py` is a circuit breaker for the Codex lane: a
-usage-limit or capacity refusal printed by the Codex CLI is recorded once, with the retry time
-the CLI named, and `/adversarial-review` skips the lane until then instead of paying several
+usage-limit or capacity refusal printed by the Codex CLI, or its refusal of a model newer than
+itself, is recorded once — with the retry time the CLI named, or a default when it names none —
+and `/adversarial-review` skips the lane until then instead of paying several
 full-context turns to rediscover the outage. The breaker chooses the engine; it is never read
 as review evidence.
 
@@ -131,7 +133,7 @@ python hooks/hygiene_hooks_test.py
 | `engineering-workflow` | Before non-trivial code, config, schema, migration or API work |
 | `development-verification` | Final checks and finite risk-based review before finishing implementation |
 | `root-cause-engineering` | A bug, flaky test, regression, perf problem or production incident |
-| `simplify` | A changed scope with a concrete readability, reuse, control-flow or efficiency concern — a local pass, or one `simplify-reviewer` lane carrying all three lenses |
+| `simplify` | A changed scope with a concrete readability, reuse, control-flow or efficiency concern — a local pass, one `simplify-reviewer` lane for STANDARD, or the three lens lanes for HIGH |
 | `chip-handoff` | Spawning a chip, finishing inside one, or accepting one that reported back |
 | `task-start` | Starting work on a tracked issue in its own worktree, branch and named session |
 | `current-docs` | Anything version-sensitive about a library, API, framework or CLI |
@@ -202,15 +204,17 @@ python test_install.py
 
 ## Configuration
 
-`settings.example.json` is a template, not a file to edit. Its `__CLAUDE_DIR__` and
-`__PYTHON__` placeholders are deliberately unquoted: the installer splits each command into
-arguments and adds the quoting the launching shell actually needs, which is more than
-quoting spaces — on Windows a path containing `&`, `(`, `^` or a dozen other legal filename
-characters is shell syntax too.
+`settings.example.json` is a template, not a file to edit. Every hook in it is in exec form:
+`command` is the executable and `args` its argument vector, so Claude Code starts the hook
+without a shell. Nothing needs quoting — a config path with spaces, `&`, `%` or `!` stays one
+argument — and a hook that runs past its timeout is ended itself. In shell form on Windows the
+timeout ended only Git Bash, which could leave the hook's Python suspended and the session
+waiting on it.
 
 So don't substitute by hand. Run `install.py` without `--merge-settings` and read
-`~/.claude/settings.stack.json`: it holds the finished, correctly quoted hooks block, ready
-to copy into your own `settings.json` if you would rather merge it yourself.
+`~/.claude/settings.stack.json`: it holds the finished hooks block, each `__PYTHON__` and
+`__CLAUDE_DIR__` placeholder replaced as one argument, ready to copy into your own
+`settings.json` if you would rather merge it yourself.
 
 Worth knowing before you turn it on:
 
@@ -226,10 +230,9 @@ Worth knowing before you turn it on:
 - `autoCompactWindow: "300k"` and `skillListingMaxDescChars: 320` ship in the template on
   purpose; the measurements behind them are in `reference/usage-optimization-2026-09.md`.
   Drop them if your sessions are short.
-- The installer refuses a config path it cannot quote safely for the launching shell. On
-  Windows that means no `"`, no `%` and no `!` anywhere in the path: quoting does not stop
-  `cmd.exe` expanding `%NAME%`, delayed expansion eats `!NAME!`, and a literal quote cannot
-  be represented at all.
+- Exec form needs Claude Code 2.1.139 or later; the template's `minimumVersion` is higher
+  anyway. `--merge-settings` recognizes this stack's hooks in either form, so an earlier
+  shell-form install is replaced, not registered twice.
 
 ---
 
@@ -242,7 +245,9 @@ are in `reference/usage-optimization-2026-09.md`; the headline ones:
 - context size, not subagents, was the cost — 90% of main requests ran at 150k–1M tokens,
   subagents were 6% of context tokens;
 - the mandatory three-lens simplify wave cost three Sonnet contexts and nine minutes per
-  candidate for findings that overlapped by 6%; it is now one lane, required for HIGH only;
+  candidate for findings that overlapped by 6%; it became one lane, required for HIGH only.
+  HIGH has since gone back to the three lenses as separate lanes, and one `simplify-reviewer`
+  lane is the STANDARD pass;
 - the Codex review lane failed to deliver a verdict in 60% of its launches, almost always on
   quota or capacity, and the native lane then ran anyway; hence the breaker;
 - 29% of review delta rounds had no changed candidate between them, including 62

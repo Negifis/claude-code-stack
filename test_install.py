@@ -4,7 +4,6 @@ Run with `python test_install.py`. No test framework, same style as the hook sui
 """
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,64 +34,54 @@ def run_installer(target, *flags, python=sys.executable):
     )
 
 
+def hook_entries(settings):
+    return [h for groups in settings.get("hooks", {}).values() for g in groups for h in g["hooks"]]
+
+
 def hook_commands(settings):
-    return [h["command"] for groups in settings.get("hooks", {}).values()
-            for g in groups for h in g["hooks"]]
+    return [h["command"] for h in hook_entries(settings)]
 
 
-# --- command resolution and quoting -------------------------------------------------------
+# --- hook resolution ----------------------------------------------------------------------
 
-def test_posix_quoting():
-    was = install.WINDOWS
-    install.WINDOWS = False
-    try:
-        hostile = Path("/tmp/$(id)/a b/`x`/'q'/$HOME")
-        out = install.resolve_command(
-            "__PYTHON__ -S __CLAUDE_DIR__/hooks/guard.py", hostile, "/usr/bin/python3"
-        )
-        tokens = install.shlex.split(out, posix=True)
-        check("posix: three arguments survive", len(tokens) == 3, out)
-        check("posix: script path is one literal argument",
-              tokens[2] == f"{hostile.as_posix()}/hooks/guard.py", tokens)
-        # A real shell has to reproduce the path byte for byte rather than expanding anything
-        # in it — the tokenizer above proves the split, this proves the expansion.
-        sh = shutil.which("sh")
-        if sh:
-            echoed = subprocess.run([sh, "-c", f"printf %s {out.split(' ', 2)[2]}"],
-                                    capture_output=True, text=True)
-            check("posix: shell reproduces the path verbatim",
-                  echoed.returncode == 0
-                  and echoed.stdout == f"{hostile.as_posix()}/hooks/guard.py",
-                  f"rc={echoed.returncode} out={echoed.stdout!r}")
-        else:
-            print("SKIP posix: no sh on PATH to verify expansion")
-    finally:
-        install.WINDOWS = was
+def test_template_is_exec_form():
+    template = json.loads((HERE / "settings.example.json").read_text(encoding="utf-8"))
+    shell_form = [h["command"] for h in hook_entries(template) if "args" not in h]
+    check("template: every hook is in exec form", not shell_form, shell_form)
 
 
-def test_windows_quoting():
-    was = install.WINDOWS
-    install.WINDOWS = True
-    try:
-        out = install.resolve_command(
-            "__PYTHON__ __CLAUDE_DIR__/hooks/stop.py",
-            Path("C:/Users/a b/.claude"), "C:/Program Files/Python/python.exe",
-        )
-        check("windows: spaces are quoted", out.count('"') == 4, out)
-        # Every one of these is legal in a Windows filename and syntax to cmd.exe.
-        for special in "&()[]{}^=;+,`~<>|'":
-            quoted = install.shell_quote(f"C:/cfg{special}1/.claude")
-            check(f"windows: {special!r} forces quoting", quoted.startswith('"'), quoted)
-        for hostile, why in ((Path("C:/%USERNAME%/.claude"), "percent"),
-                             (Path('C:/a"b/.claude'), "quote"),
-                             (Path("C:/a!b!/.claude"), "delayed-expansion bang")):
-            try:
-                install.resolve_command("__PYTHON__ __CLAUDE_DIR__/x.py", hostile, "python.exe")
-                check(f"windows: {why} path rejected", False, "no error raised")
-            except install.InstallError:
-                check(f"windows: {why} path rejected", True)
-    finally:
-        install.WINDOWS = was
+def test_placeholders_become_single_arguments():
+    for windows, target in ((False, Path("/tmp/$(id)/a b/`x`/'q'/$HOME")),
+                            (True, Path("C:/Users/a b/%USERNAME%/x!y!/&(^)/.claude"))):
+        was = install.WINDOWS
+        install.WINDOWS = windows
+        try:
+            hook = install.resolve_hook(
+                {"type": "command", "command": "__PYTHON__",
+                 "args": ["-S", "__CLAUDE_DIR__/hooks/guard.py"], "timeout": 10},
+                target, "/opt/py 3/python",
+            )
+            check(f"resolve (windows={windows}): the interpreter is the command, verbatim",
+                  hook["command"] == "/opt/py 3/python", hook)
+            check(f"resolve (windows={windows}): the script path is one literal argument",
+                  hook["args"] == ["-S", f"{target.as_posix()}/hooks/guard.py"], hook)
+            check(f"resolve (windows={windows}): other fields survive", hook["timeout"] == 10, hook)
+        finally:
+            install.WINDOWS = was
+
+
+def test_resolved_arguments_arrive_verbatim():
+    # Claude Code starts an exec-form hook without a shell; so does this spawn. Every character
+    # below is legal in a Windows file name and syntax to at least one shell.
+    target = Path(tempfile.gettempdir()) / "cfg a&b (c) %X% !y! $(id) ^z"
+    hook = install.resolve_hook(
+        {"type": "command", "command": "__PYTHON__",
+         "args": ["-c", "import sys; print(sys.argv[1])", "__CLAUDE_DIR__/hooks/x.py"]},
+        target, sys.executable,
+    )
+    out = subprocess.run([hook["command"], *hook["args"]], capture_output=True, text=True)
+    check("resolve: a hostile path reaches the hook as one verbatim argument",
+          out.stdout.strip() == f"{target.as_posix()}/hooks/x.py", out.stdout + out.stderr)
 
 
 def test_powershell_hook_is_windows_only():
@@ -101,7 +90,7 @@ def test_powershell_hook_is_windows_only():
         install.WINDOWS = windows
         try:
             resolved = install.resolve_settings(Path("/tmp/cfg"), "python3")
-            present = any(".ps1" in c for c in hook_commands(resolved))
+            present = any(arg.endswith(".ps1") for h in hook_entries(resolved) for arg in h["args"])
             check(f"ps1 hook present on windows={windows}", present is expected, present)
         finally:
             install.WINDOWS = was
@@ -171,6 +160,46 @@ def test_merge_replaces_only_its_own_installed_hooks():
         {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": disabled}]}]}}, stack, owned)
     check("ownership: a path that merely starts with an owned one survives",
           disabled in hook_commands(kept), hook_commands(kept))
+    # The same two cases for entries already in exec form, as this installer now writes them.
+    stale_exec = {"type": "command", "command": "old-python",
+                  "args": [f"{target.as_posix()}/hooks/code_work_gate_stop.py"]}
+    merged = install.merge_settings({"hooks": {"Stop": [{"hooks": [stale_exec]}]}}, stack, owned)
+    check("ownership: a stale exec-form registration of our own script is replaced",
+          "old-python" not in hook_commands(merged), hook_commands(merged))
+    outsider = {"type": "command", "command": "python",
+                "args": ["/opt/company-hooks/code_work_gate_stop.py"]}
+    kept = install.merge_settings({"hooks": {"Stop": [{"hooks": [outsider]}]}}, stack, owned)
+    check("ownership: somebody else's exec-form hook survives",
+          outsider in hook_entries(kept), hook_entries(kept))
+    # A hand-edited settings.json is the one input the repo does not control.
+    malformed = [{"type": "command", "command": "python", "args": "x.py"},
+                 {"type": "command", "command": "python", "args": None}]
+    kept = install.merge_settings({"hooks": {"Stop": [{"hooks": malformed}]}}, stack, owned)
+    check("ownership: a hook whose args is not a list is kept, not misread",
+          all(hook in hook_entries(kept) for hook in malformed), hook_entries(kept))
+
+
+def test_legacy_shell_form_install_is_replaced():
+    """What the previous, shell-form installer wrote for a target with a space: quoted paths."""
+    for windows, target, python, legacy in (
+        (True, Path("C:/Users/Jane Doe/.claude"), "C:/Program Files/Python/python.exe",
+         '"C:/Program Files/Python/python.exe" "C:/Users/Jane Doe/.claude/hooks/code_work_gate_stop.py"'),
+        (False, Path("/home/jane doe/.claude"), "/usr/bin/python3",
+         "/usr/bin/python3 '/home/jane doe/.claude/hooks/code_work_gate_stop.py'"),
+    ):
+        was = install.WINDOWS
+        install.WINDOWS = windows
+        try:
+            stack = install.resolve_settings(target, python)
+            live = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": legacy}]}]}}
+            merged = install.merge_settings(live, stack, install.template_script_paths(target))
+            check(f"legacy: a quoted shell-form registration is replaced (windows={windows})",
+                  legacy not in hook_commands(merged), hook_commands(merged))
+            check(f"legacy: the stack ends up registered once (windows={windows})",
+                  len(hook_commands(merged)) == len(hook_commands(stack)),
+                  f"{len(hook_commands(stack))} -> {len(hook_commands(merged))}")
+        finally:
+            install.WINDOWS = was
 
 
 def test_ownership_survives_a_target_path_with_spaces():
@@ -289,6 +318,8 @@ def test_full_install_round_trip():
         expected = len(hook_commands(install.resolve_settings(target, sys.executable)))
         check("install: every stack hook is registered",
               len(hook_commands(settings)) == expected, hook_commands(settings))
+        check("install: every registered hook is in exec form",
+              all("args" in h for h in hook_entries(settings)), hook_entries(settings))
         check("install: skills landed", (target / "skills" / "simplify" / "SKILL.md").exists())
         check("install: CLAUDE.md landed", (target / "CLAUDE.md").exists())
 
@@ -303,12 +334,14 @@ def test_full_install_round_trip():
 
 
 for test in [
-    test_posix_quoting,
-    test_windows_quoting,
+    test_template_is_exec_form,
+    test_placeholders_become_single_arguments,
+    test_resolved_arguments_arrive_verbatim,
     test_powershell_hook_is_windows_only,
     test_merge_is_idempotent_across_interpreters,
     test_merge_preserves_user_content,
     test_merge_replaces_only_its_own_installed_hooks,
+    test_legacy_shell_form_install_is_replaced,
     test_ownership_survives_a_target_path_with_spaces,
     test_backup_dirs_are_unique,
     test_preflight_blocks_before_writing,

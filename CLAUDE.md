@@ -42,22 +42,24 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
 # Code Work Gate
 
 `development-verification` is the single code-work gate: work class, risk, candidate-bound
-checks, one bounded simplify lane, one review lane per round, finite closure, and the terminal
+checks, a bounded simplify pass, one review lane per round, finite closure, and the terminal
 `[gate]` receipt. Nothing wraps it in another loop.
 
 - Persistent work (a lasting artifact) takes the full track; operational work (a command
   against a live system) is judged before execution and closes with an operational receipt;
   a step that changed nothing closes as `no-change`.
-- LOW: the relevant deterministic check. STANDARD: affected checks. HIGH: affected checks,
-  one `simplify-reviewer` lane, and one independent adversarial review — Codex first
+- LOW: the relevant deterministic check. STANDARD: affected checks and one `simplify-reviewer`
+  lane. HIGH: affected checks, the three simplify lenses (`simplify-reuse-reviewer`,
+  `simplify-quality-reviewer`, `simplify-efficiency-reviewer`) launched together, and one
+  independent adversarial review — Codex first
   (`/adversarial-review`, after `codex_lane.py check`), the native reviewer when Codex cannot
   deliver a verdict. One engine per round, never both.
-- `VERDICT: APPROVED` ends review; a new round needs a changed candidate or new evidence, and an
-  approved candidate is not re-reviewed to confirm a merge or rebase. `ESCALATE` ends only the
-  review loop; the parent continues with the skill's bounded closure and, after `ESCALATE` or
-  `REVIEW_UNAVAILABLE`, may commit the owned scope, push a non-protected owned branch, and open
-  a ready or draft PR — never merge, deploy, force-push, bypass protection, or include
-  unrelated user changes.
+- `VERDICT: APPROVED` ends review; a new round needs a changed candidate or new evidence, and a
+  clean merge or rebase of this session's own approved candidate is not re-reviewed. `ESCALATE`
+  ends only the review loop; the parent continues with the skill's bounded closure and, after
+  `ESCALATE` or `REVIEW_UNAVAILABLE`, may commit the owned scope, push a non-protected owned
+  branch, and open a ready or draft PR — never merge, deploy, force-push, bypass protection, or
+  include unrelated user changes.
 - The Stop hook checks observable facts only (skill invoked, lane results, legal transitions,
   a fresh approval for HIGH, a receipt), with a hard three-block cap per unchanged candidate;
   the PostToolUse and prompt hooks name the open candidate's class and floor in advance. It

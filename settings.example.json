@@ -21,7 +21,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File __CLAUDE_DIR__/hooks/plugin_autoupdate.ps1",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "__CLAUDE_DIR__/hooks/plugin_autoupdate.ps1"],
             "timeout": 15,
             "statusMessage": "Checking plugin updates..."
           }
@@ -31,7 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_session_start.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_session_start.py"],
             "timeout": 10,
             "statusMessage": "Continuity: restoring task checkpoint..."
           }
@@ -41,7 +43,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/session_guard.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/session_guard.py"],
             "timeout": 10,
             "statusMessage": "Checking working tree for other sessions..."
           }
@@ -51,7 +54,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/gate_inbox.py digest",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/gate_inbox.py", "digest"],
             "timeout": 5,
             "statusMessage": "Gate inbox: checking anomaly reports..."
           }
@@ -63,7 +67,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_prompt.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_prompt.py"],
             "timeout": 10
           }
         ]
@@ -72,7 +77,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_prompt.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_prompt.py"],
             "timeout": 5
           }
         ]
@@ -83,7 +89,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_subagent.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_subagent.py"],
             "timeout": 10
           }
         ]
@@ -95,12 +102,14 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
-            "timeout": 5
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_mark.py"],
+            "timeout": 15
           },
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_progress.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_progress.py"],
             "timeout": 10
           }
         ]
@@ -110,8 +119,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
-            "timeout": 5
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_mark.py"],
+            "timeout": 15
           }
         ]
       },
@@ -120,7 +130,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-notified",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-notified"],
             "timeout": 10
           }
         ]
@@ -130,7 +141,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawned",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-spawned"],
             "timeout": 15
           }
         ]
@@ -142,8 +154,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
-            "timeout": 5
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_mark.py"],
+            "timeout": 15
           }
         ]
       },
@@ -152,7 +165,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-notify-failed",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-notify-failed"],
             "timeout": 10
           }
         ]
@@ -162,7 +176,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawn-failed",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-spawn-failed"],
             "timeout": 30
           }
         ]
@@ -173,8 +188,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_stop.py",
-            "timeout": 10,
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_stop.py"],
+            "timeout": 20,
             "statusMessage": "Code Work Gate check"
           }
         ]
@@ -183,7 +199,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_stop.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_stop.py"],
             "timeout": 10,
             "statusMessage": "Final output lint"
           }
@@ -193,7 +210,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-stop",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-stop"],
             "timeout": 15,
             "statusMessage": "Chip handoff check"
           }
@@ -206,7 +224,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/chip_handoff.py hook-spawn",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/chip_handoff.py", "hook-spawn"],
             "timeout": 30,
             "statusMessage": "Registering the chip's way back..."
           }
@@ -217,8 +236,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
-            "timeout": 5
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_mark.py"],
+            "timeout": 10
           }
         ]
       },
@@ -227,8 +247,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/code_work_gate_mark.py",
-            "timeout": 10
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/code_work_gate_mark.py"],
+            "timeout": 20
           }
         ]
       },
@@ -237,7 +258,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ -S __CLAUDE_DIR__/hooks/comment_density_guard.py",
+            "command": "__PYTHON__",
+            "args": ["-S", "__CLAUDE_DIR__/hooks/comment_density_guard.py"],
             "timeout": 10
           }
         ]
@@ -247,7 +269,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/continuity_loop_guard.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/continuity_loop_guard.py"],
             "timeout": 10
           }
         ]
@@ -258,7 +281,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/session_index.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/session_index.py"],
             "timeout": 15
           }
         ]
@@ -269,7 +293,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "__PYTHON__ __CLAUDE_DIR__/hooks/worktree_snapshot.py",
+            "command": "__PYTHON__",
+            "args": ["__CLAUDE_DIR__/hooks/worktree_snapshot.py"],
             "timeout": 120,
             "statusMessage": "Saving unfinished work before removal..."
           }
@@ -282,7 +307,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node __CLAUDE_DIR__/tools/worktree-audit.mjs --fix",
+            "command": "node",
+            "args": ["__CLAUDE_DIR__/tools/worktree-audit.mjs", "--fix"],
             "timeout": 300,
             "statusMessage": "Sweeping stale worktrees..."
           }

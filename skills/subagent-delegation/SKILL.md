@@ -16,7 +16,8 @@ call is not.
 - a non-overlapping implementation scope with one file owner;
 - a focused specialist check;
 - one read-only adversarial review for high-risk work;
-- the single `simplify-reviewer` lane when `simplify` needs one;
+- the simplify lanes `simplify` requires: one `simplify-reviewer` for STANDARD, the three lens
+  agents for HIGH — one pass, not a panel;
 - independent QA whose evidence can be checked by the parent.
 
 Keep small, linear, tightly coupled, destructive, sensitive, and ordinary sequential work local.
@@ -43,7 +44,7 @@ requirements, integration, verification, and the final answer.
 ## Model and effort
 
 The agent profile's model and effort are the default; the profiles in `~/.claude/agents` are
-routed by lane already (`Explore` and `simplify-reviewer` on Sonnet/medium,
+routed by lane already (`Explore` and the simplify lanes on Sonnet/medium,
 `adversarial-reviewer` on Fable/high). Override only for a clear reason:
 
 - a deterministic lookup or a named command: `haiku`;
