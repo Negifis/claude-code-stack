@@ -103,12 +103,13 @@ def write(root, name, text):
         handle.write(text)
 
 
-def write_session_registry(transcript_id, ccd_id):
+def write_session_registry(transcript_id, ccd_id, cwd=None):
     """Fake one entry of the app's session registry — the only place the two ids meet."""
     root = os.path.join(HOME_OVERRIDE["APPDATA"], "Claude", "claude-code-sessions", "ws")
     os.makedirs(root, exist_ok=True)
     with open(os.path.join(root, ccd_id + ".json"), "w", encoding="utf-8") as handle:
-        json.dump({"sessionId": ccd_id, "cliSessionId": transcript_id}, handle)
+        json.dump({"sessionId": ccd_id, "cliSessionId": transcript_id,
+                   **({"cwd": cwd} if cwd else {})}, handle)
     try:
         os.remove(os.path.join(os.path.dirname(chips_dir()), "session-map.json"))
     except OSError:
@@ -229,7 +230,7 @@ def test_no_commits_says_so(root):
     chip_id, worktree = open_chip(repo)
     code, out, _ = cli(worktree, "finish")
     check("finish succeeds", code == 0, out)
-    check("message reports no changes", "Изменений в коде нет" in out, out)
+    check("message reports no changes", "изменений нет" in out, out)
     check("outcome recorded", record_of(chip_id)["outcome"] == "no-changes")
 
 
@@ -615,7 +616,7 @@ def test_spawn_hook_does_not_register_twice(root):
     prompt = first["hookSpecificOutput"]["updatedInput"]["prompt"]
     code, again = spawn(repo, prompt=prompt, session="transcript-twice",
                         tool_use_id="toolu_twice_2")
-    check("an already-registered prompt is left alone", code == 0 and again is None, again)
+    check("a different call gets its own chip", code == 0 and again is not None, again)
 
 
 def test_a_prompt_quoting_the_heading_is_still_registered(root):
@@ -844,101 +845,595 @@ def test_a_stale_index_entry_is_collected(root):
     check("a settled spawn leaves no provisional entry", not os.path.exists(entry), entry)
 
 
-def test_finish_never_binds_the_chip_to_its_own_parent(root):
-    repo = make_repo(root, "parent-rebind-repo")
-    parent_transcript, parent_ccd = "transcript-parent-rebind", parent_of(repo)
-    write_session_registry(parent_transcript, parent_ccd)
-    chip_id, worktree = open_chip(repo, session=parent_ccd, hook_session=parent_transcript)
-    commit_work(worktree)
-    cli(worktree, "finish", "--message", "готово", hook_session=parent_transcript)
+def test_finish_finds_work_in_a_nested_worktree(root):
+    """The observed case: the child cut its own worktree inside the chip's and worked there."""
+    repo = make_repo(root, "nested-work-repo")
+    chip_id, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "inner")
+    git(repo, "worktree", "add", "-q", "-b", "in/child-of-nested", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="real.txt", message="real child work")
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out + err)
+    check("it does not claim there is nothing to pull", "Изменений в коде нет" not in out, out)
+    check("it names the branch the work is really on", "in/child-of-nested" in out, out)
     record = record_of(chip_id)
-    check("the parent is not recorded as its own child",
-          record.get("child_session_id") != parent_ccd, record.get("child_session_id"))
-    _, out, _ = cli(repo, "close", "--chip", chip_id, "--accept")
-    check("close does not offer to archive the parent", parent_ccd not in out, out)
+    check("the card records that branch", record.get("work_branch") == "in/child-of-nested",
+          record.get("work_branch"))
+    check("and its commit count", record.get("commits") == 1, record.get("commits"))
+    git(repo, "worktree", "remove", "--force", inner)
 
 
-def test_an_ambiguous_registry_pairing_is_refused(root):
-    repo = make_repo(root, "ambiguous-registry-repo")
-    shared = "transcript-claimed-twice"
-    write_session_registry(shared, "local_aaaaaaaa-0000-0000-0000-000000000001")
-    write_session_registry(shared, "local_bbbbbbbb-0000-0000-0000-000000000002")
-    chip_id, worktree = open_chip(repo, session=None, hook_session=shared)
-    check("no local id is guessed from an ambiguous pairing",
-          record_of(chip_id).get("parent_session_id") is None,
-          record_of(chip_id).get("parent_session_id"))
+def test_finish_refuses_a_dirty_nested_worktree(root):
+    repo = make_repo(root, "dirty-elsewhere-repo")
+    _, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "inner")
+    git(repo, "worktree", "add", "-q", "-b", "in/dirty-child", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="committed.txt", message="child work")
+    write(inner, "uncommitted.txt", "ещё не сохранено\n")
+    code, _, err = cli(worktree, "finish", "--message", "готово")
+    check("a dirty child worktree is rejected", code == 2, code)
+    check("and the message points at it", "inner" in err, err[:200])
+    git(repo, "worktree", "remove", "--force", inner)
 
 
-def test_a_provisional_chip_does_not_block_its_child(root):
-    """Between the spawn hook cutting the worktree and the spawn landing, the chip is not real."""
-    repo = make_repo(root, "provisional-repo")
-    _, out = spawn(repo, session="transcript-provisional", tool_use_id="toolu_provisional",
-                   land=False)
-    if not check("the chip was cut", out is not None):
+def test_the_merge_takes_the_chips_own_branch(root):
+    repo = make_repo(root, "merge-own-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="real.txt", message="work to merge")
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("the parent branch gets the work", "work to merge" in log, log)
+    check("outcome recorded", record_of(chip_id)["outcome"] == "merged",
+          record_of(chip_id)["outcome"])
+
+
+def test_an_empty_chip_still_reports_no_changes(root):
+    repo = make_repo(root, "genuinely-empty-repo")
+    chip_id, worktree = open_chip(repo)
+    code, out, _ = cli(worktree, "finish", "--message", "ничего не потребовалось")
+    check("finish succeeds", code == 0, out)
+    check("it still says there is nothing to pull", "изменений нет" in out, out)
+    check("outcome recorded", record_of(chip_id)["outcome"] == "no-changes")
+
+
+def test_a_foreign_worktree_is_never_elected(root):
+    """A worktree the chip did not cut carries somebody else's history, whatever it contains."""
+    repo = make_repo(root, "foreign-repo")
+    child_ccd = "local_55555555-4444-3333-2222-111111111111"
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="mine.txt", message="real chip work")
+    foreign = os.path.join(repo, ".claude", "worktrees", "foreign")
+    git(repo, "worktree", "add", "-q", "-b", "in/foreign", foreign)
+    git(foreign, "config", "user.email", "test@example.invalid")
+    git(foreign, "config", "user.name", "Chip Test")
+    for n in range(3):
+        commit_work(foreign, name="foreign{}.txt".format(n), message="foreign {}".format(n))
+    write_session_registry("transcript-foreign", child_ccd, cwd=foreign)
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--child-session", child_ccd,
+                       "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    record = record_of(chip_id)
+    check("the chip's own branch is reported",
+          record.get("work_branch") == record["chip_branch"], record.get("work_branch"))
+    check("the foreign branch is not named", "in/foreign" not in out, out)
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("only the chip's work is merged", "real chip work" in log and "foreign" not in log,
+          log)
+    git(repo, "worktree", "remove", "--force", foreign)
+
+
+def test_a_dirty_main_checkout_never_reaches_the_chip(root):
+    """The repository root contains every worktree; its state is not the chip's business."""
+    repo = make_repo(root, "dirty-root-repo")
+    child_ccd = "local_77777777-6666-5555-4444-333333333333"
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="chip-work.txt", message="work in the chip worktree")
+    write_session_registry("transcript-dirty-root", child_ccd, cwd=repo)
+    write(repo, "not-mine.txt", "чужое состояние\n")
+    os.remove(os.path.join(repo, "kept.txt"))
+    code, out, err = cli(worktree, "finish", "--child-session", child_ccd,
+                         "--message", "готово")
+    check("finish is not blocked by the main checkout", code == 0, err[:200])
+    check("the root is never named", os.path.abspath(repo) not in (err or ""), err[:200])
+    check("the chip's branch is reported",
+          record_of(chip_id).get("work_branch") == record_of(chip_id)["chip_branch"])
+
+
+def test_detached_work_is_not_reported_as_merged(root):
+    repo = make_repo(root, "detached-repo")
+    chip_id, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "inner")
+    git(repo, "worktree", "add", "-q", "--detach", inner, "main")
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="detached.txt", message="work with no branch")
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("it does not claim a merge", "Влито" not in out, out)
+    check("it names the detached state", "отсоединённом" in out, out)
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("nothing was merged", "work with no branch" not in log, log)
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_a_second_source_with_commits_is_named(root):
+    repo = make_repo(root, "two-sources-repo")
+    chip_id, worktree = open_chip(repo)
+    for name in ("one", "two"):
+        tree = os.path.join(worktree, name)
+        git(repo, "worktree", "add", "-q", "-b", "in/" + name, tree)
+        git(tree, "config", "user.email", "test@example.invalid")
+        git(tree, "config", "user.name", "Chip Test")
+        commit_work(tree, name=name + ".txt", message="work " + name)
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("both branches are named", "in/one" in out and "in/two" in out, out)
+    check("neither is merged silently", "Автомерж" in out, out)
+    for name in ("one", "two"):
+        git(repo, "worktree", "remove", "--force", os.path.join(worktree, name))
+
+
+def test_uncommitted_work_in_the_chip_tree_still_refuses(root):
+    """The nested worktree carries the commits, but the chip tree has edits nobody saved."""
+    repo = make_repo(root, "forgotten-repo")
+    _, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "inner")
+    git(repo, "worktree", "add", "-q", "-b", "in/inner-work", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="done.txt", message="committed elsewhere")
+    write(worktree, "forgotten.txt", "забытое\n")
+    code, _, err = cli(worktree, "finish", "--message", "готово")
+    check("the forgotten edit blocks the handoff", code == 2, code)
+    check("and the chip tree is named", "forgotten" in err or worktree in err, err[:200])
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_a_nested_branch_is_reported_but_not_merged(root):
+    repo = make_repo(root, "no-automerge-repo")
+    chip_id, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "inner")
+    git(repo, "worktree", "add", "-q", "-b", "in/child-branch", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="real.txt", message="child work")
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the branch is named", "in/child-branch" in out, out)
+    check("but no command is handed over for it",
+          "git merge --no-ff in/child-branch" not in out, out)
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("but nothing is merged without the parent looking", "child work" not in log, log)
+    check("outcome recorded", record_of(chip_id)["outcome"] == "found-elsewhere",
+          record_of(chip_id)["outcome"])
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_a_comparison_tree_never_outranks_the_real_work(root):
+    """A child cuts a tree at the parent's tip to compare against; that is not its work."""
+    repo = make_repo(root, "comparison-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="real.txt", message="real chip work")
+    for n in range(3):
+        write(repo, "parent{}.txt".format(n), "родитель\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "parent moved {}".format(n))
+    compare = os.path.join(worktree, "compare")
+    git(repo, "worktree", "add", "-q", "-b", "in/compare", compare, "main")
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    record = record_of(chip_id)
+    check("the chip's own branch wins",
+          record.get("work_branch") == record["chip_branch"], record.get("work_branch"))
+    check("the borrowed history is not counted as work", record.get("commits") == 1,
+          record.get("commits"))
+    check("the comparison branch is not named", "in/compare" not in out, out)
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("the free parent branch gets the work", "real chip work" in log, log)
+    git(repo, "worktree", "remove", "--force", compare)
+
+
+def test_an_untracked_file_beside_a_nested_worktree_still_blocks(root):
+    """An untracked directory collapses in git's default listing; the file must not hide."""
+    repo = make_repo(root, "beside-repo")
+    _, worktree = open_chip(repo)
+    os.makedirs(os.path.join(worktree, "src"))
+    inner = os.path.join(worktree, "src", "inner")
+    git(repo, "worktree", "add", "-q", "-b", "in/beside", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="done.txt", message="child work")
+    write(os.path.join(worktree, "src"), "new.txt", "забытое рядом\n")
+    code, _, err = cli(worktree, "finish", "--message", "готово")
+    check("the neighbouring file blocks the handoff", code == 2, code)
+    check("and is named", "new.txt" in err, err[:200])
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_a_non_ascii_nested_worktree_does_not_look_dirty(root):
+    repo = make_repo(root, "cyrillic-repo")
+    chip_id, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "тест")
+    git(repo, "worktree", "add", "-q", "-b", "in/cyrillic", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="done.txt", message="child work")
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("a non-ASCII worktree name is not mistaken for dirt", code == 0, err[:200])
+    check("its branch is reported", "in/cyrillic" in out, out)
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_detached_work_is_bundled_and_its_neighbours_named(root):
+    repo = make_repo(root, "detached-bundle-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="on-branch.txt", message="work on the chip branch")
+    inner = os.path.join(worktree, "inner")
+    # From the chip's own branch, the way a child continues its own work without a new branch.
+    git(repo, "worktree", "add", "-q", "--detach", inner, record_of(chip_id)["chip_branch"])
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    for n in range(2):
+        commit_work(inner, name="loose{}.txt".format(n), message="detached {}".format(n))
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the detached state is named", "отсоединённом" in out, out)
+    check("the chip branch's commit is inside what is delivered",
+          record_of(chip_id).get("commits") == 3, record_of(chip_id).get("commits"))
+    check("so it is not announced as something extra",
+          not record_of(chip_id).get("other_sources"),
+          record_of(chip_id).get("other_sources"))
+    bundle = record_of(chip_id).get("bundle")
+    check("the loose commits are bundled", bundle and os.path.exists(bundle), bundle)
+    check("no bundle error", not record_of(chip_id).get("bundle_error"),
+          record_of(chip_id).get("bundle_error"))
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_a_rebased_parent_branch_is_never_merged_into(root):
+    """The parent rebased before publishing; the chip's base is no longer in that history."""
+    repo = make_repo(root, "rebased-parent-repo")
+    git(repo, "switch", "-q", "-c", "in/parent-work")
+    commit_work(repo, name="parent.txt", message="parent work")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="child.txt", message="child work")
+    # The parent rewrites its own branch, as a rebase before a merge request does.
+    git(repo, "reset", "-q", "--hard", "main")
+    commit_work(repo, name="parent.txt", message="parent work, rewritten")
+    git(repo, "switch", "-q", "main")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("no merge is attempted", "Влито" not in out, out)
+    check("the reason is named", "переписана" in out, out)
+    check("and cherry-pick is offered", "cherry-pick" in out, out)
+    check("outcome recorded", record_of(chip_id)["outcome"] == "base-rewritten",
+          record_of(chip_id)["outcome"])
+    log = git(repo, "log", "--oneline", "in/parent-work").stdout
+    check("the parent branch is untouched", "child work" not in log, log)
+
+
+def test_a_rebased_child_still_delivers(root):
+    """The child rebases onto the parent's rewritten branch before reporting."""
+    repo = make_repo(root, "rebased-child-repo")
+    git(repo, "switch", "-q", "-c", "in/pw")
+    commit_work(repo, name="parent.txt", message="parent work")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="child.txt", message="child work")
+    git(repo, "reset", "-q", "--hard", "main")
+    commit_work(repo, name="parent.txt", message="parent work rewritten")
+    git(worktree, "rebase", "-q", "in/pw")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the delivery is not called empty", "изменений нет" not in out, out)
+    record = record_of(chip_id)
+    check("its commit is counted", record.get("commits") == 1, record.get("commits"))
+    check("and a bundle exists", record.get("bundle"), record.get("bundle_error"))
+
+
+def test_a_chip_branch_reset_behind_its_base_still_delivers(root):
+    repo = make_repo(root, "reset-behind-repo")
+    git(repo, "switch", "-q", "-c", "in/parent-b")
+    commit_work(repo, name="parent.txt", message="parent work")
+    chip_id, worktree = open_chip(repo)
+    git(worktree, "reset", "-q", "--hard", "main")
+    commit_work(worktree, name="child.txt", message="child work from main")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the delivery is not called empty", "изменений нет" not in out, out)
+    check("its commit is counted", record_of(chip_id).get("commits") == 1,
+          record_of(chip_id).get("commits"))
+
+
+def test_work_already_in_the_parent_is_named_as_such(root):
+    repo = make_repo(root, "already-there-repo")
+    git(repo, "switch", "-q", "-c", "in/parent-c")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="child.txt", message="child work")
+    git(repo, "merge", "-q", "--ff-only", record_of(chip_id)["chip_branch"])
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("it does not call the branch empty", "изменений нет" not in out, out)
+    check("it says the parent already has it", "уже есть" in out, out)
+    check("outcome recorded", record_of(chip_id)["outcome"] == "already-there",
+          record_of(chip_id)["outcome"])
+
+
+def test_a_copy_at_the_same_commit_is_not_a_second_source(root):
+    repo = make_repo(root, "same-tip-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="child.txt", message="child work")
+    copy = os.path.join(worktree, "copy")
+    git(repo, "worktree", "add", "-q", "--detach", copy,
+        record_of(chip_id)["chip_branch"])
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the copy is not announced as another source", "есть ещё" not in out, out)
+    check("and the chip's own branch was elected",
+          record_of(chip_id).get("work_branch") == record_of(chip_id)["chip_branch"],
+          record_of(chip_id).get("work_branch"))
+    check("no other source recorded", not record_of(chip_id).get("other_sources"),
+          record_of(chip_id).get("other_sources"))
+    git(repo, "worktree", "remove", "--force", copy)
+
+
+def test_a_tree_cut_from_a_third_branch_never_outranks_the_work(root):
+    """The parent sits on a feature branch while the child compares against the trunk."""
+    repo = make_repo(root, "third-branch-repo")
+    for n in range(5):
+        write(repo, "trunk{}.txt".format(n), "ствол" + chr(10))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "trunk {}".format(n))
+    git(repo, "switch", "-q", "-c", "in/feature", "HEAD~5")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="real.txt", message="real chip work")
+    compare = os.path.join(worktree, "compare")
+    git(repo, "worktree", "add", "-q", "-b", "in/baseline", compare, "main")
+    git(repo, "switch", "-q", "main")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    record = record_of(chip_id)
+    check("the chip's own branch wins",
+          record.get("work_branch") == record["chip_branch"], record.get("work_branch"))
+    check("only its own commit is counted", record.get("commits") == 1, record.get("commits"))
+    check("the trunk branch is not offered for merging",
+          "git merge --no-ff in/baseline" not in out, out)
+    check("it is mentioned only as a note",
+          "есть ещё" in out or "in/baseline" not in out, out)
+    log = git(repo, "log", "--oneline", "in/feature").stdout
+    check("the free parent branch gets the real work", "real chip work" in log, log)
+    git(repo, "worktree", "remove", "--force", compare)
+
+
+def test_an_uncountable_candidate_stops_the_report(root):
+    repo = make_repo(root, "uncountable-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="child.txt", message="child work")
+    # The commit the chip was cut at is gone from the object store.
+    record = record_of(chip_id)
+    with open(os.path.join(chips_dir(), chip_id + ".json"), encoding="utf-8") as handle:
+        card = json.load(handle)
+    card["base_sha"] = "0" * 40
+    with open(os.path.join(chips_dir(), chip_id + ".json"), "w", encoding="utf-8") as handle:
+        json.dump(card, handle, ensure_ascii=False)
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("finish refuses rather than guessing", code == 2, code)
+    check("and says why", "сосчитать" in err, err[:200])
+    check("nothing was published", record_of(chip_id)["status"] == "open",
+          record_of(chip_id)["status"])
+
+
+def test_nested_work_survives_a_later_commit_on_the_chip_branch(root):
+    """The child works in a nested tree, then commits a .gitignore on the chip branch."""
+    repo = make_repo(root, "later-commit-repo")
+    chip_id, worktree = open_chip(repo)
+    inner = os.path.join(worktree, "impl")
+    git(repo, "worktree", "add", "-q", "-b", "in/impl", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    for n in range(3):
+        commit_work(inner, name="impl{}.txt".format(n), message="real work {}".format(n))
+    write(worktree, ".gitignore", "impl/" + chr(10))
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "-m", "ignore the nested tree")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the nested work is not lost from the report", "in/impl" in out, out)
+    record = record_of(chip_id)
+    named = [o["branch"] for o in record.get("other_sources") or []] + [record.get("work_branch")]
+    check("and the branch is on the card", "in/impl" in named, named)
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_nested_work_survives_a_rebase_of_the_chip_branch(root):
+    repo = make_repo(root, "rebase-after-nested-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree, name="first.txt", message="chip work")
+    inner = os.path.join(worktree, "impl")
+    git(repo, "worktree", "add", "-q", "-b", "in/after", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="after.txt", message="nested work")
+    commit_work(repo, name="moved.txt", message="parent moved")
+    git(worktree, "rebase", "-q", "main")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the nested branch is still named", "in/after" in out, out)
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def test_an_untouched_chip_is_not_delivered_from_a_comparison_tree(root):
+    """The chip branch never moved; a tree cut from a trunk ahead of the parent is not it."""
+    repo = make_repo(root, "untouched-compare-repo")
+    for n in range(5):
+        write(repo, "trunk{}.txt".format(n), "ствол" + chr(10))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "trunk {}".format(n))
+    git(repo, "switch", "-q", "-c", "in/feature", "HEAD~5")
+    chip_id, worktree = open_chip(repo)
+    compare = os.path.join(worktree, "compare")
+    git(repo, "worktree", "add", "-q", "-b", "in/compare", compare, "main")
+    code, out, _ = cli(worktree, "finish", "--message", "ничего не потребовалось")
+    check("finish succeeds", code == 0, out)
+    record = record_of(chip_id)
+    check("the trunk tree is not the delivery",
+          record.get("work_branch") != "in/compare", record.get("work_branch"))
+    check("and it is not offered for merging",
+          "git merge --no-ff in/compare" not in out, out)
+    git(repo, "worktree", "remove", "--force", compare)
+
+
+def test_an_untouched_chip_is_not_delivered_from_a_tag_tree(root):
+    """Containment must span tags, not only local branches."""
+    repo = make_repo(root, "tag-compare-repo")
+    for n in range(3):
+        write(repo, "rel{}.txt".format(n), "релиз" + chr(10))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "release {}".format(n))
+    git(repo, "tag", "v1")
+    git(repo, "switch", "-q", "-c", "in/feature", "HEAD~3")
+    chip_id, worktree = open_chip(repo)
+    compare = os.path.join(worktree, "compare")
+    git(repo, "worktree", "add", "-q", "--detach", compare, "v1")
+    code, out, _ = cli(worktree, "finish", "--message", "ничего не потребовалось")
+    check("finish succeeds", code == 0, out)
+    check("released history is not reported as the child's work",
+          "отсоединённом" not in out, out)
+    check("and the chip is not asked to move it onto a branch",
+          "перенести коммиты" not in out, out)
+    git(repo, "worktree", "remove", "--force", compare)
+
+
+def test_a_backup_branch_does_not_demote_the_chips_work(root):
+    """`git branch backup` before a rebase is ordinary and must not cost the delivery."""
+    repo = make_repo(root, "backup-branch-repo")
+    chip_id, worktree = open_chip(repo)
+    for n in range(3):
+        commit_work(worktree, name="real{}.txt".format(n), message="real work {}".format(n))
+    git(worktree, "branch", "backup")
+    try_tree = os.path.join(worktree, "try")
+    git(repo, "worktree", "add", "-q", "-b", "in/try", try_tree,
+        record_of(chip_id)["base_sha"])
+    git(try_tree, "config", "user.email", "test@example.invalid")
+    git(try_tree, "config", "user.name", "Chip Test")
+    commit_work(try_tree, name="experiment.txt", message="experiment")
+    git(repo, "switch", "-q", "-c", "parked")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    record = record_of(chip_id)
+    check("the chip's own branch is the delivery",
+          record.get("work_branch") == record["chip_branch"], record.get("work_branch"))
+    log = git(repo, "log", "--oneline", "main").stdout
+    check("and it is what gets merged", "real work 2" in log, log)
+    check("the experiment is not merged", "experiment" not in log, log)
+    git(repo, "worktree", "remove", "--force", try_tree)
+
+
+def test_a_quiet_report_still_names_what_was_found(root):
+    """Untouched chip branch, nested work, and the child's own backup ref and tag."""
+    repo = make_repo(root, "quiet-report-repo")
+    chip_id, worktree = open_chip(repo)
+    impl = os.path.join(worktree, "impl")
+    git(repo, "worktree", "add", "-q", "-b", "in/impl", impl)
+    git(impl, "config", "user.email", "test@example.invalid")
+    git(impl, "config", "user.name", "Chip Test")
+    for n in range(3):
+        commit_work(impl, name="impl{}.txt".format(n), message="real work {}".format(n))
+    git(impl, "branch", "backup")
+    git(impl, "tag", "snap")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the found branch is named whatever the outcome", "in/impl" in out, out)
+    check("with its commit count", "3" in out, out)
+    check("the report never claims there is nothing", "Забирать нечего" not in out, out)
+    git(repo, "worktree", "remove", "--force", impl)
+
+
+def test_a_push_to_any_remote_keeps_the_work_the_childs_own(root):
+    repo = make_repo(root, "fork-push-repo")
+    bare = os.path.join(root, "fork.git")
+    git(root, "init", "-q", "--bare", bare)
+    chip_id, worktree = open_chip(repo)
+    impl = os.path.join(worktree, "impl")
+    git(repo, "worktree", "add", "-q", "-b", "in/pushed", impl)
+    git(impl, "config", "user.email", "test@example.invalid")
+    git(impl, "config", "user.name", "Chip Test")
+    commit_work(impl, name="pushed.txt", message="work pushed to a fork")
+    git(impl, "remote", "add", "fork", bare)
+    git(impl, "push", "-q", "fork", "HEAD:refs/heads/in/pushed")
+    code, out, _ = cli(worktree, "finish", "--message", "готово")
+    check("finish succeeds", code == 0, out)
+    check("the pushed branch is still named as the work", "in/pushed" in out, out)
+    check("and is not called somebody else's",
+          "принадлежит другой ветке" not in out, out)
+    git(repo, "worktree", "remove", "--force", impl)
+
+
+def test_no_merge_command_is_printed_for_a_branch_that_is_not_the_chips(root):
+    """A tree checked out on the trunk cannot be told from the child's own work."""
+    repo = make_repo(root, "no-offer-repo")
+    for n in range(3):
+        write(repo, "trunk{}.txt".format(n), "ствол" + chr(10))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "trunk {}".format(n))
+    git(repo, "switch", "-q", "-c", "in/feature", "HEAD~3")
+    chip_id, worktree = open_chip(repo)
+    trunk_tree = os.path.join(worktree, "trunk")
+    git(repo, "worktree", "add", "-q", trunk_tree, "main")
+    code, out, _ = cli(worktree, "finish", "--message", "смотрел ствол")
+    check("finish succeeds", code == 0, out)
+    check("the trunk is never offered for merging",
+          "git merge --no-ff main" not in out, out)
+    check("but it is named", "main" in out, out)
+    git(repo, "worktree", "remove", "--force", trunk_tree)
+
+
+def test_a_carried_over_handoff_block_does_not_steal_the_chip(root):
+    """The parent reused the previous task's prompt; the new child must get its own chip."""
+    repo = make_repo(root, "carried-over-repo")
+    _, first = spawn(repo, title="Первая задача", session="transcript-carried",
+                     tool_use_id="toolu_first")
+    if not check("the first spawn registered", first is not None):
         return
-    worktree = out["hookSpecificOutput"]["updatedInput"]["cwd"]
-    code, blocked = stop(worktree, "Готово." + chr(10) * 2 + RECEIPT)
-    check("a pending chip never blocks", code == 0 and blocked == "", blocked)
-
-
-def sweep_now(extra=1):
-    return subprocess.run(
-        [PYTHON, "-c",
-         "import sys, time; sys.path.insert(0, r'{}');"
-         " import chip_handoff as ch;"
-         " ch.sweep_pending(now=time.time() + ch.PENDING_GRACE + {})".format(HERE, extra)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env={**os.environ, **HOME_OVERRIDE}, timeout=120)
-
-
-def test_the_sweep_never_deletes_a_chip_that_holds_work(root):
-    """A session on an older hook set never confirms its spawn; its child is alive regardless."""
-    repo = make_repo(root, "unconfirmed-repo")
-    _, out = spawn(repo, session="transcript-unconfirmed", tool_use_id="toolu_unconfirmed",
-                   land=False)
-    if not check("the chip was cut", out is not None):
+    old_prompt = first["hookSpecificOutput"]["updatedInput"]["prompt"]
+    old_cwd = first["hookSpecificOutput"]["updatedInput"]["cwd"]
+    _, second = spawn(repo, title="Вторая задача", prompt=old_prompt + chr(10) + "Теперь другое.",
+                      session="transcript-carried", tool_use_id="toolu_second",
+                      spawn_cwd=old_cwd)
+    if not check("the second spawn is registered too", second is not None):
         return
-    worktree = out["hookSpecificOutput"]["updatedInput"]["cwd"]
-    write(worktree, "child-was-here.txt", "работа ребёнка\n")
-    swept = sweep_now()
-    check("the sweep runs", swept.returncode == 0, swept.stderr[-300:])
-    check("the worktree survives", os.path.isdir(worktree), worktree)
-    check("the child's file survives",
-          os.path.exists(os.path.join(worktree, "child-was-here.txt")))
+    updated = second["hookSpecificOutput"]["updatedInput"]
+    check("the child is not sent into the first chip's worktree",
+          updated["cwd"] != old_cwd, updated["cwd"])
+    check("only one chip token is handed over",
+          updated["prompt"].count("<!-- chip:") == 1, updated["prompt"][:200])
     mine = [c for c in cards() if c.get("parent_cwd") == os.path.abspath(repo)]
-    check("and the chip is adopted rather than dropped",
-          len(mine) == 1 and mine[0]["status"] == "open", mine)
+    check("two separate chips exist", len(mine) == 2, [c["chip_id"] for c in mine])
+    titles = sorted((c.get("title") or "") for c in mine)
+    check("each carries its own task", titles == ["Вторая задача", "Первая задача"], titles)
 
 
-def test_the_sweep_keeps_a_chip_that_committed(root):
-    repo = make_repo(root, "committed-repo")
-    _, out = spawn(repo, session="transcript-committed", tool_use_id="toolu_committed",
-                   land=False)
-    if not check("the chip was cut", out is not None):
+def test_the_same_call_registered_twice_is_left_alone(root):
+    """A genuine retry of one call must not cut a second chip."""
+    repo = make_repo(root, "same-call-repo")
+    _, first = spawn(repo, session="transcript-same-call", tool_use_id="toolu_same")
+    if not check("the spawn registered", first is not None):
         return
-    worktree = out["hookSpecificOutput"]["updatedInput"]["cwd"]
-    commit_work(worktree)
-    swept = sweep_now()
-    check("the sweep runs", swept.returncode == 0, swept.stderr[-300:])
-    check("a committed worktree is never removed", os.path.isdir(worktree), worktree)
-    log = git(worktree, "log", "--oneline", "-1").stdout
-    check("its commit is intact", "chip work" in log, log)
-
-
-def test_an_abandoned_spawn_is_swept_after_the_grace_period(root):
-    repo = make_repo(root, "swept-repo")
-    _, out = spawn(repo, session="transcript-swept", tool_use_id="toolu_swept", land=False)
-    if not check("the chip was cut", out is not None):
-        return
-    worktree = out["hookSpecificOutput"]["updatedInput"]["cwd"]
+    prompt = first["hookSpecificOutput"]["updatedInput"]["prompt"]
+    code, again = spawn(repo, prompt=prompt, session="transcript-same-call",
+                        tool_use_id="toolu_same")
+    check("the same call is recognised", code == 0 and again is None, again)
     mine = [c for c in cards() if c.get("parent_cwd") == os.path.abspath(repo)]
-    check("it is pending", len(mine) == 1 and mine[0]["status"] == "pending", mine)
-    # A spawn that was neither confirmed nor refused: nothing signals it, only time does.
-    swept = sweep_now()
-    check("the sweep runs", swept.returncode == 0, swept.stderr[-300:])
-    check("the abandoned worktree is gone", not os.path.isdir(worktree), worktree)
-    left = [c for c in cards() if c.get("parent_cwd") == os.path.abspath(repo)]
-    check("and its card with it", left == [], [c.get("chip_id") for c in left])
+    check("and no second chip is cut", len(mine) == 1, [c["chip_id"] for c in mine])
 
 
 def test_hooks_survive_bad_input(root):
@@ -1018,6 +1513,37 @@ def main():
             test_a_stale_index_entry_is_collected,
             test_finish_never_binds_the_chip_to_its_own_parent,
             test_an_ambiguous_registry_pairing_is_refused,
+            test_finish_finds_work_in_a_nested_worktree,
+            test_finish_refuses_a_dirty_nested_worktree,
+            test_the_merge_takes_the_chips_own_branch,
+            test_an_empty_chip_still_reports_no_changes,
+            test_a_foreign_worktree_is_never_elected,
+            test_a_dirty_main_checkout_never_reaches_the_chip,
+            test_detached_work_is_not_reported_as_merged,
+            test_a_second_source_with_commits_is_named,
+            test_uncommitted_work_in_the_chip_tree_still_refuses,
+            test_a_nested_branch_is_reported_but_not_merged,
+            test_a_comparison_tree_never_outranks_the_real_work,
+            test_an_untracked_file_beside_a_nested_worktree_still_blocks,
+            test_a_non_ascii_nested_worktree_does_not_look_dirty,
+            test_detached_work_is_bundled_and_its_neighbours_named,
+            test_a_rebased_parent_branch_is_never_merged_into,
+            test_a_rebased_child_still_delivers,
+            test_a_chip_branch_reset_behind_its_base_still_delivers,
+            test_work_already_in_the_parent_is_named_as_such,
+            test_a_copy_at_the_same_commit_is_not_a_second_source,
+            test_a_tree_cut_from_a_third_branch_never_outranks_the_work,
+            test_an_uncountable_candidate_stops_the_report,
+            test_nested_work_survives_a_later_commit_on_the_chip_branch,
+            test_nested_work_survives_a_rebase_of_the_chip_branch,
+            test_an_untouched_chip_is_not_delivered_from_a_comparison_tree,
+            test_an_untouched_chip_is_not_delivered_from_a_tag_tree,
+            test_a_backup_branch_does_not_demote_the_chips_work,
+            test_a_quiet_report_still_names_what_was_found,
+            test_a_push_to_any_remote_keeps_the_work_the_childs_own,
+            test_no_merge_command_is_printed_for_a_branch_that_is_not_the_chips,
+            test_a_carried_over_handoff_block_does_not_steal_the_chip,
+            test_the_same_call_registered_twice_is_left_alone,
             test_hooks_survive_bad_input,
             test_stop_hook_ignores_a_plain_session,
         ):

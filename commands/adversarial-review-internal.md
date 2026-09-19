@@ -35,7 +35,8 @@ explicitly) or launched into the background (`run_in_background: true`: the turn
 completion notification resumes the work; never poll it). Do not launch a panel. The finite Stop
 gate reads the verdict from the foreground tool result or from the result the completion
 notification carries; a background verdict is filed at the launch, so a lasting edit after the
-launch expires it.
+launch expires it. The reviewer's own read-only commands (`git show`, grep) do not: the marker
+records a command run inside a read-only lane only for what its snapshot measured.
 
 The task packet must contain:
 
@@ -60,7 +61,10 @@ boundary, or terminal states here.
 
 The command owns only reviewer runtime continuity:
 
-- reuse the same reviewer when foreground continuation is supported;
+- continue the same reviewer with `SendMessage` to the id its result's `agentId:` trailer or its
+  launch acknowledgement names: the round runs in the background, its verdict arrives with the
+  completion notification and is filed at the `SendMessage`, so make no lasting edit until it
+  arrives;
 - otherwise invoke the same profile with only the remediation delta, open ledger, affected
   interfaces, and new evidence;
 - never send an unchanged candidate twice;

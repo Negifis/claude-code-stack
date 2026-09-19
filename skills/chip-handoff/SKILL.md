@@ -47,7 +47,10 @@ After the work is done and `development-verification` has closed it:
 2. Run the `finish` command from the handoff block. In a chip worktree it needs no arguments
    beyond the summary; an operational chip passes its `--chip <id>`. Nothing else: `finish`
    resolves your own `sessionId` through the app's session registry, so the parent can archive
-   you or send you back without being told who you are.
+   you or send you back without being told who you are. It names the chip by id, so run it from
+   wherever the shell already is. Commits made in a worktree outside the chip's directory count
+   once they are on the chip branch; `git -C <chip tree> merge --ff-only <branch>` puts them
+   there without a `cd`.
 
    For code it merges into the parent branch when that branch is checked out nowhere, and
    otherwise leaves it alone — merging into a branch a live session holds would move the ref
@@ -77,8 +80,10 @@ When a chip is waiting:
 
 1. **Verify it yourself.** For code: read `git log --oneline <parent>..<chip-branch>` and the
    diff, and run the checks the changed boundary deserves — the child's own gate receipt is
-   not a substitute. For operational work: check the effect on the system, not the child's
-   description of it.
+   not a substitute. Bringing the chip's commits into your own tree — a checkout, a merge —
+   opens your own candidate at its floor, and the child's approval does not close it; a merge
+   you resolved by hand is a delta candidate (`development-verification` §6). For operational
+   work: check the effect on the system, not the child's description of it.
 
 2. Then close it:
 

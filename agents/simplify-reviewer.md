@@ -1,6 +1,6 @@
 ---
 name: simplify-reviewer
-description: 'Read-only simplify pass over a changed scope: reuse, quality and efficiency findings in one report, behavior-preserving, with file:line evidence. One lane per candidate; the main agent applies accepted findings.'
+description: 'Read-only simplify pass of a STANDARD candidate: reuse, quality and efficiency findings in one report, behavior-preserving, with file:line evidence. HIGH work runs the three lens agents instead; the main agent applies accepted findings.'
 tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
 model: sonnet
 effort: medium

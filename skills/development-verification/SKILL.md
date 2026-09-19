@@ -16,7 +16,10 @@ loop, and do not run any part of it as a ritual.
   so a defect keeps costing. Sections 3–9 apply.
 - **OPERATIONAL** — an effect on a live system: commands against a device, server, database,
   cloud account or account state, plus the throwaway scripts and scratchpad files written to
-  carry them out. The cost lands once, at execution. Section 2 applies.
+  carry them out. The cost lands once, at execution. Section 2 applies. The gate recognizes a
+  throwaway by where it lives: the session scratchpad, a file directly in a drive-root temp
+  directory such as `C:/tmp`, or a subdirectory of one that is no repository; the same script in
+  a repository is source.
 
 One changed lasting artifact makes the candidate persistent. Mixed work is graded on its
 persistent half; the operational half is verified by its observed effect. Work that changed
@@ -46,13 +49,16 @@ from what is merely expected.
 No simplify pass and no code review on a throwaway script that already executed. Close with
 `[gate] operational: <what was established before executing>; <verified effect>` or
 `[gate] no-change: <reason>`. Both require this skill to have been invoked; invoking it before
-execution, where it belongs, satisfies that.
+execution, where it belongs, satisfies that. A lasting change the gate cannot see — prose written
+through the shell into a file no snapshot watches — is still persistent work: close that
+candidate with `[gate] verified: <risk>; …` and what that risk requires.
 
 A lasting change that was undone — a rebase probe aborted, an edit reverted — leaves the
 repository on the commit the candidate opened on, with every ref where it was and the whole
 tree clean; the gate reads that from git and accepts `operational` or `no-change` for it, so do
 not manufacture a review for nothing. A commit on another branch, a stash, a push, a gitignored
-lasting file or a tree that was already dirty when the candidate opened keep it open.
+lasting file, a tree that was already dirty when the candidate opened, or a candidate past the
+marker's path cap keep it open; the block names which.
 
 ## 3. Classify risk
 
@@ -60,12 +66,12 @@ lasting file or a tree that was already dirty when the candidate opened keep it 
   effect, or a local reversible configuration edit with no runtime/public-contract change.
   Run the relevant deterministic check. No independent review.
 - **STANDARD** — a bounded logic or user-visible change with limited blast radius. Run
-  affected tests and static checks. Add a simplify lane or independent review only for a
-  concrete complexity, uncertainty, or integration risk.
+  affected tests and static checks and one `simplify-reviewer` lane. Add independent review
+  only for a concrete complexity, uncertainty, or integration risk.
 - **HIGH** — security/auth/permissions, data/schema/migrations, concurrency/distributed
   state, public contracts, production/release, irreversible effects, or a broad
-  cross-component diff. Run affected checks, one broad final check when warranted, one
-  simplify lane, and one independent adversarial review.
+  cross-component diff. Run affected checks, one broad final check when warranted, the three
+  simplify lenses, and one independent adversarial review.
 
 Judge risk by blast radius, reversibility, data sensitivity, observability, and rollback — not
 line count or a sensitive-looking filename. The Stop hook enforces a lower bound on lasting
@@ -107,19 +113,23 @@ so the receipt shape is never a surprise.
 ## 5. Bounded simplify
 
 Simplification applies to lasting artifacts only and never to operational work. It is
-required for HIGH and optional otherwise (use it for a concrete readability, reuse,
-control-flow, type/error, resource, or efficiency concern).
+required for STANDARD and HIGH and optional for LOW (a local pass for a concrete readability,
+reuse, control-flow, type/error, resource, or efficiency concern).
 
-- Follow the `simplify` skill: a local pass for small work; for a non-trivial scope, or
-  whenever evidence is required, exactly one foreground `simplify-reviewer` lane
-  (`run_in_background: false`) covering reuse, quality and efficiency in one report. Apply only
-  accepted behavior-preserving findings and rerun affected checks.
-- Maximum two runs of the lane per candidate: the second only as a delta confirmation after
-  accepted edits on broad or high-risk work. A lane result that already exists for this
-  candidate is the completed pass; never re-run it for bookkeeping, and never after review
-  approval. A candidate ends with its receipt: edits made after a closed cycle — remediation
-  after a rebase, a follow-up on the same branch — are a new candidate, and a lane result from
-  the closed one does not carry over; run the lane once on the new delta.
+- **STANDARD** — exactly one foreground `simplify-reviewer` lane (`run_in_background: false`)
+  covering reuse, quality and efficiency in one report.
+- **HIGH** — the three lenses as separate foreground lanes, launched together in one message:
+  `simplify-reuse-reviewer`, `simplify-quality-reviewer` and `simplify-efficiency-reviewer`,
+  each on the same bounded scope. All three results are required; a lone `simplify-reviewer`
+  does not satisfy HIGH, and the complete trio satisfies STANDARD.
+- Follow the `simplify` skill for the packet. Apply only accepted behavior-preserving findings
+  and rerun affected checks.
+- Maximum two runs of any one lane per candidate: the second only as that lane's delta
+  confirmation after accepted edits on broad or high-risk work. A lane result that already
+  exists for this candidate is that lane's completed pass; never re-run it for bookkeeping, and
+  never after review approval. A candidate ends with its receipt: edits made after a closed
+  cycle — remediation after a rebase, a follow-up on the same branch — are a new candidate, and
+  lane results from the closed one do not carry over; run the pass once on the new delta.
 
 ## 6. Finite independent review
 
@@ -131,29 +141,47 @@ review lane per round, chosen in this order:
    Codex wrote in between, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
    judgment is worth more than a second opinion from the model that wrote the code. Run
    `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
-   at capacity) means the lane is skipped for this round, not retried.
+   at capacity, a CLI too old for the model) means the lane is skipped for this round, not
+   retried.
 2. **The native `adversarial-reviewer`** through `/adversarial-review-internal`, in the
    foreground (`run_in_background: false`) or launched into the background and judged at its
    completion notification, when Codex is unavailable, reports an outage, fails before a
    verdict on its one allowed resume, or the user declines it. Say which engine reviewed and
    why when it was not Codex.
 
-Both lanes satisfy the gate; neither adds an obligation to run the other. Every verdict must be
+Both lanes satisfy the gate; neither adds an obligation to run the other, and there is no third —
+`reference/model-routing.md` records why, before anyone proposes one. Every verdict must be
 observable — the native lane as a foreground result or as the result its completion
 notification carries, the Codex lane as the rollout log bound at its notification — never as a
 summary you wrote. A background verdict is filed at the launch: a lasting edit after the launch
-expires it exactly as an edit after a foreground approval does. One ledger and one round
-budget span the lanes: switching engines continues the review, never restarts it. Add at most one specialist
-only for a named non-overlapping risk; the lane that owns the verdict keeps it.
+expires it exactly as an edit after a foreground approval does, and so does a write-capable
+command the snapshots could not measure — the launch command included, when it starts outside
+any repository. Launch from the candidate's repository; a command that begins with
+`cd <repo> &&` counts as starting there. A later round may continue the same native reviewer
+with `SendMessage`: its verdict is read from that round's completion notification and filed at
+the `SendMessage`. One ledger and one round budget span the lanes: switching engines continues
+the review, never restarts it. Add at most one specialist only for a named non-overlapping
+risk; the lane that owns the verdict keeps it.
 
 Obtain the verdict as the last step. Editing a lasting artifact after an approval invalidates
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
-scope); reruns of a throwaway script or a maintenance command do not, and neither does an edit
-reverted byte for byte, nor does staging or committing the approved bytes — the gate measures
-content, not edit events (a file still in conflict when reviewed is the exception: `git add` is
-its resolution step, so resolve and stage before the review). A clean merge or rebase
-of an approved candidate needs nothing; one resolved by hand is a delta candidate whose
-resolution diff gets the delta lane and a delta round.
+scope), and the rounds after it form a new sequence of at most three; reruns of a throwaway
+script or a maintenance command do not, and neither does an edit reverted byte for byte, nor
+does staging or committing the approved bytes — the gate measures content, not edit events (a
+file still in conflict when reviewed is the exception: `git add` is its resolution step, so
+resolve and stage before the review). A clean merge or rebase of this session's approved
+candidate needs nothing, and neither does merging upstream into a candidate: the marker sets
+aside every path a merge leaves exactly as `git merge-tree` computes it from the HEAD before the
+command and a commit reachable from a remote's default branch, and a verdict that covered the
+candidate's own files covers such a merge of them. The gate trusts the ref, not the author:
+whatever the default branch reaches — your own push there, the branch a local-clone remote had
+checked out — reads as upstream, so never route unreviewed work through it. Merging any other
+branch — a feature branch, a chip's, your own push to one — brings work in and is recorded like
+any write. A path resolved by hand — a conflict edited, a modify/delete settled with `git rm` —
+stays in the candidate: its resolution diff is a delta that gets the delta lane and a delta
+round, and a merge resolved by hand never closes as `operational`. An approval from another
+session, a chip's included, is a claim: bringing that work into your tree from its branch opens
+your own candidate.
 
 ```
 MAX_REVIEW_ROUNDS = 3
@@ -166,10 +194,10 @@ BLOCKING_THRESHOLD = HIGH
   remediation delta, open blockers, affected interfaces, and direct regressions.
 - A new round requires a changed candidate or new material evidence. Identical code and
   evidence cannot trigger another review, and an APPROVED candidate is not reviewed again to
-  "confirm" it after a merge, a rebase or publication: the August 2026 transcripts held 62 such
-  confirmation rounds, all of which approved again.
-- If remediation changes code, rerun affected checks; spend the one remaining simplify
-  confirmation only for a concrete complexity concern.
+  "confirm" it after a clean merge, a clean rebase or publication: the August 2026 transcripts
+  held 62 such confirmation rounds, all of which approved again.
+- If remediation changes code, rerun affected checks; spend a lane's one remaining simplify
+  confirmation only for a concrete concern in that lane's lens.
 - `VERDICT: APPROVED` ends the gate immediately. There is no post-approval review or simplify
   pass. Round 3 with open blockers ends in `VERDICT: ESCALATE`; never force approval and never
   emit a fourth ordinary round.
@@ -216,7 +244,10 @@ straight to `DRAFT_BLOCKED`; `BLOCKED` at pass 2, or `REVIEW_UNAVAILABLE` blocki
 evidence, is terminal `DRAFT_BLOCKED`. Do not restart broad review or repeat an approach.
 A closure packet sent before a round-3 `ESCALATE` is not a closure validation: the hook counts
 it only as review activity, and the ordinary review continues within its round budget. The
-round-3 packet must offer `ESCALATE`; a round-3 `REVISE` leaves no legal closure.
+round-3 packet must offer `ESCALATE`; a round-3 `REVISE`, or a fourth ordinary round, leaves no
+legal receipt — the Stop hook blocks three times and retires the candidate unverified, which is
+the protocol working, not an anomaly to report. The edit a pass-1 `BLOCKED` asks for is the
+next pass's recovery delta: make it and run its checks before the pass-2 packet.
 
 Ask the user only for choices reserved by the authority rules: product intent, acceptance of
 security/data-loss/irreversible risk, protected access or secrets, or an otherwise unauthorized
@@ -267,15 +298,16 @@ The Stop hook is right by default: a missing or misplaced receipt, a `REVISE`, a
 approval, a lane launched in the wrong mode are your mistakes, not the hook's. An anomaly is a
 block that contradicts facts you can verify in the transcript: the required evidence exists in
 the required shape (an APPROVED after the last lasting edit — a foreground result, a background
-lane's notification or the Codex rollout — and the simplify lane's result), the hook demands a
+lane's notification or the Codex rollout — and the simplify lane results the risk requires), the hook demands a
 lane this skill forbids repeating, the same block returns after its
 demand was met exactly, the marker names files you never touched, the hook failed or timed out,
 or its advice contradicts the breaker or this skill. Not an anomaly: a lane result that
-belongs to a candidate already closed by a receipt — the block names the candidate that
-opened afterwards, and that one needs its own delta pass.
+belongs to a candidate already closed by a receipt, closed as `anomaly-reported`, or replaced by
+a new one — the block says when this candidate's evidence starts counting and which candidate
+it replaced, and this one needs its own pass; nor an approval another session gave.
 
 Order: check the three facts once — the receipt is the last line and well-formed, the last
-lasting edit precedes the verdict, the lanes ran in a shape the hook reads (the simplify lane in
+lasting edit precedes the verdict, the lanes ran in a shape the hook reads (the simplify lanes in
 the foreground; a review lane in the foreground or the background) — and fix what is yours. If
 the block still stands, do not re-run lanes, do not poll, do not argue with the hook: file the
 report and finish honestly.

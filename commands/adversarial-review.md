@@ -51,9 +51,17 @@ the Codex session that was given exactly that text — which is what keeps two r
 once from different chats apart. Write the packet in its own shell call and launch Codex in
 the next one: the copy is taken before the launch command runs, so a packet composed by the
 same command as the launch is not there yet and the verdict binds nothing. The packet path may
-use a variable assigned in the same command (`REVIEW_ID=… ; … < /c/tmp/codex-packet-${REVIEW_ID}.md`);
-a variable nothing assigns, `codex --profile x exec`, or `bash -c "codex exec …"` leave the
-launch unrecognizable and it binds nothing.
+use a variable assigned a literal value in the same command
+(`REVIEW_ID=r2; … < /c/tmp/codex-packet-${REVIEW_ID}.md`); a value computed at run time
+(`$(date +%s)`), a variable nothing assigns, `codex --profile x exec`, or `bash -c "codex exec …"`
+leave the launch unrecognizable and it binds nothing.
+Write the packet by its full path rather than after a `cd` into a scratch directory, and launch
+from the candidate's repository: a launch that starts outside any repository is a command the
+snapshots cannot measure, and it expires the very verdict filed at its start (report a269a6fc).
+A launch that begins with `cd <repo> &&` counts as starting in that repository. When the marker
+hook left no copy of the packet, the Stop hook reads the file itself, but only while nothing has
+written it since the launch — a round without a copy binds nothing once the next round
+overwrites its file.
 Carry the literal marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is what makes
 the launch a review lane rather than an errand, so a review that ran but could not be
 attributed still counts as an unresolved lane instead of vanishing. The result must end with
@@ -94,7 +102,7 @@ timeout 3600 codex exec --ignore-user-config \
   --disable computer_use --disable browser_use --disable browser_use_external \
   --disable image_generation --disable apps --disable in_app_browser \
   --disable skill_search --disable tool_suggest \
-  -m gpt-5.6-sol -c model_reasoning_effort=high -c tools.web_search=true \
+  -m gpt-6-astra -c model_reasoning_effort=high -c tools.web_search=true \
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
@@ -117,6 +125,12 @@ Compare the sets, never the timestamps: those names are truncated to whole secon
 concurrent session can look newer than the round that actually ran. `--last` is only for the
 case where nothing else on the machine could have started a session in between.
 
+The model is `gpt-6-astra`, which an older CLI refuses with `requires a newer version of Codex`
+(the verified versions are in `reference/codex-routing.md`). That refusal is recorded as an
+outage like a usage limit. The fix is `npm install -g @openai/codex@latest` followed by
+`python ~/.claude/hooks/codex_lane.py clear`, which lifts the recorded outage at once; never an
+older model in this command.
+
 The sandbox bypass is not optional here: the Windows restricted-token sandbox fails to start
 (`CreateProcessWithLogonW 1326`), so `-s read-only` leaves the reviewer unable to run a single
 command; the read-only discipline comes from the role text in the packet instead. Both names of
@@ -126,8 +140,9 @@ Shell and web search both survive this — verified by a probe that read a local
 the web in one lean turn. Delta rounds repeat the same flags on `codex exec resume`, since they
 are per-invocation and `--ignore-user-config` does not disturb the stored session. Reasoning
 effort is `high` for every round: `xhigh` round-1 runs were the ones that exhausted the Codex
-usage window in August 2026 and turned the lane into a fallback to the native reviewer;
-`reviewer.toml` on the Codex side runs the same role at `high`.
+usage window in August 2026 and turned the lane into a fallback to the native reviewer, and
+OpenAI's migration guidance for Astra is to keep a lane's effective effort rather than retune it
+with the model; `reviewer.toml` on the Codex side runs the same role at `high`.
 
 Four residuals worth knowing. Skills are discovered from `CODEX_HOME/skills` rather than from
 the config, so they still load and still consume their 2% budget; there is no global switch, and
@@ -159,6 +174,14 @@ check results. Give Codex a self-contained read-only packet with:
 - remediation delta and affected interfaces on later rounds;
 - severity bar and the required final verdict.
 
+GPT-6 Astra asks instead of assuming when it sees room for interpretation, and it weighs
+instructions from skills and `AGENTS.md` more heavily than earlier models; in a non-interactive
+run a question is a round without a verdict. So every packet also says, plainly: the review is
+fully authorized read-only work that ends with its verdict line and never with a question; this
+packet and the role outrank skills and the global `AGENTS.md` for this lane, so no skill's
+workflow or gate runs; and if an instruction from such a file still makes it pause or change
+course, it names the file, quotes the instruction, and finishes the review.
+
 Do not pass the conversation or secrets. Disable nested reviewer delegation for this lane. Keep
 one external review session and resume it for delta rounds when the integration supports resume.
 
@@ -171,8 +194,9 @@ transitions, autonomous closure, or authority boundary.
 
 If Codex fails before a verdict:
 
-- when stderr names a usage limit or a model at capacity, do not resume: the record is already
-  written, and the round goes to `/adversarial-review-internal` now;
+- when stderr names a usage limit, a model at capacity, or a CLI too old for the model, do not
+  resume: the record is already written, and the round goes to `/adversarial-review-internal`
+  now;
 - for any other failure, resume that same session once; if that fails too, ordinarily hand the
   round to `/adversarial-review-internal` with the ledger and the packet so far, and say that the
   native engine reviewed because Codex was unavailable. The round budget carries over; a lane

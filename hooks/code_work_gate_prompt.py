@@ -32,7 +32,9 @@ def describe(entry):
             "[gate] Open candidate: OPERATIONAL (shell mutation, no lasting artifact){}. "
             "When this work is finished, end the final message with "
             "`[gate] operational: <pre-execution check>; <verified effect>` or "
-            "`[gate] no-change: <reason>`; a closing message without a receipt is blocked."
+            "`[gate] no-change: <reason>` (a lasting change the gate cannot see, such as prose "
+            "written through the shell: `[gate] verified: <risk>; …`); a closing message "
+            "without a receipt is blocked."
         ).format(since)
     floor = shape["floor"]
     files = shape["files"]

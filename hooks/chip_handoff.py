@@ -336,19 +336,185 @@ def records_for_parent(session_id):
     return records_from_index(BY_PARENT, session_id)
 
 
-def checked_out_branches(repo_root):
-    """Branch -> worktree that holds it. A branch checked out anywhere cannot be merged into."""
+def worktrees_of(repo_root):
+    """[(path, branch)] for every worktree of this repository; branch is None when detached."""
     ok, out, _ = git(repo_root, "worktree", "list", "--porcelain")
-    held = {}
     if not ok:
-        return held
-    tree = None
+        return []
+    found, path = [], None
     for line in out.splitlines():
         if line.startswith("worktree "):
-            tree = line[len("worktree "):].strip()
-        elif line.startswith("branch refs/heads/"):
-            held[line[len("branch refs/heads/"):].strip()] = tree
-    return held
+            path = line[len("worktree "):].strip()
+            found.append([path, None])
+        elif line.startswith("branch refs/heads/") and found:
+            found[-1][1] = line[len("branch refs/heads/"):].strip()
+    return [(os.path.realpath(pth), branch) for pth, branch in found if pth]
+
+
+def under(path, root):
+    """Whether `path` is `root` or inside it, comparing what the filesystem resolves to.
+
+    git prints resolved paths; a card stores the path as it was built. Behind a junction or a
+    short name the two spell the same directory differently, and a lexical comparison then
+    fails to recognise the chip's own worktree.
+    """
+    root = os.path.normcase(os.path.realpath(root))
+    path = os.path.normcase(os.path.realpath(path))
+    return path == root or path.startswith(root + os.sep)
+
+
+def dirty_outside(tree, nested):
+    """What is uncommitted in `tree`, ignoring the worktrees the child cut inside it.
+
+    A worktree nested in another shows up in its parent as an untracked directory, so a chip
+    whose child cut its own tree would otherwise never look clean and could never hand
+    anything back.
+    """
+    # `-uall` so an untracked directory does not collapse into one line and hide a file next
+    # to a nested worktree; `core.quotePath=false` so a non-ASCII name arrives as itself
+    # instead of octal escapes that match nothing.
+    ok, out, err = git(tree, "-c", "core.quotePath=false", "status", "--porcelain", "-uall",
+                       timeout=20)
+    if not ok:
+        return None, err
+    ignored = {os.path.normcase(os.path.abspath(path)) for path in nested
+               if not under(tree, path)}
+    kept = []
+    for line in out.splitlines():
+        entry = line[3:].strip().strip('"').rstrip("/")
+        if not entry:
+            continue
+        # Only the nested worktree itself is ignored, never a directory that contains one:
+        # a file sitting beside it is somebody's unsaved work.
+        full = os.path.normcase(os.path.abspath(os.path.join(tree, entry)))
+        if full in ignored:
+            continue
+        kept.append(line)
+    return "\n".join(kept), ""
+
+
+def chip_trees(record):
+    """Every worktree the chip owns: its own and anything cut inside it.
+
+    Distinct from `work_sources`, which ranks only the trees that carry work. Cleanliness is
+    judged across all of them, and each of them has to be invisible to the others — a worktree
+    nested in another shows up there as an untracked directory.
+    """
+    chip_tree, repo_root = record.get("worktree"), record.get("repo_root")
+    if not chip_tree or not repo_root:
+        return []
+    found = [path for path, _ in worktrees_of(repo_root)
+             if under(path, chip_tree) and os.path.isdir(path)]
+    return found or [chip_tree]
+
+
+def work_sources(record, parent_tip=None):
+    """[(worktree, branch, commits)] carrying this chip's work, most commits first.
+
+    The chip worktree is where the child starts, and it does not always stay on the chip
+    branch: it cuts a worktree of its own inside the chip's and works there, leaving the chip
+    branch empty. Reporting that branch would tell the parent there is nothing to pull while
+    the work sits one branch away.
+
+    Only worktrees inside the chip's own directory count. Where a session says it is working is
+    not evidence of authorship — the app hands sessions worktrees of its own and reuses them
+    between children — whereas a worktree under the chip's directory was cut by this chip's
+    child and nobody else. A candidate must also descend from the commit the chip was cut from,
+    so a directory that merely happens to sit there cannot pass its own history off as the
+    chip's work.
+    """
+    chip_tree, repo_root = record.get("worktree"), record.get("repo_root")
+    origin = record.get("base_sha")
+    if not chip_tree or not repo_root or not origin:
+        return []
+    # Counted against the chip's own base and the parent's tip, and nothing else: subtracting
+    # every ref in the repository turned a delivery the child had merely pushed, backed up or
+    # branched from into nothing at all.
+    excludes = ["--not", origin] + ([parent_tip] if parent_tip and parent_tip != origin else [])
+    # Where the chip tree itself stands. Useful only while the chip branch has moved: before
+    # the child's first commit it equals the base, and then it tells nothing apart.
+    _, chip_head, _ = git(chip_tree, "rev-parse", "HEAD", timeout=20)
+    chip_branch = record.get("chip_branch")
+
+    found, seen = [], set()
+    for path, branch in worktrees_of(repo_root):
+        # Everything under the chip's directory was cut there by this chip's child, so nothing
+        # is dropped: a tree is ranked, never silenced. Only the ranking decides what the
+        # parent is told to take.
+        if not under(path, chip_tree) or not os.path.isdir(path):
+            continue
+        own_tree = under(chip_tree, path)
+        ok, head, _ = git(path, "rev-parse", "HEAD", timeout=20)
+        if ok and head in seen:
+            # Two worktrees at the same commit are one delivery; naming the copy as a second
+            # source would ask the parent to chase work it has already been given.
+            continue
+        counted, count, _ = git(path, "rev-list", "--count", "HEAD", *excludes, timeout=20)
+        # A count that could not be taken is unknown, never zero: reporting it as zero told the
+        # parent there was nothing to pull while the branch held the delivery.
+        unique = int(count) if counted and count.isdigit() else None
+        if unique is None or unique or own_tree:
+            found.append((unique, path, branch,
+                          False if own_tree else borrowed_history(path, branch, chip_branch),
+                          derived_from(path, chip_head, origin, own_tree)))
+            if ok and head:
+                seen.add(head)
+    if not found:
+        # The chip's own worktree is missing from the repository's list — nothing here can be
+        # counted, and saying "nothing to pull" would be a guess.
+        return [(chip_tree, record.get("chip_branch"), None, False)]
+    # Unknown first, because it has to be looked at before anything is reported. Then history
+    # that belongs to somebody else goes last, whatever its size. Then what grew out of the
+    # chip's current branch, then the larger contribution, and the chip's own tree breaks a tie.
+    found.sort(key=lambda row: (row[0] is not None, row[3], not row[4], -(row[0] or 0),
+                                not under(chip_tree, row[1])))
+    return [(path, branch, commits, borrowed)
+            for commits, path, branch, borrowed, _ in found]
+
+
+def borrowed_history(path, branch, chip_branch):
+    """Whether this worktree stands on commits some other ref already owns.
+
+    A tree the child cut to compare against — from the trunk, a remote-tracking branch, a
+    release tag — sits on that history: the ref contains its HEAD. Work the child did itself is
+    contained by nothing but its own branch and the copies of it the child pushed. Size cannot
+    tell the two apart, since a trunk ahead of the parent always has more commits than the
+    child wrote, so containment does.
+
+    Asked only of trees the child cut inside the chip's: the chip's own worktree is the
+    delivery by definition, and the parent branch contains its base, which would make every
+    untouched chip look borrowed.
+    """
+    ok, out, _ = git(path, "for-each-ref", "--format=%(refname:short)", "--contains", "HEAD",
+                     "refs/heads/", "refs/remotes/", "refs/tags/", timeout=20)
+    if not ok:
+        # Unknown ownership is treated as borrowed: promoting a tree that might be somebody
+        # else's over the chip's own work is the failure this test exists to prevent.
+        return True
+    mine = {name for name in (branch, chip_branch) if name}
+    # Every remote this repository knows, not a guessed pair: a child that pushed its work to a
+    # fork, or under another name, still pushed its own work.
+    ok_remotes, remotes, _ = git(path, "remote", timeout=10)
+    known = [line.strip() for line in remotes.splitlines() if line.strip()] if ok_remotes else []
+    mine |= {"{}/{}".format(remote, name) for name in list(mine) for remote in known}
+    ok_up, upstream, _ = git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
+                             timeout=10)
+    if ok_up and upstream.strip():
+        mine.add(upstream.strip())
+    return any(name.strip() and name.strip() not in mine for name in out.splitlines())
+
+
+def derived_from(path, chip_head, origin, own_tree):
+    """Whether this worktree grew out of the chip branch as it stands now."""
+    if own_tree or not chip_head or chip_head == origin:
+        return True
+    ok, _, _ = git(path, "merge-base", "--is-ancestor", chip_head, "HEAD", timeout=20)
+    return ok
+
+
+def checked_out_branches(repo_root):
+    """Branch -> worktree that holds it. A branch checked out anywhere cannot be merged into."""
+    return {branch: path for path, branch in worktrees_of(repo_root) if branch}
 
 
 class ChipError(Exception):
@@ -458,7 +624,9 @@ def print_open_result(record):
 
 
 def finish_command(record):
-    target = "" if record["mode"] == "code" else " --chip {}".format(record["chip_id"])
+    # Always by id: the child may run this from the worktree it cut for itself, where the
+    # card cannot be found by directory.
+    target = " --chip {}".format(record["chip_id"])
     return ('"{}" "{}" finish{} --child-session <свой sessionId> '
             '--message "<что сделано, одной строкой>"').format(
         sys.executable, os.path.abspath(__file__), target)
@@ -514,6 +682,17 @@ def handoff_footer(record):
     return "\n".join(lines)
 
 
+def work_branch(record):
+    """The branch the work is on, or None when it is on a detached HEAD.
+
+    Once `finish` has looked, the answer is whatever it found — including nothing. Falling back
+    to the chip branch here would let a detached commit be reported as merged.
+    """
+    if "work_branch" in record:
+        return record["work_branch"]
+    return record.get("chip_branch")
+
+
 def base_ref(record):
     """(name to merge into, commit it points at) — the parent branch while it still exists,
     else the commit the chip was cut from."""
@@ -539,6 +718,17 @@ def try_merge(record, base):
     parent = record.get("parent_branch")
     if not parent or parent != base:
         return "no-parent-branch", None, []
+    source = work_branch(record)
+    if not source or source == parent:
+        return "no-work-branch", None, []
+    # The parent branch can be rewritten while the chip works — a rebase before publication is
+    # ordinary. Merging then drags the commit the chip was cut at, which no longer belongs to
+    # that history, and duplicates whatever was published in its place. Only the parent knows
+    # how its own work should be carried over, so this stops and says so.
+    still_there, _, _ = git(record["repo_root"], "merge-base", "--is-ancestor",
+                            record["base_sha"], parent, timeout=20)
+    if not still_there:
+        return "base-rewritten", None, []
     held = checked_out_branches(record["repo_root"])
     if parent in held:
         return "branch-busy", held[parent], []
@@ -548,7 +738,7 @@ def try_merge(record, base):
     if not ok:
         return "merge-unavailable", err, []
     try:
-        ok, _, err = git(tmp, "merge", "--no-ff", "--no-edit", record["chip_branch"])
+        ok, _, err = git(tmp, "merge", "--no-ff", "--no-edit", work_branch(record))
         if ok:
             _, sha, _ = git(tmp, "rev-parse", "HEAD")
             return "merged", sha, []
@@ -595,33 +785,74 @@ def cmd_finish(args):
         record["outcome"] = "reported"
         return publish_report(record)
 
-    worktree = record.get("worktree") or cwd
-    ok, dirty, err = git(worktree, "status", "--porcelain")
-    if not ok:
-        return fail("git status не отработал\n{}".format(err))
-    if dirty:
-        return fail("рабочее дерево не чистое — сначала коммит:\n{}".format(dirty))
-
     base, base_commit = base_ref(record)
-    ok, count, err = git(worktree, "rev-list", "--count", "{}..HEAD".format(base))
-    if not ok:
-        return fail("не удалось сравнить с {}\n{}".format(base, err))
+    sources = work_sources(record, base_commit)
+    # Every tree the chip owns has to be clean, not just the one that wins: uncommitted edits
+    # left in another of them would be dropped from the handoff without a word.
+    trees = chip_trees(record) or [record.get("worktree") or cwd]
+    for path in trees:
+        dirty, err = dirty_outside(path, trees)
+        if dirty is None:
+            return fail("git status не отработал в {}\n{}".format(path, err))
+        if dirty:
+            return fail("рабочее дерево {} не чистое — сначала коммит:\n{}".format(path, dirty))
+
+    worktree, branch, commits, _ = sources[0]
+    _, delivered_head, _ = git(worktree, "rev-parse", "HEAD", timeout=20)
+    if commits is None:
+        return fail("не удалось сосчитать коммиты в {} — возможно, базовый коммит {} больше не "
+                    "существует; отчёт не отправлен".format(worktree, (base_commit or "")[:12]))
     record["base_commit"] = base_commit
-    record["commits"] = int(count or "0")
+    record["commits"] = commits
+    # Kept as None when the work sits on a detached HEAD: substituting the chip branch here
+    # would let an empty merge report itself as a delivery.
+    record["work_branch"] = branch
+    record["work_worktree"] = worktree
+    # Every other source that carries commits is named, whoever won: they all grew from the
+    # chip's base, so each is work the parent would otherwise never hear about.
+    # Measured against what is actually being handed over: a nested branch the child already
+    # merged into the delivery holds nothing the parent could miss, and warning about it teaches
+    # the parent to ignore the line that matters when a tree really does hold something extra.
+    record["other_sources"] = []
+    for other_path, other_branch, other_commits, other_borrowed in sources[1:]:
+        if not other_commits or not delivered_head:
+            continue
+        ok, beyond, _ = git(other_path, "rev-list", "--count", "HEAD", "--not", delivered_head,
+                            timeout=20)
+        left = int(beyond) if ok and beyond.isdigit() else other_commits
+        if left:
+            record["other_sources"].append({"worktree": other_path, "branch": other_branch,
+                                            "commits": left, "borrowed": other_borrowed})
     record["status"] = "handed-off"
 
     if record["commits"] == 0:
-        record["outcome"] = "no-changes"
+        # A branch that never moved means nothing was done; one that moved but whose commits
+        # the parent already holds means the delivery arrived by another route. The parent
+        # needs to be told which.
+        moved, tip, _ = git(worktree, "rev-parse", "HEAD", timeout=20)
+        taken, _, _ = git(worktree, "merge-base", "--is-ancestor", "HEAD", base, timeout=20)
+        untouched = not moved or tip == record.get("base_sha")
+        record["outcome"] = "no-changes" if untouched else ("already-there" if taken
+                                                            else "no-changes")
         return publish_report(record)
 
-    outcome, detail, conflicts = try_merge(record, base)
+    # A branch the chip did not cut is never merged automatically: it was found, not agreed,
+    # and the parent has to look at it first.
+    if not work_branch(record):
+        outcome, detail, conflicts = "no-work-branch", None, []
+    elif work_branch(record) != record.get("chip_branch"):
+        outcome, detail, conflicts = "found-elsewhere", None, []
+    else:
+        outcome, detail, conflicts = try_merge(record, base)
     record["outcome"] = outcome
     record["outcome_detail"] = detail
     record["conflicts"] = conflicts
     if outcome != "merged":
         bundle = os.path.join(CHIP_DIR, "{}.bundle".format(record["chip_id"]))
-        ok, _, err = git(worktree, "bundle", "create", bundle, record["chip_branch"],
-                         "--not", base)
+        # A detached candidate has no branch to name, so its own HEAD is bundled instead —
+        # those commits are reachable from nothing else and would go with the worktree.
+        ok, _, err = git(worktree, "bundle", "create", bundle,
+                         work_branch(record) or "HEAD", "--not", base)
         record["bundle"] = bundle if ok else None
         record["bundle_error"] = None if ok else err
     return publish_report(record)
@@ -648,18 +879,53 @@ def notification(record):
                                               record["chip_id"]), ""]
     if record.get("summary"):
         lines += [record["summary"], ""]
+    others = ["На `{}` есть ещё {} коммит(ов){} — посмотри, нужны ли они.".format(
+        other["branch"] or "detached HEAD", other["commits"],
+        ", но эта история принадлежит другой ветке" if other.get("borrowed") else
+        " сверх того, что забирается") + "\n"
+        for other in record.get("other_sources") or []]
 
     if outcome == "reported":
         lines.append("Операционная работа: подтягивать нечего, эффект проверяется по самой "
                      "системе.")
         return "\n".join(lines + parent_actions(record))
-    if outcome == "no-changes":
-        lines.append("Изменений в коде нет — забирать нечего, ветка `{}` пустая.".format(
-            record["chip_branch"]))
+    if outcome in ("no-changes", "already-there"):
+        if outcome == "no-changes":
+            lines.append("На ветке `{}` изменений нет.".format(work_branch(record)))
+        else:
+            lines.append("Работа с ветки `{}` уже есть в `{}`.".format(
+                work_branch(record), record.get("parent_branch") or "родительской ветке"))
+        # A chip that reports nothing must still say where commits were found. A delivery the
+        # ranking put second is a lead; staying silent about it is how work is lost.
+        if others:
+            lines += ["", "Но в деревьях чипа есть коммиты:", ""] + others
+            lines += ["Готовой команды нет: принадлежность этих коммитов по истории не "
+                      "определяется, посмотри сам, из {}.".format(record["repo_root"]), ""]
+        else:
+            lines.append("Забирать нечего.")
         return "\n".join(lines + parent_actions(record))
 
-    chip = record["chip_branch"]
-    lines.append("Ветка `{}`, коммитов: {}.".format(chip, record.get("commits")))
+    branch = work_branch(record)
+    if not branch:
+        lines += ["Работа лежит в отсоединённом состоянии (detached HEAD) в дереве `{}` — "
+                  "ветки нет, мержить нечего.".format(record.get("work_worktree")),
+                  "Попроси ребёнка перенести коммиты на ветку и отчитаться снова.", ""]
+        lines += others
+        if record.get("bundle"):
+            lines += ["Коммиты сохранены в bundle, поверх `{}`:".format(
+                          (record.get("base_commit") or "")[:12]), "",
+                      "```bash", 'git fetch "{}" HEAD'.format(
+                          record["bundle"].replace("\\", "/")), "```", ""]
+        return "\n".join(lines + parent_actions(record))
+    foreign = branch != record.get("chip_branch")
+    if foreign:
+        lines += ["Коммиты нашлись не на ветке чипа, а на `{}` в дереве `{}`. Чей это код — "
+                  "работа ребёнка или ветка, от которой он сравнивался, — по истории не "
+                  "определить, поэтому ни автомержа, ни готовой команды: посмотри сам и "
+                  "забери, если это результат."
+                  .format(branch, record.get("work_worktree")), ""]
+    lines += others
+    lines.append("Ветка `{}`, коммитов: {}.".format(branch, record.get("commits")))
     if outcome == "merged":
         lines += [
             "Влито в `{}` (коммит {}).".format(record["parent_branch"],
@@ -675,19 +941,27 @@ def notification(record):
                            record.get("parent_branch"), record.get("outcome_detail")),
         "conflict": "мерж дал конфликт и был отменён; конфликтуют: {}".format(
             ", ".join(record.get("conflicts") or []) or "см. git"),
+        "found-elsewhere": "ветка найдена, но не заводилась этим чипом — автомерж не делается",
+        "base-rewritten": "ветка `{}` переписана с тех пор, как чип был отведён — обычный мерж "
+                          "затащил бы осиротевший базовый коммит и продублировал уже "
+                          "опубликованное; перенеси работу через `git cherry-pick -x`"
+                          .format(record.get("parent_branch")),
         "no-parent-branch": "родительская ветка не найдена (detached HEAD или ветка удалена)",
+        "no-work-branch": "работа не на отдельной ветке (detached HEAD либо та же ветка, что "
+                          "у родителя) — мержить нечего",
         "merge-unavailable": "не удалось подготовить временное дерево для мержа: {}".format(
             record.get("outcome_detail")),
     }
-    lines += [
-        "Автомерж не выполнен: {}.".format(reasons.get(outcome, outcome)),
-        "",
-        "Забрать так — из {}:".format(record["repo_root"]),
-        "",
-        "```bash",
-        "git merge --no-ff {}".format(chip),
-        "```",
-    ]
+    lines.append("Автомерж не выполнен: {}.".format(reasons.get(outcome, outcome)))
+    if not foreign:
+        lines += [
+            "",
+            "Забрать так — из {}:".format(record["repo_root"]),
+            "",
+            "```bash",
+            "git merge --no-ff {}".format(branch),
+            "```",
+        ]
     if record.get("bundle"):
         lines += [
             "",
@@ -695,13 +969,14 @@ def notification(record):
             "bundle, поверх `{}`:".format((record.get("base_commit") or "")[:12]),
             "",
             "```bash",
-            'git fetch "{}" {}:{}'.format(record["bundle"].replace("\\", "/"), chip, chip),
+            'git fetch "{}" {}:{}'.format(record["bundle"].replace("\\", "/"), branch,
+                                          branch),
             "```",
         ]
     elif record.get("bundle_error"):
         lines += ["", "Запасной bundle создать не удалось ({}) — ветка `{}` единственный "
                       "носитель работы, не удаляй её до мержа.".format(
-                          record["bundle_error"], chip)]
+                          record["bundle_error"], branch)]
     return "\n".join(lines + parent_actions(record))
 
 
@@ -983,17 +1258,32 @@ def record_for_spawn(tool_use_id):
     return read_json(record_path(ids[-1])) if ids else None
 
 
-def already_registered(prompt):
-    """Whether this prompt already carries a handoff for a chip that exists.
+def already_registered(prompt, tool_use_id):
+    """Whether this very call is already registered — not merely that a token is present.
 
-    Keyed on the chip id the footer embeds rather than on the visible heading: a task about
-    this tooling quotes that heading, and treating the quote as proof of registration left the
-    chip with no card at all.
+    A parent composing the next task routinely carries the previous one's handoff block over
+    with it. A token alone therefore proves nothing: it named a chip that belongs to a
+    different task, whose card and worktree the new child would then inherit, leaving its own
+    work with no card and its parent with nothing to accept. Only the call's own id can say
+    that this spawn was already registered.
     """
+    if not tool_use_id:
+        return False
     for chip_id in CHIP_TOKEN_RE.findall(prompt or ""):
-        if read_json(record_path(chip_id)):
+        card = read_json(record_path(chip_id))
+        if card and card.get("spawn_tool_use_id") == tool_use_id:
             return True
     return False
+
+
+def without_stale_handoff(prompt):
+    """The task text with a handoff block carried over from another chip cut away.
+
+    `open` always appends its block last, so everything from the first token on is the old
+    block; leaving it would hand the child two chip ids and two sets of instructions.
+    """
+    match = CHIP_TOKEN_RE.search(prompt or "")
+    return (prompt[:match.start()] if match else prompt).rstrip()
 
 
 def chip_cwd(worktree, parent_cwd, repo_root):
@@ -1039,14 +1329,20 @@ def hook_spawn():
     spawn = payload.get("tool_input")
     if not isinstance(spawn, dict):
         return 0
-    if already_registered(spawn.get("prompt") or ""):
+    if already_registered(spawn.get("prompt") or "", payload.get("tool_use_id")):
         return 0
     try:
         sweep_pending()
     except Exception:
         pass
 
-    parent_cwd = os.path.abspath(spawn.get("cwd") or payload.get("cwd") or os.getcwd())
+    asked_cwd = spawn.get("cwd")
+    # A `cwd` carried over with somebody else's handoff block points into that chip's worktree.
+    # Branching from there would cut this chip off another chip's work, so it is ignored and
+    # the parent's own directory is used instead.
+    if asked_cwd and under(asked_cwd, TREE_ROOT):
+        asked_cwd = None
+    parent_cwd = os.path.abspath(asked_cwd or payload.get("cwd") or os.getcwd())
     operational, repo_root = spawn_mode(parent_cwd)
     try:
         record = create_chip(spawn.get("title") or "Чип", parent_cwd, None, operational,
@@ -1056,7 +1352,8 @@ def hook_spawn():
         return 0
 
     updated = dict(spawn)
-    updated["prompt"] = (spawn.get("prompt") or "").rstrip() + "\n\n" + handoff_footer(record)
+    updated["prompt"] = (without_stale_handoff(spawn.get("prompt") or "") + "\n\n"
+                         + handoff_footer(record))
     if record["mode"] == "code":
         updated["cwd"] = chip_cwd(record["worktree"], parent_cwd, repo_root)
     print(json.dumps({"hookSpecificOutput": {

@@ -7,7 +7,8 @@ the candidate produced — a lasting artifact, or an effect on a live system:
 
 * development-verification was actually invoked;
 * an operational candidate ends with a receipt naming its pre-execution check and its effect;
-* a HIGH candidate has one foreground simplify-reviewer result (the legacy trio still counts);
+* a STANDARD candidate has one foreground simplify-reviewer result, a HIGH candidate one from
+  each of the three simplify lenses;
 * HIGH completion has an adversarial APPROVED result — from either review engine — newer than
   the final edit;
 * post-ESCALATE publication has a bounded closure-validation result.
@@ -65,14 +66,22 @@ MOVED_ACK_RE = re.compile(
 AGENT_BG_RE = re.compile(
     r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"
 )
+# The id a foreground agent result names for continuing that agent with SendMessage.
+AGENT_TRAILER_RE = re.compile(r"(?:^|\n)agentId: ([A-Za-z0-9_-]+) \(use SendMessage")
+# What SendMessage returns when it resumed a finished agent; a message to a running one says
+# nothing like it and starts no round.
+RESUMED_AGENT_RE = re.compile(r"\"resumedAgentId\"\s*:\s*\"([A-Za-z0-9_-]+)\"")
 # Raw-line tokens without which a pre-candidate transcript line can contribute nothing: a skill
-# timestamp, or the background bookkeeping that spans the whole session.
+# timestamp, the background bookkeeping that spans the whole session, or the id of a reviewer a
+# later round may resume.
 PRE_CANDIDATE_TOKENS = (
-    '"Skill"', '"SlashCommand"', '"TaskStop"',
+    '"Skill"', '"SlashCommand"', '"TaskStop"', '"Agent"', '"Task"',
     "in background with ID", "moved to the background", "Async agent launched",
+    "use SendMessage",
 )
 NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
+NOTIFICATION_CALL_RE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
 # An agent's notification carries its final message, HTML-escaped, as the result.
 NOTIFICATION_RESULT_RE = re.compile(r"<result>(.*?)</result>", re.S)
@@ -80,18 +89,12 @@ MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
 RISK_ORDER = cwg.RISK_ORDER
-# One lane is the whole simplify pass: `simplify-reviewer` covers reuse, quality and efficiency
-# in one report. The three legacy lens names still count, so an older transcript, or a project
-# that kept the trio, closes under the same rule. The August 2026 transcripts are why: 456 trio
-# waves, 205 of them single-lens re-runs forced by the old three-lens requirement, ~9 minutes
-# of wall time and three Sonnet contexts each, for findings the parent applied in 56% of waves.
-SIMPLIFY_LANE = "simplify-reviewer"
-SIMPLIFY_REVIEWERS = {
-    SIMPLIFY_LANE,
-    "simplify-reuse-reviewer",
-    "simplify-quality-reviewer",
-    "simplify-efficiency-reviewer",
-}
+# HIGH work gets a separate context per simplify concern; STANDARD gets the one lane covering
+# all three, which the complete trio also satisfies. The lane names are what the transcript
+# shows, so they are the whole of the evidence.
+SIMPLIFY_LANE = cwg.SIMPLIFY_LANE
+SIMPLIFY_LENSES = cwg.SIMPLIFY_LENSES
+SIMPLIFY_REVIEWERS = {SIMPLIFY_LANE, *SIMPLIFY_LENSES}
 TERMINAL_RE = re.compile(
     r"^\[gate\]\s*(verified|operational|no-change|pr-ready|draft-blocked|anomaly-reported)"
     r"\s*:\s*(\S.*)$",
@@ -99,7 +102,7 @@ TERMINAL_RE = re.compile(
 )
 # `[gate] anomaly-reported: <report id>; <the verifiable contradiction>`
 # Wall-clock budget for the git calls that decide whether a repository is back where the
-# candidate opened: the Stop hook has a ten-second window of its own.
+# candidate opened: the Stop hook has a twenty-second window of its own.
 RESTORE_BUDGET = 4.0
 ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
 VERIFIED_REASON_RE = re.compile(r"^(LOW|STANDARD|HIGH)\s*;\s*\S", re.IGNORECASE)
@@ -122,7 +125,7 @@ CODEX_SESSION_GLOB = "rollout-*.jsonl"
 CODEX_RUN_SLACK = 5.0        # the CLI keeps logging briefly after the command returns
 CODEX_RUN_HORIZON = 7 * 86400.0  # older sessions reviewed some earlier candidate, not this one
 # Read budget across every log this run inspects, newest first: one session store here holds
-# 300 MB logs, and the hook answers inside a ten-second Stop timeout.
+# 300 MB logs, and the hook answers inside a twenty-second Stop timeout.
 CODEX_SCAN_BUDGET = 128 * 1024 * 1024
 CODEX_EXCERPT = 400
 CODEX_MIN_BINDING = 200
@@ -531,40 +534,66 @@ def distinctive_of(packet):
     return " ".join(parts[-1].split())
 
 
-def packet_of_launch(command, call_id):
-    """(fed_on_stdin, distinctive_packet_text) for a Codex launch, from the marker hook's capture.
+def packet_of_launch(command, call_id, started=None):
+    """(fed_on_stdin, distinctive_packet_text, why_unbindable) for a Codex launch.
 
     The packet is what the session was given, and Codex logs it verbatim, so it names the one
     session among several that this launch started. It is read from the capture the marker hook
     took before the command ran — not from the file, which the model may have rewritten since.
-    What names the session is the packet beyond the role every review is given, and it has to
-    be long enough to be distinctive. A launch that fed something it cannot be bound by — no
-    usable capture, an unrecognizable launch, a packet that is all role — binds nothing.
+    Without a capture, because that hook did not run to the end, the file itself is read when
+    nothing can have written it after the launch started. What names the session is the packet
+    beyond the role every review is given, and it has to be long enough to be distinctive. A
+    launch that fed something it cannot be bound by binds nothing, and the third value says why.
     """
     try:
         import code_work_gate_mark as mark
         launch = mark.codex_launch(command)
     except Exception:
+        mark = None
         launch = {"fed": "<" in str(command or ""), "path": ""}
     if not launch["fed"]:
-        return False, ""
+        return False, "", ""
     if not launch["path"]:
-        return True, ""
+        return True, "", "the hooks could not name the file the launch fed"
     capture = cwg.read_json(cwg.packet_capture_path(_SESSION["key"], str(call_id or "")))
     # A missing capture reads as None, not a dict — a launch whose PreToolUse mark hook was
     # cancelled (it can run tens of seconds) leaves none. Guard the whole record before any
     # field access: dereferencing None here aborted the entire Stop scan, and everything after
     # the aborting notification went unread, so a later in-flight task earned no wait and the
     # turn was blocked with no receipt instead.
-    if not isinstance(capture, dict) or capture.get("truncated"):
-        return True, ""
+    if not isinstance(capture, dict):
+        capture = packet_from_file(mark, launch["path"], started)
+        if capture is None:
+            return True, "", "no capture, and the file changed after the launch or cannot be read"
+    if capture.get("truncated"):
+        return True, "", "the packet is longer than a capture keeps"
     text = capture.get("text")
     if not isinstance(text, str):
-        return True, ""
+        return True, "", "the capture holds no text"
     distinctive = distinctive_of(text)
     if len(distinctive) < PACKET_MIN_CHARS:
-        return True, ""
-    return True, distinctive
+        return True, "", "the packet beyond the reviewer role is too short to name a session"
+    return True, distinctive, ""
+
+
+def packet_from_file(mark, path, started):
+    """The packet file read as a capture, when its last write came before the launch (R4).
+
+    The file is stated before and after the read, so a write landing in between binds nothing.
+    """
+    if mark is None or not cwg.valid_ts(started):
+        return None
+    try:
+        before = os.stat(path)
+        if before.st_mtime > float(started):
+            return None
+        read = mark.packet_text(path)
+        after = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if read is None or (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size):
+        return None
+    return {"text": read[0], "truncated": read[1]}
 
 
 def session_given(path, mtime_ns, size, started, finished, packet):
@@ -588,16 +617,14 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
     itself, from records stamped inside the launch-to-notification window. When the launch fed a
     packet on stdin, the session that was given that packet is the one; otherwise exactly one
     briefed session may have spoken there — two are ambiguous, and an ambiguous verdict binds
-    to nothing, which is the safe direction.
+    to nothing, which is the safe direction. Returns `(verdict, why_none)`.
     """
-    fed, packet = packet_of_launch(command, call_id)
+    fed, packet, why = packet_of_launch(command, call_id, started)
     if fed and not packet:
         # The usual cause: the packet was written by the same shell command that launched
         # Codex, so nothing existed when the marker hook looked before the command ran.
-        review_note(at=finished, engine="codex-background", verdict=None,
-                    reason="packet fed on stdin but nothing to bind by at launch; write the "
-                           "packet in its own call before launching")
-        return None
+        return None, ("packet fed on stdin but nothing to bind by at launch ({}); write the "
+                      "packet in its own call before launching").format(why)
     verdicts, given = {}, []
     for path, _ in codex_run_files(since):
         try:
@@ -620,10 +647,15 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
     if packet:
         # Exactly one session may have been given this packet, whether or not it answered:
         # two chats reviewing with the same words are told apart by nothing, and bind nothing.
-        return verdicts.get(given[0]) if len(given) == 1 else None
+        if len(given) != 1:
+            return None, ("no session in the window was given this launch's packet" if not given
+                          else "{} sessions were given this launch's packet".format(len(given)))
+        control = verdicts.get(given[0])
+        return control, "" if control else "the session given the packet stated no verdict in the window"
     if len(verdicts) != 1:
-        return None
-    return next(iter(verdicts.values()))
+        return None, ("no briefed session stated a verdict in the window" if not verdicts
+                      else "{} briefed sessions stated verdicts in the window".format(len(verdicts)))
+    return next(iter(verdicts.values())), ""
 
 
 def record_control(evidence, stamp, control, malformed=False):
@@ -642,6 +674,33 @@ def record_control(evidence, stamp, control, malformed=False):
     elif not malformed:
         return
     evidence["review_events"].append((stamp, control_kind, control_value))
+
+
+def review_lane(task_id, calls_named, rounds, open_rounds, launched):
+    """The judged review lane a notification about this task belongs to, or None.
+
+    The round the notification names by its SendMessage call, then the agent's round still
+    waiting for one, then the agent's own background launch.
+    """
+    for call_id in calls_named:
+        if rounds.get(call_id, {}).get("agent") == task_id:
+            return call_id
+    if task_id in open_rounds:
+        return open_rounds[task_id]
+    return task_id if task_id in launched else None
+
+
+def resumed_agent(text):
+    """The agent a SendMessage result says it resumed, or None."""
+    try:
+        payload = json.loads(text)
+    except Exception:
+        match = RESUMED_AGENT_RE.search(str(text or ""))
+        return match.group(1) if match else None
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return None
+    agent = payload.get("resumedAgentId")
+    return agent if isinstance(agent, str) else None
 
 
 def judge_background_agents(evidence, launches, notices_by_task):
@@ -669,8 +728,9 @@ def judge_background_agents(evidence, launches, notices_by_task):
         if first is not None:
             stamp, _, control = notices[first]
             record_control(evidence, launch["started"], control)
-            review_note(at=stamp, engine="native-background", verdict=control[1],
-                        task=task_id)
+            resumed = {"agent": launch["agent"]} if launch.get("agent") else {}
+            review_note(at=launch["started"], notified=stamp, engine="native-background",
+                        verdict=control[1], task=task_id, **resumed)
             notices = notices[first + 1:]
             reason = "the lane went on after stating its verdict"
         else:
@@ -725,6 +785,15 @@ def transcript_evidence(path, since, skill_since=None):
     # agent that stops to wait for its own background suite notifies without a verdict first.
     background_agents = {}
     agent_notices = {}
+    # Review agents by the id the harness gave them — a background launch's acknowledgement
+    # names it, and so does a foreground result's trailer — so that a SendMessage resuming one
+    # is a review round (report 7435cfb4). Rounds are keyed by that SendMessage call, whose id the
+    # round's notification carries, and each agent's round still waiting for it is kept for a
+    # notification that names no call.
+    review_agents = {}
+    resume_rounds = {}
+    open_rounds = {}
+    latest_rounds = {}
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
             for raw in stream:
@@ -751,10 +820,13 @@ def transcript_evidence(path, since, skill_since=None):
                     for notice in notices:
                         status_match = NOTIFICATION_STATUS_RE.search(notice)
                         status = (status_match.group(1) if status_match else "?").strip().lower()
+                        calls_named = NOTIFICATION_CALL_RE.findall(notice)
                         for task_id in NOTIFICATION_ID_RE.findall(notice):
                             if task_id.startswith("__orphan"):
                                 continue
                             delivery = entry.get("type") in ("user", "attachment")
+                            lane = review_lane(task_id, calls_named, resume_rounds, open_rounds,
+                                               background_agents)
                             # A native review agent's verdict lives in its delivery record — the
                             # absorbed command (`attachment`) or the idle turn (`user`) — not in
                             # the queue bookkeeping. Marking such an agent done on a lone enqueue
@@ -764,12 +836,9 @@ def transcript_evidence(path, since, skill_since=None):
                             # lane is done only when its delivery record is seen; every other
                             # task (a Codex launch, judged from its rollout) is done on any
                             # notification, as before.
-                            if task_id not in background_agents or delivery:
+                            if lane is None or delivery:
                                 evidence["background_done"][task_id] = (stamp, status)
-                            if (
-                                task_id in background_agents and not stamp + 1 < since
-                                and delivery
-                            ):
+                            if lane is not None and not stamp + 1 < since and delivery:
                                 # One notice per physical delivery: the absorbed command
                                 # (`attachment`) or the idle turn (`user`). The enqueue and the
                                 # later `absorbed_mid_turn` remove are the same text as
@@ -783,20 +852,23 @@ def transcript_evidence(path, since, skill_since=None):
                                     reviewer_control(html.unescape(found.group(1) if found else ""))
                                     if status == "completed" else None
                                 )
-                                agent_notices.setdefault(task_id, []).append(
+                                agent_notices.setdefault(lane, []).append(
                                     (stamp, status, control)
                                 )
+                                if open_rounds.get(task_id) == lane:
+                                    del open_rounds[task_id]
                             call = background_calls.pop(task_id, None)
                             if not call or stamp + 1 < since:
                                 continue
                             # A backgrounded review lane is judged from the rollout log Codex
                             # wrote between the launch and this notification; its output file
                             # is for the parent to read, not evidence.
-                            control = (
-                                rollout_verdict(call["started"], stamp, skill_since,
-                                                call.get("command", ""), call["call_id"])
-                                if status == "completed" else None
-                            )
+                            if status == "completed":
+                                control, unbound_why = rollout_verdict(
+                                    call["started"], stamp, skill_since,
+                                    call.get("command", ""), call["call_id"])
+                            else:
+                                control, unbound_why = None, "the task ended " + status
                             bound = control is not None
                             # The verdict covers the candidate as it was when the review was
                             # launched — nothing edited after the launch was in the packet —
@@ -810,15 +882,18 @@ def transcript_evidence(path, since, skill_since=None):
                             evidence["background_judged"].append(call["call_id"])
                             if bound:
                                 record_control(evidence, call["started"], control)
-                                review_note(at=stamp, engine="codex-background",
-                                              verdict=control[1], task=task_id)
+                                # `at` is where the verdict is filed, which is what expiry is
+                                # judged against; the notification only reports it (a269a6fc).
+                                review_note(at=call["started"], notified=stamp,
+                                            engine="codex-background", verdict=control[1],
+                                            task=task_id)
                             else:
                                 evidence["review_failures"].append(stamp)
                                 record_control(evidence, stamp, ("unbound", None), malformed=True)
                                 review_note(at=stamp, engine="codex-background",
                                               verdict=None, task=task_id, status=status,
                                               reason="no single briefed Codex verdict between "
-                                                     "launch and notification")
+                                                     "launch and notification: " + unbound_why)
                                 # The marker hook reads a foreground call's stderr when it
                                 # returns; a background lane returns at launch, so its outage
                                 # (usage limit, capacity) is only readable here, from the
@@ -855,8 +930,13 @@ def transcript_evidence(path, since, skill_since=None):
                             stopped = str(payload.get("task_id") or "")
                             if stopped:
                                 evidence["background_done"][stopped] = (stamp, "stopped")
-                                if stopped in background_agents:
-                                    agent_notices.setdefault(stopped, []).append(
+                                # A stop lands on the agent's latest round, else its first lane:
+                                # after a verdict it is activity after that verdict.
+                                lane = latest_rounds.get(stopped) or (
+                                    stopped if stopped in background_agents else None
+                                )
+                                if lane is not None:
+                                    agent_notices.setdefault(lane, []).append(
                                         (stamp, "stopped", None)
                                     )
                                 call = background_calls.pop(stopped, None)
@@ -876,7 +956,17 @@ def transcript_evidence(path, since, skill_since=None):
                                                   status="stopped",
                                                   reason="the review task was stopped")
                             continue
-                        if before_candidate:
+                        if tool_name == "SendMessage":
+                            # A round only counts inside the window, like any other review call.
+                            target = str(payload.get("to") or "")
+                            if call_id and target in review_agents and not before_candidate:
+                                calls[call_id] = {
+                                    "kind": "resume", "agent": target, "started": stamp,
+                                    "foreground": False,
+                                    "label": review_agents[target].get("label", ""),
+                                }
+                            continue
+                        if before_candidate and tool_name not in ("Agent", "Task"):
                             continue
                         if tool_name in cwg.SHELL_TOOLS and call_id:
                             command = str(payload.get("command") or "")
@@ -921,17 +1011,36 @@ def transcript_evidence(path, since, skill_since=None):
                             "foreground": foreground,
                             "started": stamp,
                             "label": str(payload.get("description") or subtype)[:80],
+                            # A reviewer from before the window lends it nothing but its id,
+                            # which a round inside the window may resume.
+                            "prior": before_candidate,
                         }
                         if subtype in SIMPLIFY_REVIEWERS:
                             agent_call["kind"] = "simplify"
                         elif "adversarial-reviewer" in subtype:
                             agent_call["kind"] = "review"
+                        if before_candidate and agent_call["kind"] != "review":
+                            continue
                         calls[call_id] = agent_call
 
                     if block.get("type") != "tool_result":
                         continue
                     call = calls.get(block.get("tool_use_id"))
                     text = result_text(block)
+                    if call is not None and call["kind"] == "resume":
+                        # Only a resumed agent starts a round; a message queued to a lane still
+                        # running is part of that lane's own flight.
+                        if not block.get("is_error") and resumed_agent(text) == call["agent"]:
+                            round_id = block.get("tool_use_id")
+                            resume_rounds[round_id] = call
+                            open_rounds[call["agent"]] = round_id
+                            latest_rounds[call["agent"]] = round_id
+                            evidence["background"][call["agent"]] = {
+                                "started": call["started"], "kind": "agent",
+                                "label": call["label"], "review": True,
+                            }
+                            evidence["background_done"].pop(call["agent"], None)
+                        continue
                     # Background bookkeeping spans the whole transcript: a server started before
                     # the candidate opened is still this session's running work, so the harness's
                     # acknowledgement is read even for a call the scan did not register.
@@ -955,11 +1064,18 @@ def transcript_evidence(path, since, skill_since=None):
                                 "review": bool(call and call["kind"] == "review"),
                             }
                             if call and call["kind"] == "review":
-                                background_agents[launched.group(1)] = call
+                                review_agents[launched.group(1)] = call
+                                if not call.get("prior"):
+                                    background_agents[launched.group(1)] = call
                             continue
                     if call is None:
                         continue
-                    if before_candidate or call["kind"] == "agent" or not call["foreground"]:
+                    if call["kind"] == "review" and call["foreground"]:
+                        trailer = AGENT_TRAILER_RE.search(text)
+                        if trailer:
+                            review_agents[trailer.group(1)] = call
+                    if (before_candidate or call.get("prior") or call["kind"] == "agent"
+                            or not call["foreground"]):
                         continue
                     failed = bool(block.get("is_error"))
                     if call["kind"] == "external":
@@ -1020,7 +1136,7 @@ def transcript_evidence(path, since, skill_since=None):
                     if control[0] in ("ordinary", "closure"):
                         review_note(at=stamp,
                                       engine="native", verdict=control[1])
-        judge_background_agents(evidence, background_agents, agent_notices)
+        judge_background_agents(evidence, dict(background_agents, **resume_rounds), agent_notices)
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
         # record: an approval early in the cycle would otherwise outlive the REVISE that
@@ -1323,32 +1439,56 @@ def anomaly_closure(receipt, state, key):
 
 
 def restored_to_head(entry):
-    """Whether the repository shows nothing lasting changed since the candidate opened.
+    """Whether the repository shows nothing lasting changed since the candidate opened."""
+    return not restoration_blocker(entry)
 
-    True only when the marker remembers the commit and the refs the cycle opened on and names
-    every lasting path it touched, HEAD is that commit again, every ref points where it did (no
-    commit on a side branch, no tag, no stash, no push that moved a remote-tracking ref), the
-    repository ignores case so the lower-cased paths can be checked against its ignore patterns,
-    none of them is gitignored (git could not see a change to it), and `git status` for the
-    whole tree is clean — a tree that was
-    dirty before the candidate opened cannot close this way, which is the conservative side. A
-    lasting path outside the repository is not something git can vouch for. Every git call shares
-    one small budget and any failure keeps the candidate open.
+
+# One answer per marker within a Stop run, which `main` switches on: the preflight and the block
+# text ask the same question, and each asking costs git calls against the hook's own timeout.
+_RESTORATION = {"memo": None}
+
+
+def restoration_blocker(entry):
+    """Why the repository does not show the candidate undone, or "" when it does.
+
+    Nothing is missing only when the marker remembers the commit and the refs the cycle opened
+    on and names every lasting path it touched, HEAD is that commit again, every ref points
+    where it did (no commit on a side branch, no tag, no stash, no push that moved a
+    remote-tracking ref), the repository ignores case so the lower-cased paths can be checked
+    against its ignore patterns, none of them is gitignored (git could not see a change to it),
+    and `git status` for the whole tree is clean — a tree that was dirty before the candidate
+    opened cannot close this way, which is the conservative side. A lasting path outside the
+    repository is not something git can vouch for. Every git call shares one small budget and
+    any failure keeps the candidate open.
     """
+    memo = _RESTORATION["memo"]
+    if memo is None:
+        return find_restoration_blocker(entry)
+    key = json.dumps([entry.get(field) for field in (
+        "identity", "head_at_start", "refs_at_start", "path_overflow", "paths", "last_path",
+    )], sort_keys=True, default=str)
+    if key not in memo:
+        memo[key] = find_restoration_blocker(entry)
+    return memo[key]
+
+
+def find_restoration_blocker(entry):
     import code_work_gate_mark as mark
     root = cwg.identity_root(entry.get("identity")).rstrip("/")
     start, refs = entry.get("head_at_start"), entry.get("refs_at_start")
     if not root or not isinstance(start, str) or not start or not isinstance(refs, str) or not refs:
-        return False
+        return "the marker records no repository, commit and refs the candidate opened on"
     # Past the path cap the marker no longer names every lasting path, so the ignore probe
     # below could not cover them all.
     if entry.get("path_overflow"):
-        return False
+        return "the candidate passed the path cap, so the marker no longer names every lasting path"
     durable = cwg.durable_paths(marker_paths(entry))
-    inside = [path for path in durable if mark.covers(root, path)]
-    if len(inside) != len(durable):
-        return False
+    outside = [path for path in durable if not mark.covers(root, path)]
+    if outside:
+        return "a lasting path lies outside {}, where git cannot vouch for it ({})".format(
+            root, cwg.basename(outside[0]))
     deadline = time.monotonic() + RESTORE_BUDGET
+    silent = "git did not answer inside the hook's budget"
 
     def call(arguments, cap):
         remaining = deadline - time.monotonic()
@@ -1357,43 +1497,60 @@ def restored_to_head(entry):
         return cwg.git_run(root, arguments, timeout=min(cap, remaining))
 
     head = call(["rev-parse", "HEAD"], 1.5)
-    if not head or head[0] != 0 or head[1].strip() != start:
-        return False
+    if not head or head[0] != 0:
+        return silent
+    if head[1].strip() != start:
+        return "HEAD is {}, the candidate opened on {}".format(head[1].strip()[:12], start[:12])
     listing = call(["for-each-ref", "--format=%(refname) %(objectname)"], 1.5)
-    if not listing or listing[0] != 0 or hashlib.sha256(
-        listing[1].encode("utf-8", "replace")
-    ).hexdigest() != refs:
-        return False
-    if inside:
+    if not listing or listing[0] != 0:
+        return silent
+    if hashlib.sha256(listing[1].encode("utf-8", "replace")).hexdigest() != refs:
+        return "a ref moved since the candidate opened (a commit, tag, stash or push)"
+    if durable:
         # The marker's paths are lower-cased; `check-ignore` matches them against the patterns
         # case-insensitively only while the repository ignores case, so any other setting
         # leaves the answer unknown.
         ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
         if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
-            return False
-        ignored = call(["check-ignore", "-q", "--"] + inside, 1.5)
+            return "the repository does not ignore case, so its ignore rules cannot be checked"
+        ignored = call(["check-ignore", "-q", "--"] + durable, 1.5)
         # Exit 0: at least one path is ignored; 1: none; anything else, or a hang: unknown.
-        if not ignored or ignored[0] != 1:
-            return False
+        if not ignored:
+            return silent
+        if ignored[0] != 1:
+            return "a lasting path is gitignored, so git cannot vouch for it"
     status = call(["status", "--porcelain", "--untracked-files=all"], 2.5)
-    return bool(status) and status[0] == 0 and status[1].strip() == ""
+    if not status or status[0] != 0:
+        return silent
+    return "" if status[1].strip() == "" else "the working tree is not clean"
+
+
+def candidate_floor(entry):
+    """The lowest risk this candidate may close at: its recorded paths and every floor seen."""
+    return cwg.max_risk(minimum_risk(marker_paths(entry)), entry.get("minimum_risk_seen"))
 
 
 def receipt_preflight(receipt, entry):
-    """Reject malformed, misclassified, or path-risk-downgraded receipts before scanning."""
+    """Reject malformed, misclassified, or path-risk-downgraded receipts before scanning.
+
+    An operational candidate may also close as `verified`: a lasting change the snapshots cannot
+    see — prose written through the shell into an unwatched file — is still one, and its receipt
+    is judged at the risk it declares (report c07fc211). That is no cheaper than `no-change`.
+    """
     if receipt is None:
         return False, "terminal receipt is missing or malformed"
     kind, _, risk = receipt
     if candidate_class(entry) == cwg.WORK_OPERATIONAL:
-        if kind not in OPERATIONAL_RECEIPTS:
+        if kind not in OPERATIONAL_RECEIPTS and kind != "verified":
             return False, (
-                "this candidate changed no lasting artifact and ends with "
-                "[gate] operational: <pre-execution check>; <verified effect> "
-                "or [gate] no-change: <reason>"
+                "this candidate changed no lasting artifact the gate could see and ends with "
+                "[gate] operational: <pre-execution check>; <verified effect>, "
+                "[gate] no-change: <reason>, or, for a lasting change made where the gate "
+                "cannot see it, [gate] verified: <risk>; <candidate and checks>"
             )
         return True, "preflight"
     if kind in OPERATIONAL_RECEIPTS:
-        if restored_to_head(entry):
+        if not restoration_blocker(entry):
             # A rebase probe aborted, an edit undone: the repository is back on the commit
             # the candidate opened on and clean, so nothing lasting changed after all.
             return True, "preflight"
@@ -1401,10 +1558,7 @@ def receipt_preflight(receipt, entry):
             "{} cannot close a candidate that changed a lasting artifact (the repository "
             "still differs from the commit the candidate opened on)".format(kind)
         )
-    required_risk = cwg.max_risk(
-        minimum_risk(marker_paths(entry)),
-        entry.get("minimum_risk_seen"),
-    )
+    required_risk = candidate_floor(entry)
     effective_risk = risk or "HIGH"
     if RISK_ORDER[effective_risk] < RISK_ORDER[required_risk]:
         return False, "declared risk {} is below path-based minimum {}".format(
@@ -1439,6 +1593,82 @@ def content_at(entry, stamp):
     return current if isinstance(current, str) else None
 
 
+def covered_contents(entry, stamp):
+    """The contents a verdict stated at this moment covers: what the candidate held then, and each
+    content a clean upstream merge made of a covered one afterwards (report f9920b99).
+
+    The marker writes such a mark (`merge`) only when every byte the command changed is what
+    `git merge-tree` computed from the HEAD before it and an upstream commit, which is the clean
+    merge a verdict needs nothing for.
+    """
+    then = content_at(entry, stamp)
+    covered = {then} if then else set()
+    for mark in entry.get("content_marks") or []:
+        if (
+            isinstance(mark, dict)
+            and cwg.valid_ts(mark.get("ts"))
+            and float(mark["ts"]) > stamp
+            and mark.get("merge") in covered
+            and isinstance(mark.get("fp"), str)
+        ):
+            covered.add(mark["fp"])
+    return covered
+
+
+UNMEASURED_REASON = "unmeasured-change"
+# Seconds of the Stop hook's ten the catch-up measurement may spend before it gives up for this stop.
+CATCH_UP_BUDGET = 3.0
+
+
+def unmeasured_change(entry, now):
+    """`(marker brought up to date, the mark it added or None)`, or None when nothing is known.
+
+    A marker hook cancelled at its timeout records nothing, so an edit made then left no mark: the
+    last approval still read as current, and the delta round the session honestly ran after the fix
+    read as review continued after a terminal APPROVED (report 8db8b3d2). The marker keeps the size
+    and modification time of its lasting paths and when they last matched (`content_stats_at`, the
+    last measurement or stop that found them unchanged). When they differ now and the content does
+    too, a mark is added and the freshness anchor moves to it, so a verdict from before the change is
+    stale and one from after it covers. It goes at the latest modification time among the changed
+    files when every one of them was modified after the stats last matched; a file that is gone, or
+    one whose time claims a moment the stats still matched (a copy that kept its source's time),
+    puts it at the moment noticed. What stays open: a kept time that falls between the last match
+    and a verdict, a lasting file outside `content_paths`, and a change undone before any stop.
+    Past the path cap the marker no longer holds the domain it measured, so nothing is compared.
+    """
+    stored = entry.get("content_stats")
+    paths = entry.get("content_paths") or []
+    marks = [item for item in entry.get("content_marks") or []
+             if isinstance(item, dict) and cwg.valid_ts(item.get("ts"))]
+    if not isinstance(stored, dict) or not marks:
+        return None
+    import code_work_gate_mark as mark
+    if len(paths) >= mark.MARKER_PATH_CAP:
+        return None
+    current = mark.content_stats(paths)
+    if current == stored:
+        return dict(entry, content_stats_at=now), None
+    fingerprint = mark.content_fingerprint(paths, deadline=time.monotonic() + CATCH_UP_BUDGET)
+    if fingerprint is None:
+        # Nothing provable now; the next stop asks again.
+        return None
+    updated = dict(entry, content_stats=current, content_stats_at=now)
+    if fingerprint == marks[-1].get("fp"):
+        # Touched, not changed.
+        return updated, None
+    matched = entry.get("content_stats_at")
+    matched = float(matched) if cwg.valid_ts(matched) else float(marks[-1]["ts"])
+    moved = [path for path in current if current[path] != stored.get(path)]
+    times = [current[path][1] / 1e9 for path in moved if current[path]]
+    trusted = bool(times) and len(times) == len(moved) and min(times) > matched
+    anchor = min(max(max(times) if trusted else now, float(marks[-1]["ts"]) + 0.001), now)
+    updated["content_marks"] = mark.content_marks_after(
+        entry.get("content_marks"), anchor, fingerprint, cause={"reason": UNMEASURED_REASON}
+    )
+    updated["last_durable_ts"] = max(float(entry.get("last_durable_ts") or 0.0), anchor)
+    return updated, updated["content_marks"][-1]
+
+
 def content_covers(entry, stamp, durable_ts):
     """Whether evidence stated at this moment still describes the candidate on disk.
 
@@ -1462,7 +1692,7 @@ def content_covers(entry, stamp, durable_ts):
     if not marks:
         return False
     now_fp = content_at(entry, float("inf"))
-    if now_fp is None or content_at(entry, stamp) != now_fp:
+    if now_fp is None or now_fp not in covered_contents(entry, stamp):
         return False
     return not any(
         float(mark["ts"]) > stamp and unknown_mark(mark) for mark in marks
@@ -1486,6 +1716,34 @@ def active_review_start(evidence, stale):
         if verdict == "APPROVED" and stale(stamp):
             start = max(start, stamp)
     return start
+
+
+def simplify_missing(risk, state):
+    """The simplify lanes this risk still needs a current foreground result from."""
+    if risk == "HIGH":
+        return [lens for lens in SIMPLIFY_LENSES if state.get(lens) != "current"]
+    if risk == "STANDARD":
+        covered = state.get(SIMPLIFY_LANE) == "current" or all(
+            state.get(lens) == "current" for lens in SIMPLIFY_LENSES
+        )
+        return [] if covered else [SIMPLIFY_LANE]
+    return []
+
+
+def simplify_block(risk, missing, state):
+    lenses = ", ".join(SIMPLIFY_LENSES)
+    needed = (
+        "one result from each of {}".format(lenses) if risk == "HIGH"
+        else "one {} result or the complete trio ({})".format(SIMPLIFY_LANE, lenses)
+    )
+    failed = [lane for lane in missing if state.get(lane) in ("failed", "exhausted")]
+    return (
+        "simplify lenses have no foreground result: a {} candidate needs {} for this candidate "
+        "(missing: {}){}"
+    ).format(
+        risk, needed, ", ".join(missing),
+        " (last attempt failed: {})".format(", ".join(failed)) if failed else "",
+    )
 
 
 def evaluate_receipt(receipt, entry, evidence):
@@ -1559,21 +1817,14 @@ def evaluate_receipt(receipt, entry, evidence):
     if "READY" in closure_verdicts[:-1]:
         return False, "closure validation continued after terminal READY"
 
-    effective_risk = risk or "HIGH"
+    # A closure receipt states no risk; the candidate's own floor decides which lanes it owes.
+    effective_risk = risk or candidate_floor(entry)
 
-    # Simplify evidence is one foreground lane result for this candidate, required for HIGH
-    # only. STANDARD work decides for itself: the mandatory trio on three-file STANDARD
-    # candidates bought three lanes plus forced single-lens re-runs for a polish pass the
-    # parent could run locally. Keying the pass on a preceding Skill call, and counting only
-    # lane results that followed it, enforced an order rather than the work; the lane results
-    # themselves are the evidence, in whatever order they ran. The per-lane pass cap is checked
-    # for every lane regardless of risk, so a ritual repeat is caught even where no pass was
-    # required.
-    requires_simplify = effective_risk == "HIGH"
-    simplify_unavailable = False
-    current_lane = False
-    exhausted_lane = False
-    attempted = False
+    # Keying the pass on a preceding Skill call enforced an order rather than the work; the lane
+    # results themselves are the evidence, in whatever order they ran. The per-lane pass cap is
+    # checked for every lane regardless of risk, so a ritual repeat is caught even where no pass
+    # was required.
+    simplify_state = {}
     for reviewer in sorted(SIMPLIFY_REVIEWERS):
         # Both lists are already candidate-bound by transcript_evidence.
         successes = evidence["simplify_successes"].get(reviewer, [])
@@ -1582,23 +1833,24 @@ def evaluate_receipt(receipt, entry, evidence):
             return False, "simplify exceeded the absolute {}-pass cap for {}".format(
                 MAX_SIMPLIFY_PASSES, reviewer
             )
-        if successes or failures:
-            attempted = True
         latest_success = max(successes, default=0.0)
         if latest_success and latest_success > (failures[-1] if failures else 0.0):
-            current_lane = True
+            simplify_state[reviewer] = "current"
             continue
         retries = [stamp for stamp in failures if stamp > latest_success]
         if len(retries) >= 2 and retries[-1] >= durable_ts:
-            exhausted_lane = True
-    if requires_simplify and not current_lane:
-        if kind == "draft-blocked" and exhausted_lane:
+            simplify_state[reviewer] = "exhausted"
+        elif retries:
+            simplify_state[reviewer] = "failed"
+    missing_simplify = simplify_missing(effective_risk, simplify_state)
+    simplify_unavailable = False
+    if missing_simplify:
+        if kind == "draft-blocked" and any(
+            simplify_state.get(lane) == "exhausted" for lane in missing_simplify
+        ):
             simplify_unavailable = True
         else:
-            return False, (
-                "simplify lenses have no foreground result: a HIGH candidate needs one {} "
-                "result for this candidate{}"
-            ).format(SIMPLIFY_LANE, " (the last attempt failed)" if attempted else "")
+            return False, simplify_block(effective_risk, missing_simplify, simplify_state)
 
     ordinary_ts, ordinary_verdict = latest(ordinary_reviews)
     closure_ts, closure_verdict = latest(closure_reviews)
@@ -1716,15 +1968,31 @@ def evaluate_receipt(receipt, entry, evidence):
 
 
 def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
+    """Retire the candidate, then the block state, then sweep: the order a cancelled hook survives.
+
+    The harness kills a hook at its timeout wherever it is. Resetting the block count first and
+    retiring the marker last left, for a hook killed in between, an open candidate with no block
+    on record, and the next stop refused the very anomaly receipt this one had accepted (report
+    267de208, a Stop hook cancelled at 11 s under load). Killed before the marker moves, nothing
+    has changed and the same receipt closes it next time; killed after, the candidate is closed,
+    and a block state left behind only counts against a candidate that no longer exists.
+    """
     now = time.time()
+    current = cwg.read_json(marker)
+    if current is None or current.get("last_ts") == candidate_ts:
+        retired = cwg.remove(marker) or cwg.write_json(marker, dict(current or {}, closed=True))
+    else:
+        current["first_ts"] = current.get("last_ts") or now
+        retired = cwg.write_json(marker, current)
+    if not retired:
+        return False
     state.update({
         "candidate_ts": candidate_ts,
         "blocks": 0,
         "closed_at": now,
         "receipt": "{}: {}".format(receipt[0], receipt[1]),
     })
-    if not cwg.write_json(state_file, state):
-        return False
+    cwg.write_json(state_file, state)
 
     # The attribution registry outlives no candidate: what this session announced is only ever
     # read by a command running at the same time, and the cycle it belonged to is over. The
@@ -1739,41 +2007,138 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     except Exception:
         # Only the import is forgiven, and every way it can fail: the marker is edited in this
         # very repository, so a half-written file raises SyntaxError rather than ImportError,
-        # and letting that escape would abandon the close after the block budget was already
-        # reset - the candidate would never retire and the three-block cap would stop biting.
-        # The sweep itself stays outside: a fault in it is a defect and must surface.
+        # and letting that escape would report a close that already happened as a hook failure,
+        # with no `close` line in the ledger. The sweep itself stays outside: a fault in it is a
+        # defect and must surface.
         mark = None
     if mark is not None:
         mark.forget_stale_captures(session_key_)
+    return True
 
-    current = cwg.read_json(marker)
-    if current is None or current.get("last_ts") == candidate_ts:
-        if cwg.remove(marker):
-            return True
-        current = dict(current or {}, closed=True)
-    else:
-        current["first_ts"] = current.get("last_ts") or now
-    return cwg.write_json(marker, current)
+
+HIGH_STALE_REASON = "HIGH candidate lacks a current APPROVED verdict"
+ROUND_REASONS = (
+    "an invoked review has no terminal APPROVED verdict",
+    "ordinary review exceeded",
+    "ordinary review continued after terminal",
+    "review activity continued after terminal",
+    "ESCALATE requires exactly",
+)
+DETAIL_LIMIT = 600
+
+
+def block_detail(reason, entry, evidence):
+    """What a block rests on, in terms the session can check against its own transcript.
+
+    The ledger held all of it before, and sessions filed anomaly reports for want of it: when
+    the evidence starts counting and which open candidate that moment replaced, what stands
+    between an approval and now, which rounds were read, and what keeps a repository from
+    reading as restored (reports a269a6fc, 4b840373, 0e4aedc8, 32a3582f).
+    """
+    import code_work_gate_mark as mark
+    notes = []
+    if reason == HIGH_STALE_REASON or reason.startswith(ROUND_REASONS + ("simplify",)):
+        first_ts = entry.get("first_ts")
+        if cwg.valid_ts(first_ts):
+            note = "evidence for this candidate counts from {}".format(mark.clock(first_ts))
+            displaced = entry.get("displaced")
+            if isinstance(displaced, dict) and cwg.valid_ts(displaced.get("opened")):
+                note += (
+                    ", when it replaced the candidate open since {} ({}); lane results from "
+                    "before belong to that one"
+                ).format(mark.clock(displaced["opened"]), mark.displacement_cause(displaced))
+            notes.append(note)
+    if reason == HIGH_STALE_REASON:
+        notes.append(approval_barriers(entry, evidence, mark.clock))
+    elif reason.startswith(ROUND_REASONS):
+        notes.append(rounds_read(evidence, mark.clock))
+    elif "cannot close a candidate that changed a lasting artifact" in reason:
+        notes.append(restoration_blocker(entry))
+    detail = "; ".join(note for note in notes if note)
+    return detail if len(detail) <= DETAIL_LIMIT else detail[:DETAIL_LIMIT - 1] + "…"
+
+
+def approval_barriers(entry, evidence, clock):
+    """What stands between the last APPROVED and the candidate as it is now."""
+    approvals = [stamp for stamp, verdict in evidence.get("ordinary_reviews") or []
+                 if verdict == "APPROVED"]
+    if not approvals:
+        return "no APPROVED verdict was read for this candidate"
+    approved = max(approvals)
+    marks = [mark for mark in entry.get("content_marks") or []
+             if isinstance(mark, dict) and cwg.valid_ts(mark.get("ts")) and float(mark["ts"]) > approved]
+    notes = [describe_mark(mark, clock) for mark in marks if unknown_mark(mark)]
+    covered = covered_contents(entry, approved)
+    if not covered:
+        notes.append("no measurement of the lasting content comes before it")
+    elif content_at(entry, float("inf")) not in covered:
+        changed = [mark for mark in marks if not unknown_mark(mark) and mark.get("fp") not in covered]
+        unmeasured = changed and (changed[-1].get("cause") or {}).get("reason") == UNMEASURED_REASON
+        notes.append("the lasting content differs from what it approved{}".format(
+            " (changed at {}{})".format(
+                clock(changed[-1]["ts"]),
+                ", a change no marker hook measured: one was cancelled or timed out" if unmeasured else "",
+            ) if changed else ""))
+    if not notes:
+        notes.append("the last lasting change is at {}".format(clock(entry.get("last_durable_ts"))))
+    shown = "; ".join(notes[:3]) + ("; and {} more".format(len(notes) - 3) if len(notes) > 3 else "")
+    return "the last APPROVED is filed at {} (for a background lane, its launch), and after it: {}".format(
+        clock(approved), shown)
+
+
+def describe_mark(mark, clock):
+    """One barrier as the marker recorded it."""
+    cause = mark.get("cause") if isinstance(mark.get("cause"), dict) else {}
+    text = "{} {}".format(clock(mark["ts"]), cause.get("reason") or "a change nobody could attribute")
+    if cause.get("command"):
+        text += " `{}`".format(cause["command"])
+    elif cause.get("tool"):
+        text += " ({})".format(cause["tool"])
+    if cause.get("landed"):
+        text += " that ended in {}, which no snapshot covered".format(cause["landed"])
+    if cause.get("skipped"):
+        text += ", with {} repositories left unmeasured by the hook's time budget".format(cause["skipped"])
+    if cause.get("no_snapshot"):
+        text += ", with no snapshot from before it (its PreToolUse hook was cancelled or failed)"
+    return text
+
+
+def rounds_read(evidence, clock):
+    """The ordinary rounds the scan read, and the review results it could not use."""
+    rounds = sorted(evidence.get("ordinary_reviews") or [])
+    text = ("ordinary rounds read: " + ", ".join(
+        "{} {}".format(clock(stamp), verdict) for stamp, verdict in rounds[-6:])
+    ) if rounds else "no ordinary round was read"
+    unusable = sorted(stamp for stamp, kind, _ in evidence.get("review_events") or []
+                      if kind not in ("ordinary", "closure"))
+    if unusable:
+        text += "; review results without a usable verdict at " + ", ".join(
+            clock(stamp) for stamp in unusable[-4:])
+    return text
 
 
 def reminder(reason, block_number, operational, session_id="", repeated=False, transcript="",
-             nonce=""):
+             nonce="", detail=""):
     if operational:
         contract = (
-            "This candidate changed no lasting artifact: it ran commands or a throwaway "
-            "script. Invoke development-verification and end with "
+            "This candidate changed no lasting artifact the gate could see: it ran commands or a "
+            "throwaway script. Invoke development-verification and end with "
             "`[gate] operational: <what was established before executing>; <verified effect "
             "on the system>`, or, when nothing was modified at all, with "
-            "`[gate] no-change: <reason>`, which needs no effect half. No simplify pass and no "
-            "adversarial review are required for operational work."
+            "`[gate] no-change: <reason>`, which needs no effect half. A lasting change made "
+            "where the gate cannot see it, such as prose written through the shell, closes as "
+            "`[gate] verified: <risk>; <candidate and checks>` with what that risk requires. No "
+            "simplify pass and no adversarial review are required for operational work."
         )
     else:
         contract = (
             "Satisfy the observable evidence contract. development-verification must have been "
-            "invoked once in this session, plus honest candidate-bound checks. A HIGH "
-            "candidate also needs one foreground simplify-reviewer result for this candidate — "
-            "the lane result is the evidence, in whatever order it ran, so do not re-run a "
-            "completed pass to satisfy this; two failed attempts end draft-blocked. HIGH "
+            "invoked once in this session, plus honest candidate-bound checks. Simplify evidence "
+            "is a foreground lane result for this candidate: a STANDARD candidate needs one "
+            "{lane} result, a HIGH candidate one result from each of the three lenses "
+            "({lenses}), launched together. The lane results are the evidence, in whatever order "
+            "they ran, so do not re-run a completed pass to satisfy this; two failed attempts of "
+            "a required lane end draft-blocked. HIGH "
             "completion requires one adversarial APPROVED result newer than the final edit to a "
             "lasting artifact, from the Codex lane (/adversarial-review, launched in the "
             "background; run `codex_lane.py check` first and skip straight to the native lane "
@@ -1781,10 +2146,10 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "the foreground or launched in the background and judged at its notification). "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
-        )
+        ).format(lane=SIMPLIFY_LANE, lenses=", ".join(SIMPLIFY_LENSES))
     inbox = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate_inbox.py")
     return (
-        "[Code Work Gate] Cannot finalize this candidate: {reason}.\n{contract}\n"
+        "[Code Work Gate] Cannot finalize this candidate: {reason}.\n{detail}{contract}\n"
         "A turn may end while this session's own background task (a review, a test run, a "
         "server) is still running: the completion notification resumes the work, so wait for "
         "it instead of polling. "
@@ -1797,6 +2162,7 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
         "and end with `[gate] anomaly-reported: <id>; <fact>`, which closes this candidate "
         "UNVERIFIED with the report attached (development-verification section 10)."
     ).format(reason=reason, contract=contract, n=block_number, cap=MAX_BLOCKS_PER_CANDIDATE,
+             detail="What the hook read: {}.\n".format(detail) if detail else "",
              repeat=" Same reason as the previous block." if repeated else "",
              inbox=inbox, sid=session_id or "<session id>", nonce=nonce or "<nonce>",
              transcript=' --transcript \"{}\"'.format(transcript) if transcript else "")
@@ -1831,6 +2197,7 @@ def main():
     try:
         key = cwg.session_key(data.get("session_id"))
         _SESSION["key"] = key
+        _RESTORATION["memo"] = {}
         marker = cwg.marker_path(key)
         state_file = cwg.state_path(key)
         if not os.path.exists(marker):
@@ -1841,6 +2208,19 @@ def main():
         if entry.get("closed"):
             allow()
             return
+        caught_up = unmeasured_change(entry, time.time())
+        if caught_up is not None:
+            updated, added = caught_up
+            if added is not None:
+                cwg.log_event("durable", session=key, reason=UNMEASURED_REASON, fp=added["fp"][:12],
+                              at=added["ts"])
+            # Written back only when no marker hook wrote in between, since the measurement took
+            # seconds: overwriting its record would lose an edit; skipping means the next stop asks
+            # again.
+            latest = cwg.read_json(marker) or {}
+            if all(latest.get(field) == entry.get(field) for field in ("last_ts", "edits", "content_marks")):
+                cwg.write_json(marker, updated)
+            entry = updated
         candidate_ts = entry.get("last_ts")
         first_ts = float(entry.get("first_ts") or candidate_ts or 0.0)
         state = cwg.read_json(state_file) or {}
@@ -1913,14 +2293,20 @@ def main():
         if not cwg.write_json(state_file, state):
             allow("Code Work Gate state is unavailable and enforcement is failing open.")
             return
+        try:
+            detail = block_detail(reason, entry, evidence)
+        except Exception:
+            # The explanation must never cost the block itself.
+            detail = ""
         cwg.log_event("block", session=key, reason=reason, block=blocks + 1,
-                      candidate_class=candidate_class(entry))
+                      candidate_class=candidate_class(entry), **({"detail": detail} if detail else {}))
         emit({
             "decision": "block",
             "reason": reminder(
                 reason, blocks + 1, candidate_class(entry) == cwg.WORK_OPERATIONAL,
                 session_id=str(data.get("session_id") or ""), repeated=repeated,
                 transcript=str(data.get("transcript_path") or ""), nonce=state["block_nonce"],
+                detail=detail,
             ),
         })
     except Exception as error:

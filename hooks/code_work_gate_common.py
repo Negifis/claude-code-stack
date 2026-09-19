@@ -57,19 +57,26 @@ AGENT_EXECUTABLE_PATH_RE = re.compile(
     r"(^|/)(\.claude|\.codex|\.agents)/settings[^/]*\.json$",
     re.IGNORECASE,
 )
-# Throwaway artifacts: a session scratchpad, a loose file dropped straight into a temp root, and
-# the agent's own bookkeeping. They are written to be executed once and abandoned, so no future
-# run reads them and reviewing them for reuse, naming or hot-path cost polishes something nobody
-# will open again. They never open a gate cycle on their own; the risk of the work that produced
+# Throwaway artifacts: a session scratchpad, a loose file dropped straight into a temp root, the
+# harness's own scratch tree, and the agent's own bookkeeping. They are written to be executed
+# once and abandoned, so no future run reads them and reviewing them for reuse, naming or
+# hot-path cost polishes something nobody will open again. They never open a gate cycle on their own; the risk of the work that produced
 # them lives in executing them, which the shell mark records as an operational candidate.
 #
 # A temp root alone is deliberately not enough: real working clones live in directories like
 # C:/tmp/<project>, and treating those as throwaway would silently drop the gate on ordinary
-# source work. Only a scratchpad segment or a file sitting directly in the temp root qualifies.
+# source work. Only a scratchpad segment, a file directly in the temp root, or the harness's own
+# scratch tree qualifies.
+# A temp directory at the root of a drive, where agents keep throwaway helpers next to real clones.
+DRIVE_TEMP_ROOT = r"(?:^(?:[a-z]:)?/(?:tmp|temp)/|^/var/tmp/)"
 TEMP_ROOT = (
-    r"(?:^(?:[a-z]:)?/(?:tmp|temp)/|^/var/tmp/|"
+    r"(?:" + DRIVE_TEMP_ROOT + r"|"
     r"(?:^|/)(?:users|home)/[^/]+/appdata/local/temp/)"
 )
+# The harness's scratch tree, session scratchpad a level down. Nothing snapshots a temp tree, so
+# a helper graded lasting here makes every write-capable command a barrier (report 7bad3973).
+# Exactly `claude`: the mirror at C:/tmp/claude-code-stack is source and stays gated.
+AGENT_SCRATCH = TEMP_ROOT + r"claude/"
 # The agent's own bookkeeping, scoped to the home configuration. A repository that commits
 # .claude/plans or .claude/state is publishing files people read later, so those stay gated.
 #
@@ -87,6 +94,7 @@ HOME_BOOKKEEPING = (
 EPHEMERAL_PATH_RE = re.compile(
     TEMP_ROOT + r"[^/]+$|"
     + TEMP_ROOT + r"(?:[^/]+/)*scratchpad(?:/|$)|"
+    + AGENT_SCRATCH + r"|"
     + HOME_BOOKKEEPING,
     re.IGNORECASE,
 )
@@ -245,22 +253,22 @@ def packet_capture_path(session_key_, tool_use_id):
     return os.path.join(tempfile.gettempdir(), "cwg_packet_{}_{}.json".format(session_key_, tool_use_id))
 
 
-def git_run(cwd, arguments, timeout):
+def git_run(cwd, arguments, timeout, stdin=None):
     """(exit code, stdout) of `git -C cwd …`, or None when git could not be run — a hang too."""
     import subprocess
     try:
         proc = subprocess.run(
             ["git", "-C", cwd] + list(arguments), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, check=False,
+            encoding="utf-8", errors="replace", timeout=timeout, check=False, input=stdin,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.returncode, proc.stdout
 
 
-def git_text(cwd, arguments, timeout):
+def git_text(cwd, arguments, timeout, stdin=None):
     """`git -C cwd …` stdout as text, or None on any failure."""
-    result = git_run(cwd, arguments, timeout)
+    result = git_run(cwd, arguments, timeout, stdin)
     return result[1] if result and result[0] == 0 else None
 
 
@@ -306,13 +314,23 @@ def log_event(kind, **fields):
         pass
 
 
+# The Stop hook requires these lanes and every reminder names them: one spelling for all of it.
+SIMPLIFY_LANE = "simplify-reviewer"
+SIMPLIFY_LENSES = (
+    "simplify-reuse-reviewer",
+    "simplify-quality-reviewer",
+    "simplify-efficiency-reviewer",
+)
+
+
 def receipt_requirements(floor):
     """The evidence a persistent candidate at this floor must carry, in one clause."""
     return {
         "LOW": "the relevant deterministic check",
-        "STANDARD": "affected checks",
-        "HIGH": "affected checks, one foreground simplify-reviewer result and one adversarial "
-                "APPROVED newer than the last edit to a lasting artifact",
+        "STANDARD": "affected checks and one foreground {} result".format(SIMPLIFY_LANE),
+        "HIGH": "affected checks, a foreground result from each simplify lens ({}) and one "
+                "adversarial APPROVED newer than the last edit to a lasting artifact".format(
+                    ", ".join(SIMPLIFY_LENSES)),
     }.get(floor, "affected checks")
 
 

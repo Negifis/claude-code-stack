@@ -61,44 +61,31 @@ Typical invocations:
 
 ## Codex model / effort routing
 
-These govern the flags passed to **Codex**, not Claude's own model. Prefer relying on the
-existing Codex config defaults in `~/.codex/config.toml` — do NOT pass `--model`/`--effort`
-unless there is a specific reason to override. Current global default there: `gpt-5.6-sol`
-at `medium`, with `plan_mode_reasoning_effort = "high"`. Native multi-agent is on
-(`[features] multi_agent`, `[agents] max_threads = 6`, `max_depth = 1`); profiles `deep`
-(Sol/high) and `max` (Sol/max) are the escalation presets.
+These settings govern the Codex child, not the Claude parent or its provider. The source of
+truth is the active `~/.codex/config.toml`, its `*.config.toml` profiles and native role files
+under `~/.codex/agents/`. Read the relevant settings instead of maintaining another model
+catalog in this reference.
 
-GPT-5.6 is a three-tier family — pick the weakest tier that fits, a stronger one only for
-judgment, not by habit:
+The user selects Astra for all native Codex work. The root baseline is `gpt-6-astra` with
+`medium` effort. Discovery and deterministic checks use configured `explorer`/`test_runner`
+roles at `low`, bounded implementation uses `implementer` at `medium`, and independent review
+uses `reviewer`/`adversarial-reviewer` at `high`. Higher effort is justified by a concrete
+unresolved question after collecting evidence; return to the sufficient lower effort afterward.
+Do not silently fall back to another model when Astra is unavailable.
 
-- `gpt-5.6-sol` — architecture, ambiguous or high-risk changes, security, final review.
-  Effort `medium`/`high`, rarely `xhigh`/`max`. (`gpt-5.6` with no suffix aliases this.)
-- `gpt-5.6-terra` — the everyday worker: normal implementation, repo exploration, moderate
-  refactors, docs. Effort `low`/`medium`.
-- `gpt-5.6-luna` — repeatable/mechanical work: test runs, extraction, classification,
-  formatting, bulk passes. Effort `none`/`low`, occasionally `medium`.
-- `gpt-5.4-mini` — cheaper fallback for throwaway secondary passes when even Luna is overkill.
+Use the companion's supported `--effort high` for an independent review and its baseline for
+ordinary implementation. Verify the installed parser before using another level. The installed
+codex-plugin-cc 1.0.6 accepts flags only through `xhigh`; do not claim its flag reaches `max`
+or `ultra`. Native Codex 0.154.0 supports `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
+Its existing `deep` profile selects high and `max` selects max; the `low` profile selects low.
+Do not use `none` or `minimal` for Astra, enable Fast mode, or change billing automatically.
 
-Codex's own native subagents (defined in `~/.codex/agents/`, routed by `~/.codex/AGENTS.md`)
-already encode this split: `explorer` = Terra/low/read-only, `implementer` = Terra/medium/
-write, `test_runner` = Luna/low, `reviewer` = Sol/high/read-only. When you delegate a broad
-build to Codex, the parent Sol session fans these out — you don't address them directly.
-
-Effort ladder, lowest to highest: `none | minimal | low | medium | high | xhigh | max |
-ultra` (Codex CLI >= 0.143; older CLIs stop at `xhigh` and refuse a config that sets
-`max`/`ultra`). The official Config Reference still lists only `…xhigh`, so keep portable
-role files at `xhigh` or below. `max` gives one model more time on one task; `ultra` turns
-the turn into a multi-agent workflow and costs far more tokens because each sub-agent reasons
-independently. Neither is the default.
-
-Reach for `ultra` only when the task splits into 2–3 genuinely independent lanes — a
-security+tests+maintainability review, several unrelated services, code+docs+logs research,
-comparing architectures, a bulk audit, a migration with separate schema/app/rollback agents.
-Not for a one-method edit, a local bug with a clear repro, a rename, formatting, or anything
-where every agent would touch the same files. Rule of thumb: read in parallel, write in
-sequence; the parent coordinates rather than repeating its children. The bundled
-`codex-plugin-cc` also caps its own `--effort` at `xhigh`, so `/codex:*` can't reach
-`max`/`ultra` by flag regardless — that needs the config default.
+For native invocations, `codex --profile <name>` layers the matching
+`$CODEX_HOME/<name>.config.toml`. A `-c model_reasoning_effort=<level>` override applies to that
+invocation. A running task keeps its own settings until changed through a supported task or
+turn interface; editing a file alone does not prove adoption. Explicit child role settings
+prevent accidental inheritance of a costly parent mode. Check runtime metadata, not model
+self-identification, when proving the applied route.
 
 ## Codex task template
 
@@ -118,8 +105,37 @@ Give Codex a self-contained task:
     - ...
     Validation:
     - commands to run
+    Authorization:
+    - what the task may do without asking, and the one point where it must stop
     Expected output:
     - diff summary, files changed, commands run + results, remaining risks / skipped checks
+
+## Prompting GPT-6 Astra
+
+Source: OpenAI's model guidance for GPT-6 Astra,
+https://developers.openai.com/api/docs/guides/latest-model. Five behaviours differ from Sol, and
+each has a prompt answer:
+
+- **It stops to ask more often.** Where more input could change the result it asks instead of
+  assuming, and in a non-interactive `codex exec` run that ends the turn without the result.
+  State the authorization in the task: a change is carried to completion, with the authorized
+  work done first so that approval is only ever needed for the final external step; a review is
+  read-only, fully authorized, and ends with its verdict.
+- **It follows files more closely.** Skills and `AGENTS.md` weigh more, and unclear or
+  conflicting guidance in them can pause it early. `~/.codex/AGENTS.md` states that the task
+  outranks skill guidance and that a pause is reported with the file and the quoted instruction;
+  keep that file free of contradictions and audit it first when Codex behaves unexpectedly.
+- **It formats heavily.** Lists, tables and Markdown by default. Ask for plain paragraphs where
+  prose is wanted, and give the exact output contract where structure is wanted.
+- **It delegates less.** Say when subagents are expected; a review lane says never.
+- **It tests broadly.** Name the checks a change needs; a reversible, low-impact change gets no
+  tests that mirror its implementation.
+
+Parameters: model `gpt-6-astra`; effort `low` to `max` (plus `ultra` in Codex), never `none` —
+keep a lane's current effort when moving it to Astra and raise it only on a measured failure;
+the model's default verbosity is `low` (the user config sets `medium`); the migration guide
+removes `temperature`, `top_p` and `top_logprobs` from requests. The installed stable Codex 0.154.0 catalog confirms Astra support; verify the actual executable used by the wrapper. The plugin's bundled `gpt-5-4-prompting`
+skill predates Astra; for Codex tasks this section wins where they differ.
 
 ## When neither engine can run
 

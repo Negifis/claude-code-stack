@@ -46,9 +46,8 @@ def normalize_path(text: str) -> str:
 def template_script_paths(target: Path) -> set[str]:
     """Full paths of the hook scripts this stack registers — the identity a merge replaces.
 
-    Read from the template, where every token is still unquoted, rather than from a rendered
-    command: a config directory whose name contains a space renders as a quoted path, and
-    re-splitting that on whitespace would tear one script into fragments that match nothing.
+    Read from the template's argument vectors, where each placeholder is one whole argument, so a
+    config directory whose name contains a space still yields one path per script.
 
     Full paths, not basenames: a user who runs their own `code_work_gate_stop.py` out of some
     other directory keeps it, because only a command naming the copy inside this target's
@@ -59,22 +58,29 @@ def template_script_paths(target: Path) -> set[str]:
     for groups in settings.get("hooks", {}).values():
         for group in groups:
             for hook in group.get("hooks", []):
-                for token in shlex.split(hook.get("command", ""), posix=True):
+                for token in hook.get("args", []):
                     if "__CLAUDE_DIR__" in token:
                         found.add(normalize_path(token.replace("__CLAUDE_DIR__", target.as_posix())))
     return found
 
 
-def command_arguments(command: str) -> set[str]:
-    """The arguments of one live hook command, normalized for comparison.
+def hook_arguments(hook: dict) -> set[str]:
+    """The arguments of one live hook, normalized for comparison.
 
-    Split with the grammar of the shell that will run it, so a Windows path keeps its
-    backslashes instead of having them eaten as escapes.
+    An exec-form hook lists them in `args`. Anything else — a shell-form entry from an earlier
+    install of this stack or written by hand, or an `args` that is not a list — has its command
+    split with the grammar of the shell that runs it, so a Windows path keeps its backslashes
+    instead of having them eaten as escapes.
     """
-    try:
-        tokens = shlex.split(command, posix=not WINDOWS)
-    except ValueError:
-        tokens = command.split()
+    command = str(hook.get("command", ""))
+    args = hook.get("args")
+    if isinstance(args, list):
+        tokens = [command, *map(str, args)]
+    else:
+        try:
+            tokens = shlex.split(command, posix=not WINDOWS)
+        except ValueError:
+            tokens = command.split()
     return {normalize_path(token.strip('"')) for token in tokens}
 
 
@@ -176,38 +182,20 @@ def copy_tree(src: Path, dst: Path, root: Path, backup: Path, dry: bool) -> tupl
     return new, replaced
 
 
-# cmd.exe treats all of these as syntax, and every one of them is legal in a Windows filename.
-CMD_SPECIAL = set(" \t&()[]{}^=;+,`~<>|'")
-# Quoting does not neutralize these: %NAME% expands inside double quotes, !NAME! expands too
-# wherever delayed expansion is enabled, and a literal quote cannot be represented at all.
-CMD_REJECT = {'"': "a quote", "%": "a % that cmd.exe would expand",
-              "!": "a ! that delayed expansion would eat"}
+def resolve_hook(hook: dict, target: Path, python: str) -> dict:
+    """Resolve one template hook against this machine.
 
-
-def shell_quote(argument: str) -> str:
-    """Quote one argument for the shell Claude Code launches hook commands through."""
-    if not WINDOWS:
-        return shlex.quote(argument)
-    for character, why in CMD_REJECT.items():
-        if character in argument:
-            raise InstallError(f"this path carries {why}, which cmd.exe cannot be made to "
-                               f"take literally: {argument}")
-    return f'"{argument}"' if any(c in argument for c in CMD_SPECIAL) else argument
-
-
-def resolve_command(command: str, target: Path, python: str) -> str:
-    """Rebuild one template command against this machine, quoting every argument itself.
-
-    The template is parsed as JSON before this runs, so the placeholders arrive as plain text
-    and each one becomes exactly one argument. Substituting into the raw JSON instead would
-    make a path containing a quote or a backslash produce a file that no longer parses, and a
-    path containing shell syntax would be interpreted rather than used.
+    The template registers every hook in exec form: Claude Code starts `command` with `args` as
+    its argument vector and no shell in between, so a timeout ends the hook itself rather than a
+    shell that leaves the hook's process behind on Windows. Each placeholder becomes exactly one
+    argument and nothing is quoted — a path with spaces, `&`, `%` or `!` stays one literal
+    argument. The template is parsed as JSON before this runs, so substitution never touches the
+    raw text either.
     """
-    return " ".join(
-        shell_quote(token.replace("__CLAUDE_DIR__", target.as_posix()))
-        if token != "__PYTHON__" else shell_quote(python)
-        for token in shlex.split(command, posix=True)
-    )
+    def resolve(token: str) -> str:
+        return python if token == "__PYTHON__" else token.replace("__CLAUDE_DIR__", target.as_posix())
+
+    return {**hook, "command": resolve(hook["command"]), "args": [resolve(arg) for arg in hook["args"]]}
 
 
 def resolve_settings(target: Path, python: str) -> dict:
@@ -219,13 +207,12 @@ def resolve_settings(target: Path, python: str) -> dict:
         for group in groups:
             kept = []
             for hook in group.get("hooks", []):
-                command = hook.get("command", "")
                 # The plugin updater is a PowerShell script; nothing else in the payload is
                 # platform-bound, and a POSIX box has no powershell.exe to run it with. The
                 # worktree audit runs under node, which every platform can supply.
-                if ".ps1" in command and not WINDOWS:
+                if any(arg.endswith(".ps1") for arg in hook["args"]) and not WINDOWS:
                     continue
-                kept.append({**hook, "command": resolve_command(command, target, python)})
+                kept.append(resolve_hook(hook, target, python))
             if kept:
                 kept_groups.append({**{k: v for k, v in group.items() if k != "hooks"}, "hooks": kept})
         if kept_groups:
@@ -278,7 +265,7 @@ def merge_settings(live: dict, stack: dict, owned_paths: set[str]) -> dict:
                 hook for hook in group.get("hooks", [])
                 # Exact argument equality, not a substring: `…/stop.py.disabled` contains an
                 # owned path but runs a different file, and is somebody else's business.
-                if not command_arguments(hook.get("command", "")) & owned_paths
+                if not hook_arguments(hook) & owned_paths
             ]
             if survivors:
                 kept.append({**{k: v for k, v in group.items() if k != "hooks"}, "hooks": survivors})
@@ -301,7 +288,6 @@ def main() -> int:
     target = (args.target or claude_dir()).expanduser().resolve()
     dry = args.dry_run
 
-    # Resolve before touching anything: an unquotable path should fail with nothing installed.
     stack = resolve_settings(target, args.python)
     preflight(target)
 

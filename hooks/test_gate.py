@@ -2,6 +2,7 @@
 import atexit
 import datetime
 import glob
+import hashlib
 import html
 import io
 import json
@@ -228,8 +229,8 @@ def write_transcript(events):
     return path
 
 
-SIMPLIFY_LENSES = [gate.SIMPLIFY_LANE]
-LEGACY_LENSES = sorted(gate.SIMPLIFY_REVIEWERS - {gate.SIMPLIFY_LANE})
+SIMPLIFY_LENSES = list(gate.SIMPLIFY_LENSES)
+SIMPLIFY_LANE_ONLY = [gate.SIMPLIFY_LANE]
 PROMPT_HOOK = os.path.join(HERE, "code_work_gate_prompt.py")
 import codex_lane  # noqa: E402
 
@@ -418,7 +419,9 @@ finally:
 sid = session()
 try:
     seed(sid, ["C:/repo/src/app.py"])
-    transcript = write_transcript(base_events())
+    events = base_events()
+    simplify_wave(events, 122, "standard-lane", SIMPLIFY_LANE_ONLY)
+    transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
@@ -480,23 +483,30 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
-sid = session()
-try:
-    seed(sid, [cwg.SHELL_MUTATION_PATH])
-    transcript = write_transcript(base_events())
-    result = run(STOP_HOOK, {
-        "session_id": sid,
-        "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: STANDARD; command checked",
-    })
-    check("operational candidate rejects a code receipt", result.get("decision") == "block", result)
-    check(
-        "operational candidate names its own contract",
-        "changed no lasting artifact" in result.get("reason", ""),
-        result,
-    )
-finally:
-    cleanup(sid, locals().get("transcript"))
+# An operational candidate may close as `verified` at the risk it declares: prose written
+# through the shell is a lasting change the snapshots do not see (report c07fc211).
+for label, receipt, expect_ok, expect_reason in (
+    ("an operational candidate closes as verified LOW with the protocol read",
+     "[gate] verified: LOW; README rewritten through the shell and proofread", True, ""),
+    ("verified STANDARD on an operational candidate still owes its simplify lane",
+     "[gate] verified: STANDARD; command checked", False, "simplify lenses have no foreground result"),
+    ("a closure receipt on an operational candidate names its own contract",
+     "[gate] pr-ready: branch x", False, "changed no lasting artifact the gate could see"),
+):
+    sid = session()
+    try:
+        seed(sid, [cwg.SHELL_MUTATION_PATH])
+        transcript = write_transcript(base_events())
+        result = run(STOP_HOOK, {
+            "session_id": sid,
+            "transcript_path": transcript,
+            "last_assistant_message": receipt,
+        })
+        ok = result.get("continue") is True and "decision" not in result
+        check(label, ok if expect_ok else (result.get("decision") == "block"
+                                          and expect_reason in result.get("reason", "")), result)
+    finally:
+        cleanup(sid, locals().get("transcript"))
 
 sid = session()
 try:
@@ -621,13 +631,20 @@ try:
         and "cannot close a candidate that changed a lasting artifact" in result.get("reason", ""),
         result,
     )
+    check(
+        "the refusal says what keeps the repository from reading as restored",
+        "What the hook read: the marker records no repository" in result.get("reason", ""),
+        result,
+    )
 finally:
     cleanup(sid, locals().get("transcript"))
 
 sid = session()
 try:
     seed(sid, ["C:/repo/.claude/rules/operations.md"])
-    transcript = write_transcript(base_events())
+    events = base_events()
+    simplify_wave(events, 122, "prose-lane", SIMPLIFY_LANE_ONLY)
+    transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
@@ -651,8 +668,8 @@ try:
         "last_assistant_message": "[gate] verified: STANDARD; targeted tests passed",
     })
     check(
-        "three-file standard passes without a simplify lane",
-        result.get("continue") is True and "decision" not in result,
+        "three-file standard without a simplify lane is blocked",
+        result.get("decision") == "block" and gate.SIMPLIFY_LANE in result.get("reason", ""),
         result,
     )
 finally:
@@ -679,9 +696,10 @@ try:
 finally:
     cleanup(sid, locals().get("transcript"))
 
-for paths, receipt, label in (
-    (["C:/repo/tests/app.test.py"], "[gate] verified: LOW; checks passed", "low"),
-    (["C:/repo/src/app.py"], "[gate] verified: STANDARD; checks passed", "small standard"),
+for paths, receipt, label, lanes in (
+    (["C:/repo/tests/app.test.py"], "[gate] verified: LOW; checks passed", "low", []),
+    (["C:/repo/src/app.py"], "[gate] verified: STANDARD; checks passed", "small standard",
+     SIMPLIFY_LANE_ONLY),
 ):
     sid = session()
     try:
@@ -692,6 +710,7 @@ for paths, receipt, label in (
             skill_use(122, "simplify", "optional-simplify-2"),
             skill_use(123, "simplify", "optional-simplify-3"),
         ])
+        simplify_wave(events, 124, "required-lane", lanes)
         transcript = write_transcript(events)
         result = run(STOP_HOOK, {
             "session_id": sid,
@@ -731,7 +750,7 @@ sid = session()
 try:
     seed(sid, ["C:/repo/src/auth/session.ts"])
     events = base_events(include_simplify=True)
-    events.append(agent_use(132, gate.SIMPLIFY_LANE, "lane-fail"))
+    events.append(agent_use(132, "simplify-quality-reviewer", "lane-fail"))
     events.append(tool_result(132.5, "lane-fail", "unavailable", is_error=True))
     add_review(events, 134, "review-after-lane-fail", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
@@ -807,7 +826,7 @@ try:
     events.append(tool_result(
         129.5, "late-third-lens", "Third lens result."
     ))
-    add_review(events, 131, "review-legacy-trio", "No blockers.\nVERDICT: APPROVED")
+    add_review(events, 131, "review-trio-across-waves", "No blockers.\nVERDICT: APPROVED")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
@@ -815,7 +834,7 @@ try:
         "last_assistant_message": "[gate] verified: HIGH; checks and review passed",
     })
     check(
-        "legacy lenses spread across waves still complete a HIGH pass",
+        "lenses spread across waves still complete a HIGH pass",
         result.get("continue") is True and "decision" not in result,
         result,
     )
@@ -887,11 +906,11 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"])
     events = [skill_use(120, "development-verification", "skill-dev")]
     events.append(skill_use(121, "simplify", "skill-simplify"))
-    events.append(agent_use(125, gate.SIMPLIFY_LANE, "simplify-lane-fail-1"))
+    events.append(agent_use(125, "simplify-quality-reviewer", "simplify-lane-fail-1"))
     events.append(tool_result(
         125.5, "simplify-lane-fail-1", "unavailable", is_error=True
     ))
-    events.append(agent_use(127, gate.SIMPLIFY_LANE, "simplify-lane-fail-2"))
+    events.append(agent_use(127, "simplify-quality-reviewer", "simplify-lane-fail-2"))
     events.append(tool_result(
         127.5, "simplify-lane-fail-2", "still unavailable", is_error=True
     ))
@@ -908,7 +927,7 @@ finally:
 sid = session()
 try:
     seed(sid, ["C:/repo/src/app.py"])
-    events = base_events()
+    events = base_events(include_simplify=True)
     add_review(events, 130, "optional-review", "HIGH-1 open.\nVERDICT: REVISE")
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
@@ -931,7 +950,7 @@ try:
         "transcript_path": transcript,
         "last_assistant_message": "[gate] verified: HIGH; auth tests and review passed",
     })
-    check("high with one simplify lane and current approval passes", result.get("continue") is True and "decision" not in result, result)
+    check("high with the three simplify lenses and current approval passes", result.get("continue") is True and "decision" not in result, result)
 finally:
     cleanup(sid, locals().get("transcript"))
 
@@ -948,26 +967,98 @@ try:
     })
     check("high without a simplify lane is blocked", result.get("decision") == "block", result)
     check(
-        "the missing lane is named",
-        "no foreground result" in result.get("reason", "") and gate.SIMPLIFY_LANE in result.get("reason", ""),
+        "every missing lens is named",
+        "no foreground result" in result.get("reason", "")
+        and all(lens in result.get("reason", "") for lens in gate.SIMPLIFY_LENSES),
         result,
     )
 finally:
     cleanup(sid, locals().get("transcript"))
 
+
+# --- simplify by risk: HIGH needs each of the three lenses, STANDARD one lane or the whole trio
+def simplify_by_risk(paths, risk, subtypes):
+    sid = session()
+    try:
+        seed(sid, paths)
+        events = [skill_use(120, "development-verification", "skill-dev")]
+        simplify_wave(events, 122, "by-risk", subtypes)
+        if risk == "HIGH":
+            add_review(events, 130, "review-by-risk", "No blockers.\nVERDICT: APPROVED")
+        transcript = write_transcript(events)
+        return run(STOP_HOOK, {
+            "session_id": sid,
+            "transcript_path": transcript,
+            "last_assistant_message": "[gate] verified: {}; checks passed".format(risk),
+        })
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+
+HIGH_PATHS = ["C:/repo/src/auth/session.ts"]
+STANDARD_PATHS = ["C:/repo/src/app.py"]
+result = simplify_by_risk(HIGH_PATHS, "HIGH", SIMPLIFY_LANE_ONLY)
+check("a lone simplify-reviewer does not satisfy a HIGH candidate",
+      result.get("decision") == "block"
+      and all(lens in result.get("reason", "") for lens in gate.SIMPLIFY_LENSES), result)
+result = simplify_by_risk(HIGH_PATHS, "HIGH", SIMPLIFY_LENSES[:2])
+missing = result.get("reason", "").partition("(missing: ")[2].partition(")")[0]
+check("a HIGH candidate missing one lens is blocked with exactly that lens named",
+      result.get("decision") == "block" and missing == SIMPLIFY_LENSES[2], result)
+result = simplify_by_risk(STANDARD_PATHS, "STANDARD", [])
+check("a STANDARD candidate without a simplify lane is blocked with simplify-reviewer named",
+      result.get("decision") == "block" and gate.SIMPLIFY_LANE in result.get("reason", ""), result)
+result = simplify_by_risk(STANDARD_PATHS, "STANDARD", SIMPLIFY_LANE_ONLY)
+check("one simplify-reviewer satisfies a STANDARD candidate",
+      result.get("continue") is True and "decision" not in result, result)
+result = simplify_by_risk(STANDARD_PATHS, "STANDARD", SIMPLIFY_LENSES)
+check("the complete trio satisfies a STANDARD candidate",
+      result.get("continue") is True and "decision" not in result, result)
+result = simplify_by_risk(STANDARD_PATHS, "STANDARD", SIMPLIFY_LENSES[:2])
+check("two lenses do not stand in for the STANDARD lane",
+      result.get("decision") == "block" and gate.SIMPLIFY_LANE in result.get("reason", ""), result)
+check("the receipt requirements name the simplify lanes per risk",
+      gate.SIMPLIFY_LANE in cwg.receipt_requirements("STANDARD")
+      and all(lens in cwg.receipt_requirements("HIGH") for lens in gate.SIMPLIFY_LENSES)
+      and "simplify" not in cwg.receipt_requirements("LOW"),
+      [cwg.receipt_requirements(level) for level in ("LOW", "STANDARD", "HIGH")])
+
+# A closure receipt states no risk: it owes the simplify lanes of the candidate's own floor, and
+# only an exhausted lane the candidate still needs unlocks draft-blocked.
 sid = session()
 try:
-    seed(sid, ["C:/repo/src/auth/session.ts"])
-    events = [skill_use(120, "development-verification", "skill-dev")]
-    simplify_wave(events, 122, "legacy", LEGACY_LENSES)
-    add_review(events, 130, "review-legacy", "No blockers.\nVERDICT: APPROVED")
+    seed(sid, STANDARD_PATHS)
+    events = base_events()
+    simplify_wave(events, 122, "closure-lane", SIMPLIFY_LANE_ONLY)
+    add_review(events, 130, "closure-review-down", "model unavailable", is_error=True)
     transcript = write_transcript(events)
     result = run(STOP_HOOK, {
         "session_id": sid,
         "transcript_path": transcript,
-        "last_assistant_message": "[gate] verified: HIGH; auth tests and review passed",
+        "last_assistant_message": "[gate] draft-blocked: reviewer unavailable after bounded retry",
     })
-    check("the legacy trio still satisfies a HIGH candidate", result.get("continue") is True and "decision" not in result, result)
+    check("a STANDARD candidate closing draft-blocked owes one simplify lane, not the trio",
+          result.get("continue") is True and "decision" not in result, result)
+finally:
+    cleanup(sid, locals().get("transcript"))
+
+sid = session()
+try:
+    seed(sid, HIGH_PATHS)
+    events = base_events()
+    for index, stamp in enumerate((125, 127)):
+        call_id = "spent-lane-{}".format(index)
+        events.append(agent_use(stamp, gate.SIMPLIFY_LANE, call_id))
+        events.append(tool_result(stamp + 0.5, call_id, "unavailable", is_error=True))
+    transcript = write_transcript(events)
+    result = run(STOP_HOOK, {
+        "session_id": sid,
+        "transcript_path": transcript,
+        "last_assistant_message": "[gate] draft-blocked: simplify unavailable",
+    })
+    check("an exhausted lane the candidate does not need never unlocks draft-blocked",
+          result.get("decision") == "block"
+          and all(lens in result.get("reason", "") for lens in gate.SIMPLIFY_LENSES), result)
 finally:
     cleanup(sid, locals().get("transcript"))
 
@@ -1348,6 +1439,26 @@ check("a trailing slash on the working directory does not lose the ground",
       marker_hook.on_home_ground("C:/tmp/worktree/src/a.py", "C:/tmp/worktree/", [], {"tool_input": {"command": "python x.py"}}) is True, "trailing slash")
 check("on_home_ground survives malformed input",
       marker_hook.on_home_ground(changed, "", [None], {}) is False and marker_hook.on_home_ground(changed, None, [], {"tool_input": None}) is False, "malformed")
+CHIP_TREE_CWD = os.path.join(CLAUDE_CONFIG_DIR, "state", "chips", "trees", "chip-tree")
+for label, cwd, command, expect in (
+    ("a chip worktree does not put the rest of its home on the ground", CHIP_TREE_CWD,
+     'cd "{}" && python "{}" finish'.format(
+         CHIP_TREE_CWD, os.path.join(CLAUDE_CONFIG_DIR, "hooks", "chip_handoff.py")), False),
+    ("a command in the hooks directory still names its home", "C:/tmp/worktree",
+     'cd "{}" && python x.py'.format(os.path.join(CLAUDE_CONFIG_DIR, "hooks")), True),
+    ("a checkout's own .claude directory is no reference to the home", "C:/tmp/worktree",
+     'cd "C:/repo/.claude/worktrees/wt" && grep -n "a\\|b" f | head -20', False),
+    ("a remote call names no home", "C:/tmp/worktree", "curl -sS https://example.org | head -c 300", False),
+    ("a write aimed at a bookkeeping script still names its home", "C:/tmp/worktree",
+     "sed -i 's/a/b/' ~/.claude/hooks/codex_lane.py", True),
+    ("a copy onto a bookkeeping script by its full path still names its home", "C:/tmp/worktree",
+     'cp lane.py "{}"'.format(os.path.join(CLAUDE_CONFIG_DIR, "hooks", "gate_inbox.py")), True),
+    ("running a bookkeeping script from elsewhere names no home", "C:/tmp/worktree",
+     'python "{}" ack 1234abcd'.format(os.path.join(CLAUDE_CONFIG_DIR, "hooks", "gate_inbox.py")), False),
+    ("a home followed by a comma is still named", "C:/tmp/worktree", "rg x --dirs ~/.claude,~/.codex", True),
+):
+    got = marker_hook.on_home_ground(changed, cwd, [cwd], {"tool_input": {"command": command}})
+    check("on_home_ground: " + label, got is expect, command)
 
 # --- another session's change under the shared configuration home is not this command's floor
 for label, command, expect_high in (
@@ -1358,6 +1469,7 @@ for label, command, expect_high in (
 ):
     with tempfile.TemporaryDirectory(prefix="cwg_ground_") as tree:
         sid = session()
+        other = cwg.session_key(session())
         try:
             subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
             with open(os.path.join(tree, "README.md"), "w", encoding="utf-8") as stream:
@@ -1369,7 +1481,6 @@ for label, command, expect_high in (
             run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
             # Another session has a command in flight under the configuration home, and a
             # file appears there while this command runs: nobody can say whose it is.
-            other = cwg.session_key(session())
             cwg.publish_claims(other, shell_start_ts=time.time() - 1, cwd=os.path.join(CLAUDE_CONFIG_DIR, "hooks"))
             foreign = os.path.join(CLAUDE_CONFIG_DIR, "hooks", "foreign_" + uuid.uuid4().hex[:6] + ".py")
             os.makedirs(os.path.dirname(foreign), exist_ok=True)
@@ -1389,8 +1500,46 @@ for label, command, expect_high in (
                 check("an unattributed event writes a flagged mark instead of failing the hook open",
                       bool(recorded) and recorded[-1].get("unknown") is True, recorded)
             os.remove(foreign)
-            cwg.retire_claims(other)
         finally:
+            # A window opened by hand for a session that never runs again must not outlive the
+            # scenario: `retire_claims` keeps an open one, and the next scenario's change under the
+            # same tree then read as another session's work.
+            cwg.remove(cwg.claim_path(other))
+            cleanup(sid)
+
+# --- a write another session makes under the home from a shell elsewhere is not this command's
+# path: nothing marks it ambiguous, so it used to land in the delta outright (reports 27cd9fe8,
+# ae5983b0, 8ae90973)
+for label, command, name, expect_recorded in (
+    ("a command that neither runs in nor names the home is not handed another session's write",
+     "for M in 477 478; do glab api projects/1/merge_requests/$M; done", None, False),
+    ("a command that names the home still answers for the change",
+     "python ~/.claude/hooks/patch.py && ls", None, True),
+    ("a shell write to a bookkeeping script is recorded like any other hook edit",
+     "sed -i 's/a/b/' ~/.claude/hooks/codex_lane.py", "codex_lane.py", True),
+):
+    with tempfile.TemporaryDirectory(prefix="cwg_elsewhere_") as tree:
+        sid = session()
+        other = cwg.session_key(session())
+        try:
+            subprocess.run(["git", "-C", tree, "init", "-q"], check=False, capture_output=True)
+            marker, _ = gate_paths(sid)
+            payload = {"session_id": sid, "tool_name": "Bash", "tool_use_id": "elsewhere-" + uuid.uuid4().hex[:6],
+                       "cwd": tree, "tool_input": {"command": command}}
+            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+            cwg.publish_claims(other, shell_start_ts=time.time() - 1, cwd=tempfile.gettempdir())
+            foreign = os.path.join(CLAUDE_CONFIG_DIR, "hooks", name or "foreign_" + uuid.uuid4().hex[:6] + ".py")
+            os.makedirs(os.path.dirname(foreign), exist_ok=True)
+            with open(foreign, "w", encoding="utf-8") as stream:
+                stream.write("# written while the command ran" + chr(10))
+            time.sleep(0.05)
+            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+            data = cwg.read_json(marker) or {}
+            recorded = cwg.normalize_path(foreign) in (data.get("paths") or [])
+            check(label, recorded is expect_recorded and not data.get("unattributed_durable"), data)
+            os.remove(foreign)
+        finally:
+            cwg.remove(cwg.claim_path(other))
             cleanup(sid)
 
 # --- how a launch is read: any spelling of codex, one exec segment, no conditional execution
@@ -1410,6 +1559,91 @@ for command, fed, tail in (
     launch = marker_hook.codex_launch(command)
     check("codex_launch reads {!r}".format(command[:48]),
           launch["fed"] is fed and launch["path"].replace(chr(92), "/").endswith(tail) and (bool(launch["path"]) == bool(tail)), launch)
+
+# The launch the /adversarial-review command prescribes: one command written over several lines.
+# Splitting on the continued newline left the redirect in a segment of its own, so nothing was
+# captured and the verdict bound nothing (report 2b62e2fb).
+CONTINUED_LAUNCH = (
+    'cd "C:/repo" && REVIEW_ID=r9 ; timeout 3600 codex exec --ignore-user-config \\' + chr(10)
+    + "  --disable plugins --disable hooks \\" + chr(10)
+    + "  -m gpt-6-astra -c model_reasoning_effort=high \\" + chr(10)
+    + "  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW"
+)
+launch = marker_hook.codex_launch(CONTINUED_LAUNCH)
+check("a launch written over continued lines still names its packet",
+      launch["fed"] is True
+      and launch["path"].replace(chr(92), "/") == "C:/tmp/codex-packet-r9.md", launch)
+check("the redirect stays in the segment that runs codex",
+      any("codex exec" in segment and "codex-packet" in segment
+          for segment in marker_hook.shell_segments(CONTINUED_LAUNCH)),
+      marker_hook.shell_segments(CONTINUED_LAUNCH))
+check("a token split across a continuation stays one token",
+      marker_hook.join_continuations("--flag=abc\\" + chr(10) + "def") == "--flag=abcdef")
+check("a bare newline still separates two commands",
+      len(marker_hook.shell_segments("git status" + chr(10) + "git log")) == 2,
+      marker_hook.shell_segments("git status" + chr(10) + "git log"))
+check("a backslash that ends nothing is left alone",
+      marker_hook.shell_segments(r"grep -e 'a\b' file") == [r"grep -e 'a\b' file"])
+# Only an odd run of backslashes escapes the newline; an even one is escaped backslashes before a
+# real separator, and joining there hid the writer on the next line.
+for tail, joined in ((chr(92), True), (chr(92) * 2, False), (chr(92) * 3, True)):
+    command = "echo a" + tail + chr(10) + "git commit -am x"
+    check("a run of {} backslashes before the newline {} continues the line".format(
+        len(tail), "" if joined else "never"),
+        (len(marker_hook.shell_segments(command)) == 1) is joined, command)
+    # Joined, bash runs one `echo` and nothing writes; separated, the `git commit` on the next
+    # line does — and grading that read-only is what let a write pass without expiring a verdict.
+    check("a writer after {} backslashes is graded write-capable: {}".format(
+        len(tail), not joined),
+        marker_hook.write_capable({"tool_name": "Bash", "tool_input": {"command": command}})
+        is (not joined), command)
+check("a continuation ending in CRLF is joined too",
+      marker_hook.join_continuations("a" + chr(92) + chr(13) + chr(10) + "b") == "ab")
+# PowerShell continues on a backtick; a trailing backslash there is the end of a path, and
+# joining on it swallowed the next statement whole.
+PS_PATH_THEN_WRITE = "Get-ChildItem C:" + chr(92) + "hooks" + chr(92) + chr(10) + "git commit -am x"
+check("a PowerShell path ending in a backslash does not swallow the next statement",
+      len(marker_hook.shell_segments(PS_PATH_THEN_WRITE, shell="PowerShell")) == 2,
+      marker_hook.shell_segments(PS_PATH_THEN_WRITE, shell="PowerShell"))
+check("that PowerShell command is still write-capable",
+      marker_hook.write_capable(
+          {"tool_name": "PowerShell", "tool_input": {"command": PS_PATH_THEN_WRITE}}) is True)
+check("a PowerShell backtick continuation is one command",
+      len(marker_hook.shell_segments("Get-Content a.txt `" + chr(10) + "  -Raw",
+                                     shell="PowerShell")) == 1)
+# Same splitter, second consumer: the continuation segments (`--disable`, `-m`) are no command at
+# all, so a read-only pipeline written over several lines used to grade write-capable.
+CONTINUED_READ = ("grep -n pattern \\" + chr(10) + "  src/app.py | \\" + chr(10) + "  head -5")
+check("a read-only pipeline survives being written over several lines",
+      marker_hook.read_only_pipeline(CONTINUED_READ) is True, CONTINUED_READ)
+check("a write on a continued line is still a write",
+      marker_hook.read_only_pipeline("grep -n x src/app.py \\" + chr(10) + "  ; rm -rf build") is False)
+# The scrub of a harmless `2>&1` has to happen after the join, or half of it reads as a redirect
+# into a file and the whole pipeline grades write-capable.
+check("a merged stderr broken across a continuation is still harmless",
+      marker_hook.read_only_pipeline("grep -n x src/app.py 2>\\" + chr(10) + "&1 | head -5") is True)
+
+# Neither shell continues a comment: the marker belongs to the comment, so the newline still
+# separates, and the command on the next line is a command.
+for shell, marker in (("Bash", chr(92)), ("PowerShell", "`")):
+    commented = "cat f # note " + marker + chr(10) + "git commit -am x"
+    check("a {} continuation inside a comment does not swallow the next line".format(shell),
+          len(marker_hook.shell_segments(commented, shell=shell)) == 2,
+          marker_hook.shell_segments(commented, shell=shell))
+    check("that {} command is still write-capable".format(shell),
+          marker_hook.write_capable(
+              {"tool_name": shell, "tool_input": {"command": commented}}) is True, commented)
+check("a marker on the last line, after the trailing tag, is no continuation to undo",
+      marker_hook.codex_launch(CONTINUED_LAUNCH)["path"].replace(chr(92), "/")
+      == "C:/tmp/codex-packet-r9.md")
+# The `||` and the assignment must be read on the joined text, or a launch that may be skipped
+# binds a capture and a split assignment resolves to nothing.
+check("a || split across a continuation still hides the launch",
+      marker_hook.codex_launch("true |\\" + chr(10) + "| codex exec - < p.md")["path"] == "")
+check("an assignment split across a continuation still resolves",
+      marker_hook.codex_launch(
+          "REVIEW_ID=\\" + chr(10) + "r9; codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md"
+      )["path"].replace(chr(92), "/") == "C:/tmp/codex-packet-r9.md")
 
 # --- the fingerprint: records that cannot imitate one another, existence by presence, the index included
 with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
@@ -2169,13 +2403,14 @@ try:
     now = time.time()
     seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
     events = [skill_use(now - 890, "development-verification", "skill-dev")]
-    events.append(entry(now - 880, "assistant", [{
-        "type": "tool_use", "id": "simp-note", "name": "Agent",
-        "input": {"subagent_type": "simplify-reviewer", "run_in_background": False,
-                  "description": "simplify"},
-    }]))
-    events.append(tool_result(now - 870, "simp-note",
-                              "Checked the task-notification parsing and the <task-notification> handling: no findings."))
+    for index, lens in enumerate(gate.SIMPLIFY_LENSES):
+        events.append(entry(now - 880 + index, "assistant", [{
+            "type": "tool_use", "id": "simp-note-{}".format(index), "name": "Agent",
+            "input": {"subagent_type": lens, "run_in_background": False,
+                      "description": "simplify"},
+        }]))
+        events.append(tool_result(now - 870 + index, "simp-note-{}".format(index),
+                                  "Checked the task-notification parsing and the <task-notification> handling: no findings."))
     events.append(entry(now - 700, "assistant", [{
         "type": "tool_use", "id": "rev-note", "name": "Agent",
         "input": {"subagent_type": "adversarial-reviewer", "run_in_background": False,
@@ -2577,6 +2812,47 @@ for command, expected in (
     check("write-capable (PowerShell): {!r} -> {}".format(command[:50], expected),
           marker_hook.write_capable({"tool_name": "PowerShell", "tool_input": {"command": command}}) is expected,
           command)
+# --- a discarded stream or a quoted separator does not make a read a write (report 5ed394cc)
+for command, expected in (
+    ("cd t && echo x && git merge-tree --write-tree a b >/dev/null 2>&1", False),
+    ("echo x > notes.txt", True),
+    ("cat a.txt >> b.txt", True),
+    ("echo x | tee f.txt", True),
+    ("sed -n 1p a.txt; grep -i x a.txt", False),
+    ("sed -i s/a/b/ a.txt", True),
+    ("echo x | sudo tee f.txt", True),
+    ("cat a.txt | xargs tee b.txt", True),
+    ("find . -name '*.tmp' -print0 | xargs -0 rm", True),
+    ("grep tee notes.txt", False),
+    ("echo x > nul.txt", True),
+    ("echo x | sudo -u root tee f.txt", True),
+    ("command -v rm", False),
+    ("cat x &> f.txt", True),
+    ("echo x >/dev/null.bak", True),
+    ("Write-Output x; echo y >$null", False),
+    ('echo "a; rm -rf x" > /dev/null', False),
+):
+    check("shell_write: {!r} -> {}".format(command[:48], expected),
+          marker_hook.shell_write({"tool_name": "Bash", "tool_input": {"command": command}}) is expected,
+          command)
+QUOTED_ALTERNATION = 'grep -i "chip_handoff\\|chip-handoff" f'
+check("a separator inside quotes is part of the argument",
+      marker_hook.shell_segments(QUOTED_ALTERNATION) == [QUOTED_ALTERNATION],
+      marker_hook.shell_segments(QUOTED_ALTERNATION))
+check("a quoted alternation in a read stays a read",
+      marker_hook.read_only_pipeline('grep -i "a\\|b" f | head -5') is True)
+check("a separator outside the quotes still splits",
+      len(marker_hook.shell_segments('echo "a;b" && rm x')) == 2,
+      marker_hook.shell_segments('echo "a;b" && rm x'))
+check("quotes that do not balance split the plain way",
+      len(marker_hook.shell_segments("echo it's; rm x")) == 2,
+      marker_hook.shell_segments("echo it's; rm x"))
+check("an ampersand inside a redirect is no separator",
+      marker_hook.shell_segments("cat x &> f.txt") == ["cat x &> f.txt"]
+      and len(marker_hook.shell_segments("make 2>&1 | tee build.log")) == 2,
+      (marker_hook.shell_segments("cat x &> f.txt"), marker_hook.shell_segments("make 2>&1 | tee build.log")))
+check("a discarded stdout is no write",
+      marker_hook.read_only_pipeline("git log --oneline -1 >/dev/null") is True)
 check("the ledger keeps only the executable of a command",
       marker_hook.command_label('cd "C:/repo" && python deploy.py --token=SECRET') == "cd"
       and marker_hook.command_label("TOKEN=abc curl -H 'x: y' https://h") == "curl",
@@ -2713,6 +2989,16 @@ try:
     check("a review that quotes the CLI phrases is not an outage", codex_lane.outage_from_text(quoted, now=now) is None, quoted)
     found = codex_lane.outage_from_text("ERROR: Selected model is at capacity. Please try a different model.", now=now)
     check("capacity is a bounded outage", found is not None and abs(found[0] - (now.timestamp() + codex_lane.DEFAULT_OUTAGE)) < 1, found)
+    refusal = ('ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":'
+               '"The \'gpt-6-astra\' model requires a newer version of Codex. Please upgrade to the latest '
+               'app or CLI and try again."}}')
+    found = codex_lane.outage_from_text(refusal, now=now)
+    check("a model newer than the CLI is an outage that names the upgrade",
+          found is not None and "upgrade" in found[1]
+          and abs(found[0] - (now.timestamp() + codex_lane.DEFAULT_LIMIT_OUTAGE)) < 1, found)
+    quoted_refusal = "codex\nThe model requires a newer version of Codex.\nVERDICT: APPROVED"
+    check("a review quoting that refusal is not an outage",
+          codex_lane.outage_from_text(quoted_refusal, now=now) is None, quoted_refusal)
     check(
         "a recorded outage makes the lane unavailable",
         codex_lane.record_outage("ERROR: Selected model is at capacity. Please try a different model.") is True
@@ -3112,7 +3398,7 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"])
     events = base_events(include_simplify=True)
     add_codex_review(events, 128, "codex-cli",
-                     "Get-Content -Raw C:\\tmp\\packet.md | codex exec --json -m gpt-5.6-sol - "
+                     "Get-Content -Raw C:\\tmp\\packet.md | codex exec --json -m gpt-6-astra - "
                      "# CODE_WORK_GATE_REVIEW",
                      review_text("APPROVED"), tool="PowerShell")
     transcript = write_transcript(events)
@@ -4239,36 +4525,38 @@ with tempfile.TemporaryDirectory(prefix="cwg_git_snapshot_") as repo:
         finally:
             cleanup(sid)
 
+    # A lasting path outside every repository is measured on its own now, so a clean command keeps
+    # the anchor; one past the measured bound is still something no snapshot vouches for.
     with tempfile.TemporaryDirectory(prefix="cwg_cross_root_") as elsewhere:
-        sid = session()
-        try:
-            marker, _ = gate_paths(sid)
-            durable = os.path.join(elsewhere, "hooks", "gate.py")
-            run(MARK_HOOK, {
-                "session_id": sid,
-                "hook_event_name": "PostToolUse",
-                "tool_name": "Write",
-                "cwd": repo,
-                "tool_input": {"file_path": durable},
-            })
-            approved_at = (cwg.read_json(marker) or {}).get("last_durable_ts")
-            payload = {
-                "session_id": sid,
-                "tool_use_id": "clean-snapshot-elsewhere",
-                "tool_name": "Bash",
-                "cwd": repo,
-                "tool_input": {"command": "python -c write_outside_repo"},
-            }
-            run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
-            run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
-            data = cwg.read_json(marker) or {}
-            check(
-                "a clean snapshot cannot vouch for durable paths outside its repository",
-                cwg.valid_ts(approved_at) and data.get("last_durable_ts", 0) > approved_at,
-                data,
-            )
-        finally:
-            cleanup(sid)
+        for count, expires in ((1, False), (marker_hook.MAX_LOOSE_FILES + 1, True)):
+            sid = session()
+            try:
+                marker, _ = gate_paths(sid)
+                durable = [os.path.join(elsewhere, "hooks", "gate{}.py".format(index)) for index in range(count)]
+                approved_at = time.time() - 60
+                check("seed a candidate with {} loose lasting path(s)".format(count), cwg.write_json(marker, {
+                    "first_ts": approved_at - 60, "last_ts": approved_at, "last_durable_ts": approved_at,
+                    "last_path": durable[-1], "edits": count,
+                    "paths": [cwg.normalize_path(path) for path in durable],
+                }))
+                payload = {
+                    "session_id": sid,
+                    "tool_use_id": "clean-snapshot-elsewhere-{}".format(count),
+                    "tool_name": "Bash",
+                    "cwd": repo,
+                    "tool_input": {"command": "python -c write_outside_repo"},
+                }
+                run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+                run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+                data = cwg.read_json(marker) or {}
+                check(
+                    "a clean command {} with {} loose lasting path(s)".format(
+                        "expires the anchor" if expires else "keeps the anchor", count),
+                    (data.get("last_durable_ts", 0) > approved_at) is expires,
+                    data,
+                )
+            finally:
+                cleanup(sid)
 
     sid = session()
     try:
@@ -4866,6 +5154,35 @@ for path in (
     "/home/dev/.claude/state/checkpoints/proj.md",
 ):
     check("home bookkeeping is ephemeral: {}".format(path), cwg.is_ephemeral(path), path)
+
+
+# The harness's scratch tree at every depth, not only the scratchpad directory inside it.
+SCRATCH_HELPERS = [
+    "C:/Users/in/AppData/Local/Temp/claude/bound_digests.py",
+    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
+    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/notes/helper.py",
+    "/tmp/claude/fix_r1.py",
+]
+for path in SCRATCH_HELPERS:
+    check("agent scratch is ephemeral: {}".format(path), cwg.is_ephemeral(path), path)
+
+check("a candidate built only of scratch helpers is operational",
+      cwg.work_class(SCRATCH_HELPERS) == cwg.WORK_OPERATIONAL
+      and cwg.durable_paths(SCRATCH_HELPERS) == [], SCRATCH_HELPERS)
+# No snapshot answers for a temp tree, so a lasting path there expires every verdict the moment
+# any write-capable command runs — which is how one `glab api` read killed an APPROVED.
+check("scratch helpers leave nothing for outside_snapshot to flag",
+      marker_hook.outside_snapshot(SCRATCH_HELPERS, ["C:/repo"], []) == [], SCRATCH_HELPERS)
+
+for path in (
+    "C:/tmp/claude-code-stack/hooks/code_work_gate_common.py",
+    "C:/tmp/claude-code/src/app.ts",
+    "C:/tmp/claudex/app.py",
+):
+    check("a directory merely starting with claude is not scratch: {}".format(path),
+          not cwg.is_ephemeral(path), path)
+    check("a directory merely starting with claude stays gated: {}".format(path),
+          cwg.is_gated(path), path)
 
 
 # A chip's git worktree is created under the configuration home, but it is a checkout of a
@@ -6048,11 +6365,15 @@ with io.open(settings_file, encoding="utf-8") as stream:
     registered = json.load(stream)
 events = registered.get("hooks") or {}
 marker_events = {}
+shell_form = []
 for event, groups in events.items():
     for group in groups or ():
         for hook in group.get("hooks") or ():
-            if "code_work_gate_mark" in str(hook.get("command") or ""):
+            invocation = [str(hook.get("command") or "")] + [str(arg) for arg in hook.get("args") or ()]
+            if any(os.path.basename(MARK_HOOK) in part for part in invocation):
                 marker_events.setdefault(event, []).append(group.get("matcher") or "")
+            if hook.get("type") == "command" and "args" not in hook:
+                shell_form.append("{}: {}".format(event, invocation[0]))
 check(
     "a run only ever cleans up after itself",
     session().startswith(RUN + "_test_"),
@@ -6074,6 +6395,13 @@ check(
     "a failed shell command is still marked",
     any("Bash" in matcher for matcher in marker_events.get("PostToolUseFailure") or ()),
     marker_events,
+)
+# Under Git Bash a timeout kills bash alone, and the Python it started can stay suspended on the
+# hook's pipe with the session waiting on it; exec form (`args`) spawns the hook itself.
+check(
+    "every hook is spawned without a shell, so a timeout ends the hook itself",
+    not shell_form,
+    shell_form,
 )
 
 
@@ -6389,17 +6717,18 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
         mark_git(sid, "add", "-A")
         _, at_staged = measured(sid)
         mark_git(sid, "commit", "-q", "-m", "landed")
-        entry, at_landed = measured(sid)
+        marker_entry, at_landed = measured(sid)
         pending = repo_git("status", "--porcelain").stdout
         check("staging and committing the reviewed bytes never move the fingerprint",
               at_verdict == at_staged == at_landed and at_verdict is not None,
               (at_verdict, at_staged, at_landed))
         check("the commit did name a lasting path the candidate had not recorded",
-              len(entry.get("paths") or []) == 2 and len(entry.get("content_paths") or []) == 1,
-              entry)
+              len(marker_entry.get("paths") or []) == 2
+              and len(marker_entry.get("content_paths") or []) == 1,
+              marker_entry)
         check("no byte on disk moved while the candidate was staged and committed", pending == "", pending)
         check("a verdict stated before the commit still covers the candidate",
-              still_covers(entry, verdict_ts), entry)
+              still_covers(marker_entry, verdict_ts), marker_entry)
     finally:
         cleanup(sid)
 
@@ -6409,9 +6738,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
         verdict_ts = time.time()
         mark_git(sid, "add", "-A")
         mark_edit(sid, tree, "hooks/reviewed.py", "print('second')")
-        entry, _ = measured(sid)
+        marker_entry, _ = measured(sid)
         check("a change to the reviewed bytes still retires the verdict",
-              not still_covers(entry, verdict_ts), entry)
+              not still_covers(marker_entry, verdict_ts), marker_entry)
     finally:
         cleanup(sid)
         repo_git("checkout", "-q", "--", ".")
@@ -6425,9 +6754,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
         verdict_ts = time.time()
         _, at_verdict = measured(sid)
         mark_git(sid, "commit", "-q", "-m", "stale index")
-        entry, after_commit = measured(sid)
+        marker_entry, after_commit = measured(sid)
         check("committing a stale index still reads as a change of content",
-              after_commit != at_verdict and not still_covers(entry, verdict_ts),
+              after_commit != at_verdict and not still_covers(marker_entry, verdict_ts),
               (at_verdict, after_commit))
     finally:
         cleanup(sid)
@@ -6448,21 +6777,24 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
                     stream.write("print('wide')" + chr(10))
 
         mark_shell(sid, tree, "python -c write_wide", action=write_wide)
-        entry, at_verdict = measured(sid)
+        marker_entry, at_verdict = measured(sid)
         verdict_ts = time.time()
         check("a candidate wider than the indexed tier is measured, not unknown",
               at_verdict is not None
-              and len(entry.get("content_paths") or []) > marker_hook.FINGERPRINT_INDEXED_FILES,
-              entry)
+              and len(marker_entry.get("content_paths") or [])
+              > marker_hook.FINGERPRINT_INDEXED_FILES,
+              marker_entry)
         mark_git(sid, "add", "-A")
         mark_git(sid, "commit", "-q", "-m", "wide")
-        entry, at_landed = measured(sid)
+        marker_entry, at_landed = measured(sid)
         check("a wide candidate keeps its approval across staging and committing",
-              at_landed == at_verdict and still_covers(entry, verdict_ts), (at_verdict, at_landed))
+              at_landed == at_verdict and still_covers(marker_entry, verdict_ts),
+              (at_verdict, at_landed))
         with open(os.path.join(tree, *wide[0].split("/")), "w", encoding="utf-8") as stream:
             stream.write("print('wide, changed')" + chr(10))
         check("a wide candidate still notices a byte that changed",
-              marker_hook.content_fingerprint(entry.get("content_paths")) != at_landed, at_landed)
+              marker_hook.content_fingerprint(marker_entry.get("content_paths")) != at_landed,
+              at_landed)
     finally:
         cleanup(sid)
         repo_git("checkout", "-q", "--", ".")
@@ -6476,6 +6808,1119 @@ try:
     resumed = marker_hook.cycle_start(marker, time.time(), None, ["c:/repo/a.py"])
     check("a marker written before the domain existed keeps measuring what it measured",
           resumed["content_paths"] == legacy["paths"], resumed)
+finally:
+    cleanup(sid)
+
+
+# --- the snapshot follows the candidate into its other repositories and its loose lasting files
+# (reports b803660c, 5aadd867, 946d53ef)
+with tempfile.TemporaryDirectory(prefix="cwg_candidate_trees_") as base:
+    repo_a, repo_b, repo_c = (os.path.join(base, name) for name in ("a", "b", "c"))
+    for directory, branch in ((repo_a, "publish-a"), (repo_b, "candidate-b"), (repo_c, "other-c")):
+        candidate_repo(directory, branch)
+    helper = os.path.join(base, "helpers", "patch.py")
+    os.makedirs(os.path.dirname(helper))
+    with open(helper, "w", encoding="utf-8") as stream:
+        stream.write("print('patch')" + chr(10))
+
+    def mark_moving(sid, start, end, command, action=None):
+        """A shell call whose command moves the shell: the PostToolUse cwd is where it ended."""
+        payload = {"session_id": sid, "tool_use_id": "moving-{}".format(uuid.uuid4().hex),
+                   "tool_name": "Bash", "tool_input": {"command": command}}
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse", cwd=start))
+        if action:
+            action()
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse", cwd=end))
+
+    def rewrite(path, content):
+        def action():
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(content + chr(10))
+        return action
+
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        mark_edit(sid, repo_b, "src/candidate.py", "value = 2")
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write",
+                        "cwd": repo_b, "tool_input": {"file_path": helper}})
+        anchored = cwg.read_json(marker)
+        check("the candidate holds a file in its repository and a loose one",
+              any(path.endswith("/b/src/candidate.py") for path in anchored.get("paths") or [])
+              and cwg.normalize_path(helper) in (anchored.get("paths") or []), anchored)
+
+        mark_shell(sid, repo_a, "glab mr update 1 --ready | python -c pass")
+        quiet = cwg.read_json(marker)
+        check("a command run from another repository that changes nothing keeps the verdict anchor",
+              quiet["last_durable_ts"] == anchored["last_durable_ts"]
+              and quiet.get("content_marks") == anchored.get("content_marks"), (anchored, quiet))
+
+        mark_moving(sid, repo_a, repo_b, "cd ../b && glab mr view 1 | head -3")
+        check("a command that moves the shell into the candidate's repository still compares",
+              cwg.read_json(marker)["last_durable_ts"] == anchored["last_durable_ts"], cwg.read_json(marker))
+
+        mark_moving(sid, repo_a, repo_c, "cd ../c && python tools/gen.py")
+        entered = cwg.read_json(marker)
+        check("a command that changes into another repository by a literal path is measured there",
+              entered["last_durable_ts"] == anchored["last_durable_ts"], entered)
+
+        mark_moving(sid, repo_a, repo_c, 'cd "$TARGET" && python tools/gen.py')
+        unseen = cwg.read_json(marker)
+        check("a command that ends in a repository no snapshot covered expires the anchor",
+              unseen["last_durable_ts"] > anchored["last_durable_ts"], unseen)
+        cause = (unseen.get("content_marks") or [{}])[-1].get("cause") or {}
+        check("the barrier keeps where the command ended and what it was",
+              cause.get("landed") == cwg.normalize_path(repo_c).rstrip("/")
+              and cause.get("command") == "cd" and cause.get("reason") == "unresolved-write-capable", cause)
+
+        mark_shell(sid, repo_a, "python tools/bump.py",
+                   action=rewrite(os.path.join(repo_b, "src", "candidate.py"), "value = 3"))
+        rewritten = cwg.read_json(marker)
+        check("a command run elsewhere that rewrites the candidate records a measured change",
+              rewritten["last_durable_ts"] > unseen["last_durable_ts"]
+              and not (rewritten.get("content_marks") or [{}])[-1].get("unknown"), rewritten)
+
+        mark_shell(sid, repo_b, "python ../helpers/patch.py", action=rewrite(helper, "print('again')"))
+        helper_changed = cwg.read_json(marker)
+        check("a loose lasting file the command rewrote is a measured change, not an unknown one",
+              helper_changed["last_durable_ts"] > rewritten["last_durable_ts"]
+              and not (helper_changed.get("content_marks") or [{}])[-1].get("unknown"), helper_changed)
+    finally:
+        cleanup(sid)
+
+
+# --- a command's own literal directory changes decide where it is measured
+# (reports 4b840373, 0e4aedc8, a269a6fc)
+with tempfile.TemporaryDirectory(prefix="cwg_directory_plan_") as base:
+    left, right = os.path.join(base, "left"), os.path.join(base, "right")
+    os.makedirs(left)
+    os.makedirs(right)
+    forward = base.replace(chr(92), "/")
+    git_bash = "/" + forward[0].lower() + forward[2:]
+    right_forward = right.replace(chr(92), "/")
+
+    def plan(command, cwd, shell):
+        start, targets = marker_hook.directory_plan(command, cwd, shell)
+        named = [None if path is None else os.path.relpath(path, base) for path in [start] + targets]
+        return named[0], named[1:]
+
+    for label, command, cwd, shell, expected in (
+        ("an absolute target is where the command works",
+         "cd {} && python y".format(right_forward), left, "Bash", ("right", ["right"])),
+        ("a Git Bash drive path after an assignment",
+         'REVIEW_ID=r2; cd "{}/right" && codex exec - < p.md'.format(git_bash), base, "Bash", ("right", ["right"])),
+        ("a variable target loses the thread", 'cd "$W" && make', left, "Bash", (None, [])),
+        ("a relative target resolves against the directory",
+         "cd ../right && glab mr view 1 | head -3", left, "Bash", ("right", ["right"])),
+        ("a change after the work is a landing, not a start",
+         "make && cd {}".format(right_forward), left, "Bash", ("left", ["right"])),
+        ("a change inside a pipeline moves nothing",
+         "cd {} | cat; wc f".format(right_forward), left, "Bash", ("left", [])),
+        ("a subshell keeps its change to itself",
+         "(cd {} && make)".format(right_forward), left, "Bash", ("left", [])),
+        ("a directory that does not exist is no change",
+         "cd {}/missing && make".format(forward), left, "Bash", (None, [])),
+        ("PowerShell's Set-Location with a named path",
+         "Set-Location -Path '{}'; git status".format(right), left, "PowerShell", ("right", ["right"])),
+        ("an unquoted backslash path in bash is not that path",
+         "cd {} && make".format(right), left, "Bash", (None, [])),
+        ("a heredoc body is not read as shell",
+         "python - <<'PY'\ncd {}\nPY".format(right_forward), left, "Bash", ("left", [])),
+        ("pushd is a change too", "pushd ../right && make && popd", left, "Bash", ("right", ["right"])),
+        ("assignments alone run nowhere else", 'S="x y"; W="C:/q"', left, "Bash", ("left", [])),
+        ("unbalanced quotes are not read", "cd {} && echo it's".format(right_forward), left, "Bash", (None, [])),
+        ("a comment line before the change runs nothing",
+         "# round 2\nREVIEW_ID=r2; cd {} && make".format(right_forward), left, "Bash", ("right", ["right"])),
+    ):
+        check("directory_plan: " + label, plan(command, cwd, shell) == expected,
+              (command, plan(command, cwd, shell)))
+
+check("an assignment ahead of the command does not hide its executable",
+      marker_hook.command_label("REVIEW_ID=r2; cd /c/tmp/x && codex exec - < p.md") == "cd"
+      and marker_hook.command_label("A=1; B=2; git push") == "git"
+      and marker_hook.command_label("A=1;B=2;C=3;D=4;E=5;git push") == "git",
+      marker_hook.command_label("A=1;B=2;C=3;D=4;E=5;git push"))
+
+# --- a bookkeeping script is ignored only where an interpreter starting its segment runs it (G1 F7/F8)
+home_hooks = os.path.join(CLAUDE_CONFIG_DIR, "hooks")
+home_hook_change = os.path.join(home_hooks, "x.py")
+for label, command, tool, expect in (
+    ("a copy onto a hook through a directory called py still names the home",
+     'cp build/py "{}"'.format(os.path.join(home_hooks, "codex_lane.py")), "Bash", True),
+    ("the py launcher with a version flag runs a bookkeeping script",
+     'py -3 "{}" list'.format(os.path.join(home_hooks, "gate_inbox.py")), "Bash", False),
+    ("PowerShell's call operator with single quotes runs a bookkeeping script",
+     "& 'C:\\Python312\\python.exe' '{}' show 1234abcd".format(os.path.join(home_hooks, "gate_inbox.py")),
+     "PowerShell", False),
+    ("a versioned interpreter runs a bookkeeping script",
+     'python3.12 "{}" status'.format(os.path.join(home_hooks, "chip_handoff.py")), "Bash", False),
+    ("interpreter options before the script",
+     'python -X utf8 -u "{}" check'.format(os.path.join(home_hooks, "codex_lane.py")), "Bash", False),
+    ("a lower-case -x takes no value, unlike -X",
+     'python -x "{}" check'.format(os.path.join(home_hooks, "codex_lane.py")), "Bash", False),
+    ("inline code naming a bookkeeping script is no run of it",
+     'python -c "open(r\'{}\', \'w\')"'.format(os.path.join(home_hooks, "codex_lane.py")), "Bash", True),
+    ("a bookkeeping script named mid-segment is an argument, not a run",
+     'echo python "{}" > notes.txt'.format(os.path.join(home_hooks, "gate_inbox.py")), "Bash", True),
+):
+    got = marker_hook.on_home_ground(home_hook_change, "C:/tmp/worktree", ["C:/tmp/worktree"],
+                                     {"tool_name": tool, "tool_input": {"command": command}})
+    check("on_home_ground: " + label, got is expect, command)
+
+# --- a command that begins by changing into a repository is measured there, wherever it started
+with tempfile.TemporaryDirectory(prefix="cwg_entered_") as base:
+    home_repo, other_repo = os.path.join(base, "home"), os.path.join(base, "other")
+    for directory, branch in ((home_repo, "candidate"), (other_repo, "elsewhere")):
+        candidate_repo(directory, branch)
+    loose_dir = os.path.join(base, "loose")
+    os.makedirs(loose_dir)
+    home_forward = home_repo.replace(chr(92), "/")
+    other_forward = other_repo.replace(chr(92), "/")
+
+    def shell_between(sid, start, end, command, action=None, **extra):
+        """A shell call that starts in one directory and whose shell ends in another; `extra` adds
+        payload fields, such as the `agent_type` a hook inside a subagent receives."""
+        payload = dict({"session_id": sid, "tool_use_id": "entered-{}".format(uuid.uuid4().hex),
+                        "tool_name": "Bash", "tool_input": {"command": command}}, **extra)
+        run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse", cwd=start))
+        if action:
+            action()
+        run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse", cwd=end))
+
+    def write_in_other():
+        with open(os.path.join(other_repo, "src", "new_module.py"), "w", encoding="utf-8") as stream:
+            stream.write("created = True" + chr(10))
+
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        mark_edit(sid, home_repo, "src/candidate.py", "value = 2")
+        anchored = cwg.read_json(marker)
+
+        shell_between(sid, home_repo, other_repo,
+                      'cd {} && S="x" && python - "$S" <<\'PY\'\nprint(1)\nPY'.format(other_forward))
+        check("a command that changes into a repository outside the candidate is measured there",
+              cwg.read_json(marker)["last_durable_ts"] == anchored["last_durable_ts"], cwg.read_json(marker))
+
+        shell_between(sid, loose_dir, loose_dir,
+                      'REVIEW_ID=r2; cd "{}" && timeout 3600 codex exec - < p.md'.format(home_forward))
+        check("a review launched from outside any repository into the candidate's keeps its verdict",
+              cwg.read_json(marker)["last_durable_ts"] == anchored["last_durable_ts"], cwg.read_json(marker))
+
+        shell_between(sid, loose_dir, loose_dir, "python tools/bump.py")
+        outside = cwg.read_json(marker)
+        check("a command that works outside any repository still expires the anchor",
+              outside["last_durable_ts"] > anchored["last_durable_ts"], outside)
+
+        shell_between(sid, home_repo, home_repo,
+                      "cd {} && python gen.py && cd {}".format(other_forward, home_forward),
+                      action=write_in_other)
+        written = cwg.read_json(marker)
+        check("a write in a repository the command passed through is a measured path",
+              any(path.endswith("/other/src/new_module.py") for path in written.get("paths") or [])
+              and not (written.get("content_marks") or [{}])[-1].get("unknown"), written)
+    finally:
+        cleanup(sid)
+
+    def write_in_home():
+        with open(os.path.join(home_repo, "src", "generated.py"), "w", encoding="utf-8") as stream:
+            stream.write("generated = True" + chr(10))
+
+    # The repository the hook was given stays measured when the command starts somewhere else.
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        shell_between(sid, home_repo, other_repo, "cd {} && python build.py".format(other_forward),
+                      action=write_in_home)
+        started_elsewhere = cwg.read_json(marker) or {}
+        check("a command that starts elsewhere still measures the repository it was run from",
+              any(path.endswith("/home/src/generated.py") for path in started_elsewhere.get("paths") or []),
+              started_elsewhere)
+    finally:
+        cleanup(sid)
+
+    third_repo = os.path.join(base, "third")
+    candidate_repo(third_repo, "third")
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        mark_edit(sid, third_repo, "src/candidate.py", "value = 3")
+        anchored = cwg.read_json(marker)
+        shell_between(sid, home_repo, home_repo, "cd {} && python build.py && cd -".format(other_forward))
+        check("a command that returns to the repository it was run from lands on measured ground",
+              cwg.read_json(marker)["last_durable_ts"] == anchored["last_durable_ts"], cwg.read_json(marker))
+    finally:
+        cleanup(sid)
+
+    saved_budget = marker_hook.EXTRA_SNAPSHOT_BUDGET
+    marker_hook.EXTRA_SNAPSHOT_BUDGET = -1.0
+    try:
+        over_budget = marker_hook.shell_snapshot(home_repo, None, [other_repo])
+    finally:
+        marker_hook.EXTRA_SNAPSHOT_BUDGET = saved_budget
+    within_budget = marker_hook.shell_snapshot(home_repo, None, [other_repo])
+    check("repositories past the time budget are left out of the snapshot, and counted",
+          over_budget.get("repos") == [] and over_budget.get("skipped") == 1
+          and len(within_budget.get("repos") or []) == 1 and not within_budget.get("skipped"),
+          (over_budget, within_budget.get("repos")))
+
+# --- a cycle that replaces an open one says so, and so do the block and the candidate note (a269a6fc)
+with tempfile.TemporaryDirectory(prefix="cwg_displaced_") as repo:
+    candidate_repo(repo, "first-branch")
+    sid = session()
+    try:
+        marker, _ = gate_paths(sid)
+        mark_edit(sid, repo, "src/first.py")
+        opened = cwg.read_json(marker)
+        switch_branch(repo, "second-branch")
+        second = os.path.join(repo, "src", "second.py")
+        with open(second, "w", encoding="utf-8") as stream:
+            stream.write("second = True" + chr(10))
+        replacing = run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write",
+                                    "cwd": repo, "tool_input": {"file_path": second}})
+        note = (replacing.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        replaced = cwg.read_json(marker)
+        displaced = replaced.get("displaced") or {}
+        check("a new cycle records the open one it replaced",
+              replaced["first_ts"] != opened["first_ts"] and displaced.get("opened") == opened["first_ts"]
+              and str(displaced.get("was")).endswith("first-branch")
+              and str(displaced.get("now")).endswith("second-branch")
+              and any(path.endswith("/src/second.py") for path in displaced.get("by") or []), replaced)
+        check("the candidate note says which candidate it replaced and why",
+              "It replaced the candidate open since" in note and "first-branch → second-branch" in note
+              and "second.py not among its files" in note, note)
+        check("the candidate note names the candidate's files", "(1 lasting file: second.py)" in note, note)
+        mark_edit(sid, repo, "src/second.py", "second = 2")
+        check("the record of the replacement stays with the cycle",
+              (cwg.read_json(marker).get("displaced") or {}).get("opened") == opened["first_ts"],
+              cwg.read_json(marker))
+    finally:
+        cleanup(sid)
+
+now = time.time()
+detail_entry = {
+    "first_ts": now - 600, "last_ts": now - 10, "last_durable_ts": now - 100,
+    "paths": ["c:/repo/src/auth/session.ts"],
+    "content_marks": [
+        {"ts": now - 500, "fp": "aaa"},
+        {"ts": now - 100, "fp": "aaa", "unknown": True,
+         "cause": {"reason": "unresolved-write-capable", "tool": "Bash", "command": "cd",
+                   "landed": "c:/tmp/wt-other"}},
+    ],
+    "displaced": {"ts": now - 600, "opened": now - 3000, "was": "c:/repo#refs/heads/one",
+                  "now": "c:/repo#refs/heads/two", "idle": False, "by": ["c:/repo/src/updater.go"]},
+}
+approved_evidence = {"ordinary_reviews": [(now - 200, "APPROVED")],
+                     "review_events": [(now - 200, "ordinary", "APPROVED")]}
+detail = gate.block_detail(gate.HIGH_STALE_REASON, detail_entry, approved_evidence)
+check("a stale approval is explained by what came after it",
+      "the last APPROVED is filed at" in detail
+      and "unresolved-write-capable `cd` that ended in c:/tmp/wt-other" in detail, detail)
+check("the block says when evidence starts counting and which candidate that moment replaced",
+      "evidence for this candidate counts from" in detail and "branch one → two" in detail
+      and "updater.go not among its files" in detail, detail)
+rounds_detail = gate.block_detail(
+    "an invoked review has no terminal APPROVED verdict", detail_entry,
+    {"ordinary_reviews": [(now - 300, "REVISE")],
+     "review_events": [(now - 300, "ordinary", "REVISE"), (now - 250, "unbound", None)]})
+check("a round block lists the rounds it read and the results it could not use",
+      "ordinary rounds read:" in rounds_detail and "REVISE" in rounds_detail
+      and "without a usable verdict at" in rounds_detail, rounds_detail)
+check("a missing receipt needs no detail",
+      gate.block_detail("terminal receipt is missing or malformed", detail_entry, approved_evidence) == "",
+      "empty")
+check("a marker without its opening state says so",
+      "records no repository" in gate.restoration_blocker({"paths": ["c:/repo/src/a.py"]}),
+      gate.restoration_blocker({"paths": ["c:/repo/src/a.py"]}))
+
+with tempfile.TemporaryDirectory(prefix="cwg_restoration_detail_") as repo:
+    candidate_repo(repo, "restored")
+    opening = {
+        "identity": marker_hook.candidate_identity(repo),
+        "head_at_start": marker_hook.head_commit(repo),
+        "refs_at_start": cwg.refs_digest(repo),
+        "paths": [cwg.normalize_path(os.path.join(repo, "src", "seed.py"))],
+    }
+    check("a repository on its opening commit and clean has nothing to report",
+          gate.restoration_blocker(opening) == "", gate.restoration_blocker(opening))
+    with open(os.path.join(repo, "src", "seed.py"), "w", encoding="utf-8") as stream:
+        stream.write("value = 2" + chr(10))
+    commit_paths(repo, "src/seed.py", "moved on")
+    check("a repository that moved on names the commit",
+          gate.restoration_blocker(opening).startswith("HEAD is "), gate.restoration_blocker(opening))
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"], durable_ts=150)
+stale_marker, _ = gate_paths(sid)
+stale = cwg.read_json(stale_marker)
+stale["content_marks"] = [
+    {"ts": 110, "fp": "aaa"},
+    {"ts": 150, "fp": "aaa", "unknown": True,
+     "cause": {"reason": "unresolved-write-capable", "tool": "Bash", "command": "cd", "landed": "c:/tmp/wt-s5"}},
+]
+cwg.write_json(stale_marker, stale)
+events = base_events(include_simplify=True)
+add_review(events, 130, "review-1", review_text("APPROVED"))
+result = stop_with(sid, events, VERIFIED_HIGH)
+check("the block text carries what the hook read",
+      result.get("decision") == "block" and "What the hook read:" in result.get("reason", "")
+      and "ended in c:/tmp/wt-s5" in result.get("reason", ""), result)
+
+# --- a reviewer continued with SendMessage: each round is read from its notification (report 7435cfb4)
+FOREGROUND_TRAILER = ("\nagentId: {id} (use SendMessage with to: '{id}', summary: '<5-10 word recap>' "
+                      "to continue this agent)\n<usage>subagent_tokens: 1</usage>")
+
+
+def foreground_review(events, stamp, call_id, agent_id, result):
+    add_review(events, stamp, call_id, result + FOREGROUND_TRAILER.format(id=agent_id))
+
+
+def send_message(events, stamp, call_id, agent_id, resumed=True):
+    events.append(entry(stamp, "assistant", [{
+        "type": "tool_use", "id": call_id, "name": "SendMessage",
+        "input": {"to": agent_id, "message": "Round two: the remediation delta is attached."},
+    }]))
+    body = ({"success": True, "message": "Resuming agent " + agent_id, "resumedAgentId": agent_id}
+            if resumed else {"success": True, "message": "Message queued for delivery"})
+    events.append(tool_result(stamp + 0.2, call_id, json.dumps(body)))
+
+
+def round_notification(stamp, agent_id, result, call_id, status="completed"):
+    text = agent_notification_text(agent_id, result, status)
+    named = "" if call_id is None else "<tool-use-id>{}</tool-use-id>\n".format(call_id)
+    return notification_records(stamp, text.replace("<tool-use-id>toolu_a</tool-use-id>\n", named))
+
+
+def round_stop(events, stamp, agent_id):
+    events.append(entry(stamp, "assistant", [{"type": "tool_use", "id": "stop-" + agent_id,
+                                               "name": "TaskStop", "input": {"task_id": agent_id}}]))
+
+
+def rounds_case(steps, durable_ts=None):
+    sid = session()
+    seed(sid, ["C:/repo/src/auth/session.ts"], durable_ts=durable_ts)
+    events = base_events(include_simplify=True)
+    for step in steps:
+        kind = step[0]
+        if kind == "fg":
+            foreground_review(events, step[1], "review-" + str(step[1]), step[2], review_text(step[3]))
+        elif kind == "bg":
+            add_background_review(events, step[1], "bg-" + str(step[1]), step[2])
+        elif kind == "bg-notice":
+            events.extend(agent_notification(step[1], step[2], review_text(step[3])))
+        elif kind == "send":
+            send_message(events, step[1], "send-" + str(step[1]), step[2], resumed=step[3])
+        elif kind == "round":
+            events.extend(round_notification(step[1], step[2], review_text(step[3]), step[4]))
+        elif kind == "stop":
+            round_stop(events, step[1], step[2])
+    return stop_with(sid, events, VERIFIED_HIGH)
+
+
+for label, steps, durable_ts, expect_ok, expect_reason in (
+    ("a REVISE then a resumed APPROVED verifies the candidate",
+     [("fg", 130, "agent-sm1", "REVISE"), ("send", 132, "agent-sm1", True),
+      ("round", 140, "agent-sm1", "APPROVED", "send-132")], None, True, ""),
+    ("two resumed rounds after a REVISE, the last APPROVED, verify the candidate",
+     [("fg", 130, "agent-sm2", "REVISE"), ("send", 132, "agent-sm2", True),
+      ("round", 136, "agent-sm2", "REVISE", "send-132"), ("send", 138, "agent-sm2", True),
+      ("round", 142, "agent-sm2", "APPROVED", "send-138")], None, True, ""),
+    ("a resumed round after an APPROVED is review continued after it",
+     [("fg", 130, "agent-sm3", "APPROVED"), ("send", 132, "agent-sm3", True),
+      ("round", 136, "agent-sm3", "REVISE", "send-132")], None, False, "continued after terminal APPROVED"),
+    ("a message to an agent that is no reviewer is no round",
+     [("fg", 130, "agent-sm4", "REVISE"), ("send", 132, "agent-other", True),
+      ("round", 140, "agent-other", "APPROVED", "send-132")], None, False,
+     "an invoked review has no terminal APPROVED verdict"),
+    ("a background REVISE and a resumed APPROVED verify the candidate",
+     [("bg", 130, "agent-sm5"), ("bg-notice", 134, "agent-sm5", "REVISE"), ("send", 136, "agent-sm5", True),
+      ("round", 140, "agent-sm5", "APPROVED", "send-136")], None, True, ""),
+    ("a message that resumed nothing starts no round",
+     [("fg", 130, "agent-sm6", "REVISE"), ("send", 132, "agent-sm6", False),
+      ("round", 140, "agent-sm6", "APPROVED", "send-132")], None, False,
+     "an invoked review has no terminal APPROVED verdict"),
+    ("a round's notification that names no call still belongs to the open round",
+     [("fg", 130, "agent-sm7", "REVISE"), ("send", 132, "agent-sm7", True),
+      ("round", 140, "agent-sm7", "APPROVED", None)], None, True, ""),
+    ("a resumed verdict is filed at the SendMessage: an edit after it expires the verdict",
+     [("fg", 130, "agent-sm8", "REVISE"), ("send", 132, "agent-sm8", True),
+      ("round", 140, "agent-sm8", "APPROVED", "send-132")], 135, False, "lacks a current APPROVED"),
+    ("an edit before the SendMessage does not expire the resumed verdict",
+     [("fg", 130, "agent-sm9", "REVISE"), ("send", 132, "agent-sm9", True),
+      ("round", 140, "agent-sm9", "APPROVED", "send-132")], 131, True, ""),
+    ("a stop after the resumed verdict is activity after it",
+     [("fg", 130, "agent-sm10", "REVISE"), ("send", 132, "agent-sm10", True),
+      ("round", 140, "agent-sm10", "APPROVED", "send-132"), ("stop", 145, "agent-sm10")], None, False,
+     "continued after terminal APPROVED"),
+    ("a reviewer from before the candidate resumed inside it is that round",
+     [("fg", 90, "agent-sm11", "REVISE"), ("send", 132, "agent-sm11", True),
+      ("round", 140, "agent-sm11", "APPROVED", "send-132")], None, True, ""),
+):
+    result = rounds_case(steps, durable_ts)
+    ok = result.get("continue") is True and "decision" not in result
+    check("SendMessage: " + label, ok if expect_ok else (result.get("decision") == "block"
+                                                        and expect_reason in result.get("reason", "")), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+foreground_review(events, time.time() - 100, "review-live", "agent-live", review_text("REVISE"))
+send_message(events, time.time() - 50, "send-live", "agent-live")
+result = stop_with(sid, events, "Waiting for the second round.")
+check("a resumed round still running lets the turn end",
+      result.get("continue") is True and "decision" not in result, result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = base_events(include_simplify=True)
+add_background_review(events, 130, "bg-review", "agent-ledger")
+events.extend(agent_notification(140, "agent-ledger", review_text("APPROVED")))
+result = stop_with(sid, events, VERIFIED_HIGH)
+ledger_notes = [note for note in review_notes(sid) if note.get("task") == "agent-ledger"]
+check("the ledger files a background verdict at its launch and keeps when it was notified",
+      result.get("continue") is True and ledger_notes and ledger_notes[-1].get("at") == 130
+      and ledger_notes[-1].get("notified") == 140, ledger_notes)
+
+# --- a launch whose capture is missing binds by the file when nothing wrote it after the launch (R4)
+for label, written_before, expect_bound in (
+    ("a packet file last written before the launch binds without a capture", True, True),
+    ("a packet file written after the launch binds nothing without a capture", False, False),
+):
+    sid = session()
+    try:
+        now = time.time()
+        task_id = "bfile" + uuid.uuid4().hex[:4]
+        out_file = os.path.join(tasks_dir, task_id + ".output")
+        fed = reviewer_role_text() + "\n\n" + PACKET_A
+        packet_file = write_packet(task_id, fed)
+        written_at = now - 710 if written_before else now - 650
+        os.utime(packet_file, (written_at, written_at))
+        command = packet_launch(packet_file)
+        seed(sid, ["C:/repo/src/auth/session.ts"], first_ts=now - 900, last_ts=now - 800,
+             durable_ts=now - 800)
+        events = [skill_use(now - 890, "development-verification", "skill-dev")]
+        simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+        events.append(bash_use(now - 700, "codex-" + task_id, command, run_in_background=True))
+        events.append(tool_result(now - 699, "codex-" + task_id,
+                                  DETACHED_ACK.format(id=task_id, out=out_file)))
+        events.append(notification(now - 600, task_id, out_file, "completed"))
+        rollout_records([(now - 690, "developer", fed),
+                         (now - 640, "assistant", codex_cli_output(review_text("APPROVED")))])
+        transcript = write_transcript(events)
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                                 "last_assistant_message": BACKGROUND_HIGH})
+        bound = result.get("continue") is True and "decision" not in result
+        check(label, bound is expect_bound, result)
+        if not expect_bound:
+            check("the ledger says why the launch bound nothing",
+                  any("the file changed after the launch" in (note.get("reason") or "")
+                      for note in review_notes(sid)), review_notes(sid))
+    finally:
+        cleanup(sid, locals().get("transcript"))
+
+for cause in (
+    {"reason": "unresolved-write-capable", "tool": "Bash", "command": "make", "skipped": 2},
+    {"reason": "unresolved-write-capable", "tool": "Bash", "skipped": 2},
+):
+    barrier = gate.describe_mark({"ts": time.time(), "fp": "a", "unknown": True, "cause": cause},
+                                 lambda stamp: "12:00:00")
+    check("a barrier says how many repositories the time budget left out",
+          barrier.endswith(", with 2 repositories left unmeasured by the hook's time budget")
+          and barrier.count("(") <= 1, barrier)
+
+# --- an intent-to-add placeholder is no staged content (report 265312d0)
+check("the empty-blob ids are the empty blob in both object formats",
+      marker_hook.EMPTY_BLOBS == {hashlib.sha1(b"blob 0\0").hexdigest(),
+                                  hashlib.sha256(b"blob 0\0").hexdigest()},
+      marker_hook.EMPTY_BLOBS)
+with tempfile.TemporaryDirectory(prefix="cwg_intent_to_add_") as repo:
+    candidate_repo(repo, "intent")
+    fresh = os.path.join(repo, "src", "fresh.py")
+    with open(fresh, "w", encoding="utf-8") as stream:
+        stream.write("fresh = True" + chr(10))
+    subprocess.run(["git", "-C", repo, "add", "-N", "--", "src/fresh.py"], check=True)
+    fresh_path = cwg.normalize_path(fresh)
+    placeholder = marker_hook.content_fingerprint([fresh_path])
+    commit_paths(repo, "src/fresh.py", "fresh")
+    check("committing a reviewed file over its intent-to-add entry keeps the fingerprint",
+          placeholder is not None and marker_hook.content_fingerprint([fresh_path]) == placeholder,
+          (placeholder, marker_hook.content_fingerprint([fresh_path])))
+    staged = os.path.join(repo, "src", "staged.py")
+    with open(staged, "w", encoding="utf-8") as stream:
+        stream.write("staged = 1" + chr(10))
+    subprocess.run(["git", "-C", repo, "add", "--", "src/staged.py"], check=True)
+    with open(staged, "w", encoding="utf-8") as stream:
+        stream.write("staged = 2" + chr(10))
+    check("a staged new file that differs from the disk still diverges",
+          marker_hook.staged_divergences(os.path.join(repo, "src"), ["staged.py"]) not in (None, []),
+          marker_hook.staged_divergences(os.path.join(repo, "src"), ["staged.py"]))
+
+# --- a variable the same command gave a literal value names a directory too (report 265312d0)
+with tempfile.TemporaryDirectory(prefix="cwg_directory_variables_") as base:
+    left, right = os.path.join(base, "left"), os.path.join(base, "right")
+    os.makedirs(left)
+    os.makedirs(right)
+    right_forward = right.replace(chr(92), "/")
+
+    def variable_plan(command):
+        start, targets = marker_hook.directory_plan(command, left, "Bash")
+        named = [None if path is None else os.path.relpath(path, base) for path in [start] + targets]
+        return named[0], named[1:]
+
+    for label, command, expected in (
+        ("a quoted variable assigned before the change",
+         'CT="{}"; git -C "$CT" status | head -3; cd "$CT" && python finish.py'.format(right_forward),
+         ("left", ["right"])),
+        ("an unquoted variable in braces",
+         "CT={}; cd ${{CT}} && make".format(right_forward), ("right", ["right"])),
+        ("a single-quoted value keeps its backslashes",
+         "CT='{}'; cd \"$CT\" && make".format(right), ("right", ["right"])),
+        ("read may have reassigned it",
+         'CT="{}"; read CT; cd "$CT" && make'.format(right_forward), ("left", [])),
+        ("export may have reassigned it",
+         'CT="{}"; export CT=/elsewhere; cd "$CT"'.format(right_forward), ("left", [])),
+        ("a computed value is unknown", 'CT=$(pwd); cd "$CT" && make', ("left", [])),
+        ("a single-quoted reference is literal text",
+         "CT={}; cd '$CT' && make".format(right_forward), (None, [])),
+        ("an unassigned variable stays unknown", 'cd "$NOWHERE" && make', (None, [])),
+        ("an assignment inside a pipeline does not persist",
+         'CT="{}" | cat; cd "$CT" && make'.format(right_forward), ("left", [])),
+    ):
+        check("directory_plan with variables: " + label, variable_plan(command) == expected,
+              (command, variable_plan(command)))
+
+# --- a throwaway written into a drive-root temp subdirectory outside any repository (report ff2c5007)
+if os.path.isdir("C:\\tmp"):
+    with tempfile.TemporaryDirectory(prefix="cwg_scratch_rule_", dir="C:\\tmp") as scratch_dir, \
+            tempfile.TemporaryDirectory(prefix="cwg_clone_rule_", dir="C:\\tmp") as clone_dir:
+        candidate_repo(clone_dir, "clone")
+        helper = os.path.join(scratch_dir, "wait-job.sh")
+        check("a file in a temp subdirectory outside any repository is scratch",
+              marker_hook.scratch_file(helper), helper)
+        check("a file in a clone under a temp root is not scratch",
+              not marker_hook.scratch_file(os.path.join(clone_dir, "src", "seed.py")), clone_dir)
+        check("the user temp directory is not this rule's business",
+              not marker_hook.scratch_file(os.path.join(tempfile.gettempdir(), "x", "y.py")), "user temp")
+        sid = session()
+        try:
+            marker, _ = gate_paths(sid)
+            mark_edit(sid, clone_dir, "src/candidate.py", "value = 5")
+            anchored = cwg.read_json(marker)
+            with open(helper, "w", encoding="utf-8") as stream:
+                stream.write("sleep 1" + chr(10))
+            run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write",
+                            "cwd": clone_dir, "tool_input": {"file_path": helper}})
+            after_helper = cwg.read_json(marker)
+            check("a scratch helper written after an approval leaves the candidate as it was",
+                  after_helper["last_durable_ts"] == anchored["last_durable_ts"]
+                  and cwg.normalize_path(helper) not in (after_helper.get("paths") or []), after_helper)
+        finally:
+            cleanup(sid)
+
+
+# --- a clean upstream merge is git's computation, not the session's writing (report f9920b99)
+def git_as_gate(directory, *args, check=True):
+    return subprocess.run(
+        ["git", "-C", directory, "-c", "user.name=Code Work Gate", "-c", "user.email=gate@example.invalid"]
+        + list(args), check=check, capture_output=True, text=True,
+    )
+
+
+def put(directory, relative, content):
+    target = os.path.join(directory, *relative.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write(content)
+
+
+check("raw diff records keep the destination side of each path",
+      marker_hook.raw_diff_records(":100644 100644 aaa bbb M\0src/a.py\0:100644 000000 ccc 000 D\0gone.py\0")
+      == {"src/a.py": ("100644", "bbb"), "gone.py": ("000000", "000")})
+
+# These scenarios pin the judge's logic, not this machine's load: under load its own deadline runs
+# out first, which records the merge's files, the documented fallback.
+os.environ["CWG_MERGE_JUDGE_BUDGET"] = "60"
+with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
+    remote = os.path.join(base, "remote.git")
+    upstream = os.path.join(base, "upstream")
+    work = os.path.join(base, "work")
+    subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", remote], check=True)
+    subprocess.run(["git", "clone", "--quiet", remote, upstream], check=True, capture_output=True)
+    shared_base = "".join("line {}\n".format(number) for number in range(1, 21))
+    for relative, content in (("src/app.py", "value = 1\n"), ("src/gone.py", "gone = 1\n"),
+                              ("src/shared.py", shared_base), ("src/stay.py", "stay = 1\n")):
+        put(upstream, relative, content)
+    git_as_gate(upstream, "add", "-A")
+    git_as_gate(upstream, "commit", "--quiet", "-m", "base")
+    git_as_gate(upstream, "push", "--quiet", "origin", "main")
+    # Cloned after the first push, so origin/HEAD names the default branch as a real clone's does.
+    subprocess.run(["git", "clone", "--quiet", remote, work], check=True, capture_output=True)
+    put(upstream, "src/app.py", "value = 2\n")
+    put(upstream, "src/new.py", "new = 1\n")
+    os.remove(os.path.join(upstream, "src", "gone.py"))
+    put(upstream, "src/shared.py", "upstream line 1\n" + shared_base.split("\n", 1)[1])
+    git_as_gate(upstream, "add", "-A")
+    git_as_gate(upstream, "commit", "--quiet", "-m", "upstream")
+    git_as_gate(upstream, "push", "--quiet", "origin", "main")
+    git_as_gate(work, "fetch", "--quiet")
+    start = git_as_gate(work, "rev-parse", "HEAD").stdout.strip()
+
+    def restart():
+        git_as_gate(work, "reset", "--quiet", "--hard", start)
+        git_as_gate(work, "clean", "-fdq")
+
+    def merge_upstream():
+        git_as_gate(work, "merge", "--no-ff", "--no-commit", "origin/main", check=False)
+
+    def recorded(sid):
+        entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+        return entry, set(entry.get("paths") or [])
+
+    def at(relative):
+        return cwg.normalize_path(os.path.join(work, *relative.split("/")))
+
+    def covers_now(entry, stamp):
+        return gate.content_covers(entry, stamp, float(entry.get("last_durable_ts") or 0.0))
+
+    brought = {at("src/app.py"), at("src/new.py"), at("src/gone.py"), at("src/shared.py")}
+    check("no merge is judged without the HEAD the snapshot recorded",
+          marker_hook.merge_set_aside({"git": {"root": work}, "head": None, "merging": True}, None, brought,
+                                      set(), time.monotonic() + 5) == set())
+
+    sid = session()
+    try:
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
+        entry, paths = recorded(sid)
+        check("a clean upstream merge records none of the files it brought in",
+              bool(paths) and not (paths & brought), entry)
+        check("and leaves an operational candidate", not cwg.candidate_shape(entry)["persistent"], entry)
+        mark_shell(sid, work, "git commit -m merge",
+                   action=lambda: git_as_gate(work, "commit", "--quiet", "-m", "merge"))
+        entry, paths = recorded(sid)
+        check("committing the merge records none of them either", not (paths & brought), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        def merge_and_write():
+            merge_upstream()
+            with open(os.path.join(work, "src", "app.py"), "a", encoding="utf-8") as stream:
+                stream.write("sneaked = True\n")
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main && echo sneaked >> src/app.py",
+                   action=merge_and_write)
+        entry, paths = recorded(sid)
+        check("a file written after the merge in the same command is recorded as rewritten",
+              at("src/app.py") in paths and at("src/app.py") in (entry.get("content_paths") or []), entry)
+        check("while the rest of the merge is not", not (paths & (brought - {at("src/app.py")})), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        git_as_gate(work, "checkout", "--quiet", "-b", "side", "origin/main")
+        put(work, "src/side.py", "side = 1\n")
+        git_as_gate(work, "add", "src/side.py")
+        git_as_gate(work, "commit", "--quiet", "-m", "side")
+        git_as_gate(work, "checkout", "--quiet", "main")
+        mark_shell(sid, work, "git merge --no-ff --no-commit side",
+                   action=lambda: git_as_gate(work, "merge", "--no-ff", "--no-commit", "side", check=False))
+        entry, paths = recorded(sid)
+        check("a merge of a branch that is not upstream records every file it brought in",
+              {at("src/side.py"), at("src/new.py")} <= paths, entry)
+    finally:
+        cleanup(sid)
+        restart()
+        git_as_gate(work, "branch", "--quiet", "-D", "side")
+
+    sid = session()
+    try:
+        own = mark_edit(sid, work, "src/shared.py", shared_base + "own line 21")
+        mark_shell(sid, work, "git commit -am own",
+                   action=lambda: git_as_gate(work, "commit", "--quiet", "-am", "own"))
+        mark_edit(sid, work, "src/extra.py", "extra = 1")
+        verdict_ts = time.time()
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
+        entry, paths = recorded(sid)
+        check("a clean merge into the candidate's own file leaves a mark naming what it merged",
+              bool((entry.get("content_marks") or [{}])[-1].get("merge"))
+              and not (paths & (brought - {own})), entry)
+        mark_shell(sid, work, "git add src/extra.py",
+                   action=lambda: git_as_gate(work, "add", "src/extra.py"))
+        entry, _ = recorded(sid)
+        check("a verdict from before the merge still covers the candidate after the next measurement",
+              float(entry.get("last_durable_ts") or 0.0) > verdict_ts and covers_now(entry, verdict_ts), entry)
+        mark_edit(sid, work, "src/shared.py", "rewritten = True")
+        entry, _ = recorded(sid)
+        check("an edit after the merge still retires it", not covers_now(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        mark_edit(sid, work, "src/shared.py", shared_base + "own line 21")
+        mark_shell(sid, work, "git commit -am own",
+                   action=lambda: git_as_gate(work, "commit", "--quiet", "-am", "own"))
+        mark_edit(sid, work, "src/extra.py", "extra = 1")
+        verdict_ts = time.time()
+
+        def merge_and_stage():
+            merge_upstream()
+            git_as_gate(work, "add", "src/extra.py")
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main && git add src/extra.py",
+                   action=merge_and_stage)
+        entry, _ = recorded(sid)
+        check("a merge beside a staging of reviewed bytes still carries the verdict",
+              float(entry.get("last_durable_ts") or 0.0) > verdict_ts
+              and bool((entry.get("content_marks") or [{}])[-1].get("merge"))
+              and covers_now(entry, verdict_ts), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
+        mark_shell(sid, work, "git merge --abort", action=lambda: git_as_gate(work, "merge", "--abort"))
+        entry, paths = recorded(sid)
+        check("abandoning a clean upstream merge records none of its files", not (paths & brought), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        # Dirt from before the candidate, which the command that abandons the merge also discards.
+        put(work, "src/stay.py", "stay = 2\n")
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
+
+        def abandon_and_discard():
+            git_as_gate(work, "merge", "--abort")
+            git_as_gate(work, "checkout", "--", "src/stay.py")
+        mark_shell(sid, work, "git merge --abort && git checkout -- src/stay.py", action=abandon_and_discard)
+        entry, paths = recorded(sid)
+        check("an abandoned merge sets aside only what it had staged, not dirt the same command discards",
+              at("src/stay.py") in paths and not (paths & brought), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        put(work, "src/shared.py", "own line 1\n" + shared_base.split("\n", 1)[1])
+        git_as_gate(work, "commit", "--quiet", "-am", "own first line")
+        mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
+        entry, paths = recorded(sid)
+        check("a conflicted path stays recorded while the clean ones do not",
+              at("src/shared.py") in paths
+              and not (paths & {at("src/app.py"), at("src/new.py"), at("src/gone.py")}), entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+del os.environ["CWG_MERGE_JUDGE_BUDGET"]
+
+# --- a read-only lane's own commands do not expire the verdict it is producing (report a1c7b71b)
+check("cmp only compares", marker_hook.read_only_pipeline("cmp backend/schema.sql mirror/schema.sql && echo same"))
+check("the read-only lanes are the reviewer, Explore and Plan",
+      marker_hook.read_only_lane({"agent_type": "adversarial-reviewer"})
+      and marker_hook.read_only_lane({"agent_type": "Explore"})
+      and marker_hook.read_only_lane({"agent_type": "Plan"})
+      and not marker_hook.read_only_lane({"agent_type": "general-purpose"})
+      and not marker_hook.read_only_lane({}))
+
+
+with tempfile.TemporaryDirectory(prefix="cwg_lane_") as base:
+    home, other = os.path.join(base, "home"), os.path.join(base, "other")
+    candidate_repo(home, "lane-home")
+    candidate_repo(other, "lane-other")
+    # The target is computed, so the plan cannot follow it: the command lands in a repository no
+    # snapshot covered, and is unresolved.
+    unresolved = 'cd "$(git rev-parse --show-toplevel)/../other" && ls src | sed "s/_.*//" | sort | uniq -d'
+    reviewer = {"agent_id": "agent-review", "agent_type": "adversarial-reviewer"}
+    for label, extra, expires in (("the parent's", {}, True), ("a reviewer's", reviewer, False)):
+        sid = session()
+        try:
+            mark_edit(sid, home, "src/candidate.py", "value = 3")
+            anchored = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+            time.sleep(0.05)
+            shell_between(sid, home, other, unresolved, **extra)
+            after = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+            moved = after["last_durable_ts"] != anchored["last_durable_ts"]
+            check("{} unresolved command {} the verdict".format(label, "expires" if expires else "keeps"),
+                  moved == expires and (expires or after.get("paths") == anchored.get("paths")), after)
+        finally:
+            cleanup(sid)
+    sid = session()
+    try:
+        mark_edit(sid, home, "src/candidate.py", "value = 4")
+        anchored = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+
+        def lane_writes():
+            with open(os.path.join(home, "src", "candidate.py"), "w", encoding="utf-8") as stream:
+                stream.write("value = 5" + chr(10))
+        shell_between(sid, home, home, "sed -i s/4/5/ src/candidate.py", action=lane_writes, **reviewer)
+        after = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+        check("a write a reviewer makes where the snapshot looks still expires the verdict",
+              after["last_durable_ts"] != anchored["last_durable_ts"]
+              and (after.get("content_marks") or [{}])[-1].get("fp")
+              != (anchored.get("content_marks") or [{}])[-1].get("fp"), after)
+    finally:
+        cleanup(sid)
+
+# --- bookkeeping tools and GitLab calls do not write lasting artifacts (report e5533b32)
+for command, expected in (
+    ('nlm-memory remember --type GOTCHA --summary "a (b) [c]" --evidence "x"', True),
+    ('~/.local/bin/nlm-memory.cmd recall "q"', True),
+    ('NLM=~/.local/bin/nlm-memory.cmd; $NLM remember --summary "x" 2>&1 | tail -1', True),
+    ('NLM=~/.local/bin/nlm-memory.cmd; "$NLM" recall "q"', True),
+    ("NLM=~/.local/bin/nlm-memory.cmd; '$NLM' recall q", False),
+    ('NLM=~/.local/bin/nlm-memory.cmd; printf -v NLM rm; $NLM -rf x', False),
+    ('NLM=/usr/bin/rm; $NLM -rf x', False),
+    ('NLM=~/.local/bin/nlm-memory.cmd | $NLM remember', False),
+    ('$NLM remember', False),
+    ('nlm-memory remember --summary x (y)', False),
+    ('python "C:/Users/in/.claude/hooks/gate_inbox.py" ack abcd --note "x (y)"', True),
+    ('python "C:/Users/in/.claude/hooks/chip_handoff.py" open --title x', False),
+    ('cd "C:/x" && python "C:/Users/in/.claude/hooks/chip_handoff.py" finish --chip c1 --message "done (all); ok"', True),
+    ('python C:/Users/in/.claude/hooks/chip_handoff.py status', True),
+    ('python C:/Users/in/.claude/hooks/chip_handoff.py close --chip c1 --accept', True),
+    ('python C:/Users/in/.claude/hooks/chip_handoff.py', False),
+    ('python C:/Users/in/.claude/hooks/chip_handoff.py rename --chip c1', False),
+    ('glab mr view 637 -F json', True),
+    ('glab -R group/proj mr view 1', True),
+    ('glab api projects/1/merge_requests', True),
+    ('glab issue note 463 -m "text"', True),
+    ('glab mr update 637 --ready --description "$(cat f)"', False),
+    ('glab mr checkout 637', False),
+    ('glab ci artifact main build', False),
+    ('glab mr merge 637', True),
+    ('glab issue update 1 --title x', True),
+    ('glab repo view', True),
+    ('glab variable get FOO', True),
+    # Only the subcommands that write nothing but the tool's own home.
+    ('nlm-memory rollback --backup C:/x', False),
+    ('NLM=~/.local/bin/nlm-memory.cmd; $NLM rollback --backup C:/x', False),
+    ('nlm-memory init', False),
+    ('nlm-memory', False),
+    # `{` is refused before any segment is read, so `${NLM}` never reaches the variable table.
+    ('NLM=~/.local/bin/nlm-memory.cmd; ${NLM} remember x', False),
+):
+    check("read-only pipeline: {}".format(command), marker_hook.read_only_pipeline(command) == expected)
+check("in PowerShell `NAME=value` is no assignment, so the variable names no tool",
+      not marker_hook.read_only_pipeline('NLM=~/.local/bin/nlm-memory.cmd; $NLM remember x', "PowerShell")
+      and marker_hook.read_only_pipeline('nlm-memory remember --summary "x (y)"', "PowerShell"))
+
+# --- the directory holding a configuration home is not inside it (report b26e3641)
+agents_home = os.path.join(AGENT_HOME, ".agents")
+skill_file = os.path.join(agents_home, "skills", "x", "SKILL.md")
+
+
+def grounded(cwd, command, roots=(), elsewhere=True):
+    return marker_hook.on_home_ground(skill_file, cwd, list(roots),
+                                      {"tool_name": "PowerShell", "tool_input": {"command": command}},
+                                      elsewhere=elsewhere)
+
+
+check("a command run in the directory holding a home does not own a home change another session announced",
+      not grounded(AGENT_HOME, "Stop-Process -Id 1"))
+check("nor does a repository there", not grounded(AGENT_HOME, "git status", roots=[AGENT_HOME]))
+check("a change nobody else announced stays on the holding directory's ground",
+      grounded(AGENT_HOME, "python patch_skill.py", elsewhere=False))
+check("a command run inside the home owns it", grounded(agents_home, "ls"))
+check("and one that spells the home by its own name from the directory holding it",
+      grounded(AGENT_HOME, "Set-Content .agents/skills/x/SKILL.md 1")
+      and grounded(AGENT_HOME, "cat ./.agents/skills/x/SKILL.md"))
+check("a project's own dot-directory is not that home", not grounded(AGENT_HOME, "cat proj/.agents/x.md"))
+
+with tempfile.TemporaryDirectory(prefix="cwg_bookkeeping_") as base:
+    home, other = os.path.join(base, "home"), os.path.join(base, "other")
+    candidate_repo(home, "bookkeeping-home")
+    candidate_repo(other, "bookkeeping-other")
+    for command, expires in (('NLM=~/.local/bin/nlm-memory.cmd; $NLM recall "why"', False),
+                             ('python -c "print(1)"', True)):
+        sid = session()
+        try:
+            mark_edit(sid, home, "src/candidate.py", "value = 6")
+            anchored = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+            # The shell ends in a repository no snapshot covered, so the command is unresolved.
+            shell_between(sid, home, other, command)
+            after = cwg.read_json(cwg.marker_path(cwg.session_key(sid)))
+            check("an unresolved {} {} the verdict".format(command.split()[0], "expires" if expires else "keeps"),
+                  (after["last_durable_ts"] != anchored["last_durable_ts"]) == expires, after)
+        finally:
+            cleanup(sid)
+
+# --- a change no marker hook measured still retires the verdict from before it (report 8db8b3d2)
+with tempfile.TemporaryDirectory(prefix="cwg_unmeasured_") as repo:
+    candidate_repo(repo, "unmeasured")
+    fixed = os.path.join(repo, "src", "candidate.py")
+    sid = session()
+    try:
+        target = mark_edit(sid, repo, "src/candidate.py", "value = 1")
+        marker, _ = gate_paths(sid)
+        entry = cwg.read_json(marker)
+        check("a measurement keeps the lasting paths' stats",
+              target in (entry.get("content_stats") or {}), entry)
+        unchanged = gate.unmeasured_change(entry, time.time())
+        check("with nothing changed there is nothing to catch up, only the time the stats matched",
+              unchanged is not None and unchanged[1] is None
+              and unchanged[0]["content_marks"] == entry["content_marks"], unchanged)
+        before_fix = time.time()
+        time.sleep(0.05)
+        # The fix lands while the marker hooks are cancelled, so no mark records it.
+        with open(fixed, "w", encoding="utf-8") as stream:
+            stream.write("value = 2" + chr(10))
+        fixed_at = os.stat(fixed).st_mtime_ns / 1e9
+        time.sleep(0.05)
+        after_fix = time.time()
+        caught, added = gate.unmeasured_change(entry, time.time())
+        check("the unmeasured change gets a mark at its modification time",
+              (added or {}).get("cause", {}).get("reason") == gate.UNMEASURED_REASON
+              and abs(added["ts"] - fixed_at) < 0.01, caught)
+        durable = float(caught.get("last_durable_ts") or 0.0)
+        check("a verdict from before the change is stale and one from after it covers",
+              not gate.content_covers(caught, before_fix, durable) and gate.content_covers(caught, after_fix, durable),
+              caught)
+        filler = [{"ts": 1.0 + index, "fp": "old{}".format(index)} for index in range(marker_hook.CONTENT_MARKS_KEPT)]
+        crowded, crowded_added = gate.unmeasured_change(
+            dict(entry, content_marks=filler + list(entry["content_marks"])), time.time())
+        check("the catch-up keeps the marker's cap on marks and still reports the mark it added",
+              len(crowded["content_marks"]) == marker_hook.CONTENT_MARKS_KEPT
+              and crowded_added is not None and crowded["content_marks"][-1]["fp"] == added["fp"], crowded)
+        barriers = gate.approval_barriers(caught, {"ordinary_reviews": [(before_fix, "APPROVED")]}, marker_hook.clock)
+        check("the block says no marker hook measured it", "no marker hook measured" in barriers, barriers)
+        with open(fixed, "w", encoding="utf-8") as stream:
+            stream.write("value = 2" + chr(10))
+        touched, touched_added = gate.unmeasured_change(caught, time.time())
+        check("rewriting the same bytes updates the stats and adds no mark",
+              touched_added is None and touched["content_marks"] == caught["content_marks"], touched)
+        # A copy that kept its source's older time claims a moment the stats still matched.
+        with open(fixed, "w", encoding="utf-8") as stream:
+            stream.write("value = 9" + chr(10))
+        kept_time = float(touched["content_stats_at"]) - 30
+        os.utime(fixed, (kept_time, kept_time))
+        noticed = time.time()
+        copied, copied_added = gate.unmeasured_change(touched, noticed)
+        check("a change whose time predates the last match is anchored when it is noticed",
+              copied_added is not None and copied_added["ts"] == noticed, copied)
+        os.remove(fixed)
+        gone_at = time.time() + 1
+        removed, removed_added = gate.unmeasured_change(copied, gone_at)
+        check("a file that is gone anchors at the moment it was noticed",
+              removed_added is not None and removed_added["ts"] == gone_at, removed)
+        with open(fixed, "w", encoding="utf-8") as stream:
+            stream.write("value = 3" + chr(10))
+        run(STOP_HOOK, {"session_id": sid, "last_assistant_message": "done"})
+        kept = cwg.read_json(marker) or {}
+        check("the Stop hook keeps the catch-up in the marker",
+              ((kept.get("content_marks") or [{}])[-1].get("cause") or {}).get("reason") == gate.UNMEASURED_REASON
+              and kept.get("content_stats", {}).get(target), kept)
+        check("a marker from before the stats were kept is left alone",
+              gate.unmeasured_change(dict(kept, content_stats=None), time.time()) is None)
+    finally:
+        cleanup(sid)
+
+# Under a deadline a hash that did not come back is unknown, not a divergence (G6 review N1).
+with tempfile.TemporaryDirectory(prefix="cwg_hash_deadline_") as repo:
+    candidate_repo(repo, "hash-deadline")
+    source = os.path.join(repo, "src")
+    real_text = cwg.git_text
+    cwg.git_text = lambda where, arguments, timeout, stdin=None: (
+        None if arguments[:1] == ["hash-object"] else real_text(where, arguments, timeout, stdin))
+    try:
+        bounded = marker_hook.staged_divergences(source, ["seed.py"], deadline=time.monotonic() + 30)
+        unbounded = marker_hook.staged_divergences(source, ["seed.py"])
+    finally:
+        cwg.git_text = real_text
+    check("a hash that fails under a deadline leaves the answer unknown, while without one it still gives one",
+          bounded is None and unbounded is not None, (bounded, unbounded))
+
+for raw, expected in (("7", 7.0), ("abc", 3.5), ("-1", 3.5), ("", 3.5)):
+    os.environ["CWG_TEST_BUDGET"] = raw
+    check("a budget override of {!r} reads as {}".format(raw, expected),
+          marker_hook.budget_override("CWG_TEST_BUDGET", 3.5) == expected)
+del os.environ["CWG_TEST_BUDGET"]
+
+chain = {"content_marks": [{"ts": 100.0, "fp": "A"}, {"ts": 200.0, "fp": "B", "merge": "A"}]}
+check("a clean merge carries the verdict that covered what it merged",
+      gate.covered_contents(chain, 150.0) == {"A", "B"} and gate.content_covers(chain, 150.0, 250.0), chain)
+edited = {"content_marks": [{"ts": 100.0, "fp": "A"}, {"ts": 150.0, "fp": "E"},
+                            {"ts": 200.0, "fp": "B", "merge": "E"}]}
+check("a merge of content no verdict covered carries nothing", not gate.content_covers(edited, 120.0, 250.0), edited)
+later = {"content_marks": chain["content_marks"] + [{"ts": 300.0, "fp": "C"}]}
+check("an edit after a carried merge retires the verdict", not gate.content_covers(later, 150.0, 350.0), later)
+reverted = {"content_marks": later["content_marks"] + [{"ts": 400.0, "fp": "B"}]}
+check("and undoing that edit brings it back", gate.content_covers(reverted, 150.0, 450.0), reverted)
+unmeasured = {"content_marks": [{"ts": 200.0, "fp": "B", "merge": "A"}]}
+check("a merge mark covers nothing for a verdict that no measurement precedes",
+      gate.covered_contents(unmeasured, 150.0) == set() and not gate.content_covers(unmeasured, 150.0, 250.0),
+      unmeasured)
+barriers = gate.approval_barriers(later, {"ordinary_reviews": [(150.0, "APPROVED")]}, marker_hook.clock)
+check("the block names the edit after the merge, not the merge",
+      "changed at {}".format(marker_hook.clock(300.0)) in barriers, barriers)
+
+# --- a barrier whose pre-command snapshot never arrived says so (report e09cd889)
+check("a barrier without a pre-command snapshot says so",
+      "no snapshot from before it" in gate.describe_mark(
+          {"ts": 100.0, "cause": {"reason": "unresolved-write-capable", "command": "glab", "no_snapshot": True}},
+          marker_hook.clock))
+with tempfile.TemporaryDirectory(prefix="cwg_no_snapshot_") as repo:
+    candidate_repo(repo, "no-snapshot")
+    sid = session()
+    try:
+        mark_edit(sid, repo, "src/candidate.py", "value = 7")
+        run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                        "tool_use_id": "shell-{}".format(uuid.uuid4().hex), "cwd": repo,
+                        "tool_input": {"command": "glab api projects | python -c 'print(1)'"}})
+        entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+        cause = (entry.get("content_marks") or [{}])[-1].get("cause") or {}
+        check("a command whose PreToolUse hook left no snapshot is marked so",
+              cause.get("no_snapshot") is True and cause.get("reason") == "unresolved-write-capable", entry)
+    finally:
+        cleanup(sid)
+
+
+# --- closing survives a hook killed part-way through it (report 267de208)
+class Killed(Exception):
+    pass
+
+
+sid = session()
+try:
+    marker, state_file = gate_paths(sid)
+    seed(sid, ["C:/repo/src/auth.py"])
+    blocked = {"candidate_key": "k", "blocks": 1, "block_nonce": "n1", "last_block_ts": 1.0,
+               "last_block_reason": "HIGH candidate lacks a current APPROVED verdict"}
+    check("seed block state", cwg.write_json(state_file, blocked))
+    receipt = ("anomaly-reported", "abcdef12; the approval is current", None)
+    real_remove, real_write = cwg.remove, cwg.write_json
+    cwg.remove = lambda path: False if path == marker else real_remove(path)
+    cwg.write_json = lambda path, data: False if path == marker else real_write(path, data)
+    try:
+        closed = gate.close_cycle(marker, state_file, dict(blocked), 110.0, receipt, cwg.session_key(sid))
+    finally:
+        cwg.remove, cwg.write_json = real_remove, real_write
+    check("a marker that cannot be retired leaves the block on record for the same receipt",
+          not closed and os.path.exists(marker) and cwg.read_json(state_file) == blocked,
+          cwg.read_json(state_file))
+
+    def killed(_):
+        raise Killed()
+    real_retire = cwg.retire_claims
+    cwg.retire_claims = killed
+    try:
+        gate.close_cycle(marker, state_file, dict(blocked), 110.0, receipt, cwg.session_key(sid))
+    except Killed:
+        pass
+    finally:
+        cwg.retire_claims = real_retire
+    check("a hook killed while sweeping has already retired the candidate",
+          not os.path.exists(marker) and (cwg.read_json(state_file) or {}).get("blocks") == 0,
+          cwg.read_json(state_file))
 finally:
     cleanup(sid)
 
