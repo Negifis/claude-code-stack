@@ -30,9 +30,12 @@ Raw arguments: $ARGUMENTS
 
 ## 2. Launch one read-only reviewer
 
-Use one adversarial-reviewer agent with `run_in_background: false` set explicitly. Do not launch
-a panel. Every verdict-bearing call must return as a foreground tool result so the finite Stop
-gate can bind it to the candidate across Claude Code versions.
+Use one adversarial-reviewer agent, in the foreground (`run_in_background: false` set
+explicitly) or launched into the background (`run_in_background: true`: the turn ends and the
+completion notification resumes the work; never poll it). Do not launch a panel. The finite Stop
+gate reads the verdict from the foreground tool result or from the result the completion
+notification carries; a background verdict is filed at the launch, so a lasting edit after the
+launch expires it.
 
 The task packet must contain:
 
@@ -50,7 +53,8 @@ acceptance-criterion violations block unless the user set a lower threshold.
 
 ## 3. Return every result to the canonical state machine
 
-After each foreground result, return control to `development-verification`; do not reproduce or
+After each result — a foreground return or a completion notification — return control to
+`development-verification`; do not reproduce or
 reinterpret its severity threshold, round cap, transitions, autonomous closure, authority
 boundary, or terminal states here.
 

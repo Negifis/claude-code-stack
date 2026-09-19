@@ -23,27 +23,51 @@ python "C:\Users\in\.claude\hooks\codex_lane.py" check
 `CODEX_LANE: available` — continue below. `CODEX_LANE: unavailable until …` — the CLI itself
 refused an earlier launch (usage limit, model at capacity) and named when to retry; do not
 launch Codex for this round, hand the round to `/adversarial-review-internal` at once and say
-that the native engine reviewed because Codex is out until that time. The record is written by
-the PostToolUse hook from the CLI's own error text and expires on its own. In August 2026, 132
+that the native engine reviewed because Codex is out until that time. The record is written from
+the CLI's own error text — by the PostToolUse hook for a foreground call, by the Stop hook at a
+background lane's notification — and expires on its own. In August 2026, 132
 of 222 Codex review launches returned no verdict, most of them for exactly these two reasons,
 and every one of them cost the parent several full-context turns before the native lane ran
 anyway.
 
-Run Codex in the foreground so its verdict is observable: the review reaches the transcript as
-the result of the call, and a detached run leaves only a launch acknowledgement — as does
-retrieving a finished job, which reviewed a candidate the gate cannot see. Carry the literal
-marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is how a review that ran but could
-not be attributed still counts as an unresolved lane instead of vanishing, and it keeps unrelated
-command output out of the ledger. The result must end with its `VERDICT:` line; require that
-verdict in the packet and return the output verbatim.
+Launch Codex as a background shell call (`run_in_background: true`) and end the turn. A review
+takes ten to forty minutes, longer than a foreground Bash call may run (the harness moves the
+call to the background at its timeout anyway), and the gate judges a backgrounded lane from
+what the harness records for it: the launch acknowledgement names the task id and the output
+file, the completion notification (`<task-notification>` carrying that task id) resumes the
+work, and the Stop hook then reads the verdict from the rollout log Codex wrote between the
+launch and the notification — exactly one briefed session may speak in that window; the output
+file is for you to read, not evidence. So do not poll: no `sleep`/`tail` loops on the
+stderr capture, no `Monitor`, no `TaskOutput` — each poll is a full-context request that buys
+nothing, and the Stop hook lets a turn end while this session's own review is still running.
+Read the output file and `codex-<id>.err` only after the notification, to report the findings.
+Launch the review last: the verdict is filed at the launch, because the packet froze the
+candidate then, so an edit to a lasting file after the launch expires it exactly as it would a
+foreground verdict — measured by content, so an edit reverted byte for byte does not, while a
+shell change the snapshot could not attribute always does.
+Feed the packet from a file on stdin (`- < /c/tmp/codex-packet-<id>.md`), never from a heredoc:
+the marker hook keeps a copy of that file at the launch, and the Stop hook binds the verdict to
+the Codex session that was given exactly that text — which is what keeps two reviews running at
+once from different chats apart. Write the packet in its own shell call and launch Codex in
+the next one: the copy is taken before the launch command runs, so a packet composed by the
+same command as the launch is not there yet and the verdict binds nothing. The packet path may
+use a variable assigned in the same command (`REVIEW_ID=… ; … < /c/tmp/codex-packet-${REVIEW_ID}.md`);
+a variable nothing assigns, `codex --profile x exec`, or `bash -c "codex exec …"` leave the
+launch unrecognizable and it binds nothing.
+Carry the literal marker `CODE_WORK_GATE_REVIEW` in the actual shell command: it is what makes
+the launch a review lane rather than an errand, so a review that ran but could not be
+attributed still counts as an unresolved lane instead of vanishing. The result must end with
+its `VERDICT:` line; require that verdict in the packet.
 
-The verdict counts because Codex's own session log shows it saying that text while the call was
-open. So return the review as Codex printed it — summarizing or trimming it in the same call
-leaves nothing the log can vouch for — and let a review that ran but could not be attributed
-stand as an unresolved lane rather than restating its verdict yourself.
+The verdict is what Codex's own session log shows it saying between the launch and the
+notification, and only when one briefed session spoke in that window: a second review run
+alongside makes the round ambiguous and binds nothing, and a review that ran but could not be
+attributed stands as an unresolved lane rather than being restated by you. `TaskStop` on the task, or a `failed` notification, is failed lane activity
+for this candidate: it reopens an earlier approval and counts toward draft-blocked.
 
 When the user explicitly requires cross-engine evidence, `--required` is mandatory: include the
-literal marker `CODE_WORK_GATE_REQUIRED` in the actual foreground shell command, which binds
+literal marker `CODE_WORK_GATE_REQUIRED` in the actual shell command (the same background
+launch), which binds
 this exact result to the candidate. A required call that answers without a verdict counts as an
 unavailable reviewer and ends the work draft-blocked rather than falling back to the native
 lane. Never use the marker for an ordinary round.
@@ -60,6 +84,9 @@ So launch the lane with the user configuration ignored and only what a reviewer 
 on. Session logging is unaffected: rollouts still land in `CODEX_HOME/sessions`, which is what
 the gate binds the verdict to.
 
+Run it with `run_in_background: true`; `timeout 3600` stays as the hard cap on a hung run, well
+inside the two hours after which the gate stops treating the task as in flight.
+
 ```bash
 timeout 3600 codex exec --ignore-user-config \
   --disable plugins --disable hooks --disable memories \
@@ -72,8 +99,8 @@ timeout 3600 codex exec --ignore-user-config \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
 
-No `--json` here, and that is the load-bearing part: the gate reads the last line of what the
-call returned, so the result has to *be* the review. With the hooks disabled nothing appends a
+No `--json` here: plain mode leaves the output file readable as the review itself, which is
+what you report from, and it is what a foreground result would have to be. With the hooks disabled nothing appends a
 trailer and plain mode prints the final message alone — verified: a lean run asked for two lines
 returned exactly those two, the verdict last. A JSONL stream ends in `turn.completed` instead,
 which parses as malformed however good the review was. Keep stderr aside for diagnostics; the
@@ -82,7 +109,7 @@ which parses as malformed however good the review was. Keep stderr aside for dia
 `REVIEW_ID` is the id minted for this gate invocation, and the packet is the file written for
 this round — one packet per round, overwritten on a resume. Plain mode prints no session id, so
 capture it from the log the round itself wrote: list the `rollout-*.jsonl` names before
-launching, list them again when the call returns, and take the difference. Exactly one new file
+launching, list them again when the notification arrives, and take the difference. Exactly one new file
 is the round's own session, and its name carries the id to resume. Anything else — none, or
 several because another Codex session ran alongside — means the id is unknown, and the delta
 round then starts a fresh review with the whole packet rather than resuming a stranger's thread.

@@ -59,10 +59,15 @@ the evidence.
 
 ## Bounded wait
 
-When a result is required, wait once for up to ten minutes. If it is still running, send one
-focused status/follow-up request and wait once more only when no useful local work remains.
+A lane still running when no useful local work remains is not waited on by polling: end the
+turn, and its completion notification resumes the work with the result. `sleep`/`tail` loops,
+`Monitor` and `TaskOutput` are each a full-context request that buys nothing; the Stop hook
+lets a turn end while this session's own background task is in flight (at most eight such
+stops per candidate, two hours per task). Send one focused follow-up only when the lane asked
+a question.
 
-If the lane is still unavailable, do not recreate it or wait indefinitely:
+If the lane died — a `failed` notification, a stop, or no notification within the wait limit —
+do not recreate it or wait indefinitely:
 
 - for optional work, skip it and state the limitation;
 - for a required high-risk review, record REVIEW_UNAVAILABLE and enter the autonomous closure
