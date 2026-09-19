@@ -270,6 +270,10 @@ The global instructions grant publication authority after `ESCALATE` or
 
 ## 9. Terminal receipt for the finite Stop hook
 
+Before the receipt, record what the work confirmed that a later session would otherwise
+rediscover — a root cause, an accepted decision, a constraint, a verified command — with
+`nlm-memory remember` (`project-memory` says what qualifies); routine work records nothing.
+
 End implementation work with exactly one factual receipt as the final non-empty line:
 
 ```

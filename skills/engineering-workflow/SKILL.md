@@ -41,12 +41,13 @@ Before adding new logic, search for existing helpers, patterns, tests, types, sc
 
 For code changes:
 
-1. Inspect enough context before editing: relevant files, tests, configs, docs, and similar implementations. Start structural discovery with `codebase-memory-mcp` graph tools (`get_architecture`, `search_graph`, `trace_path`, `get_code_snippet`, `detect_changes`) rather than a broad manual scan; use `Read`/`Grep`/`Glob` for exact detail, text/config content, unindexed files, or when the graph is unavailable/stale.
+1. Inspect enough context before editing: relevant files, tests, configs, docs, and similar implementations. Start structural discovery with `codebase-memory-mcp` graph tools (`get_architecture`, `search_graph`, `trace_path`, `get_code_snippet`, `detect_changes`) rather than a broad manual scan; use `Read`/`Grep`/`Glob` for exact detail, text/config content, unindexed files, or when the graph is unavailable/stale. Recall the decisions and constraints recorded for the area with `nlm-memory recall` before designing the change.
 2. For complex tasks, maintain a concise plan and update it as work progresses.
 3. Batch related edits logically.
 4. Implement the smallest responsible fix at the owning layer.
 5. Add or update tests when behavior changes or the bug could regress.
 6. Run narrow checks first, then broader checks when warranted.
+7. Record an accepted design decision or a discovered constraint with `nlm-memory remember` when it is confirmed (see `project-memory`).
 
 ## Tooling
 

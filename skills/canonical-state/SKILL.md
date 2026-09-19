@@ -56,7 +56,8 @@ subagent's conclusion → the stored checkpoint.
 ## Phases
 
 1. **Intent normalization** — what is being asked, right now.
-2. **Evidence collection** — only the facts the next action needs.
+2. **Evidence collection** — only the facts the next action needs. After compaction or a resume,
+   `nlm-memory recall` the area first: an earlier session may already have settled it.
 3. **Execution** — real changes to real files.
 4. **Verification** — against the acceptance criteria.
 5. **Finalization** — the clean result, no internal history.

@@ -109,9 +109,12 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
 
 # Memory and Configuration
 
-- NotebookLM is durable project memory, never the source of truth for current code; follow
-  `~/.claude/reference/notebooklm-memory.md` when prior decisions could change a non-trivial
-  task. Repository state and the user's latest instruction win over it. Never store secrets.
+- Durable memory is NotebookLM, read through a local mirror. Recall before you research,
+  diagnose a failure or decide where history exists — `nlm-memory recall "<question>"` answers
+  in under a second, `--deep` asks the notebook — and record a confirmed root cause, decision,
+  constraint or command when it is confirmed with `nlm-memory remember`; the `project-memory`
+  skill says what qualifies. Memory is evidence, never the source of truth for current code:
+  repository state and the user's latest instruction win. Never store secrets.
 - Before changing anything under `~/.claude`, read `~/.claude/reference/environment.md`.
   Deterministic hooks carry objective facts, skills carry judgment; hooks from every active
   scope are additive, so a project hook never duplicates the global gate.

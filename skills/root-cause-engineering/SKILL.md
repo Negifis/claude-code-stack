@@ -9,6 +9,7 @@ For bugs, flaky behavior, broken tests, regressions, unclear failures, or perfor
 
 1. Reproduce or characterize the failure.
    - Capture the exact command, error, observed behavior, and expected behavior.
+   - Recall first: `nlm-memory recall "<error text or symptom>"`. A recorded GOTCHA may already name the cause, and the lookup takes a second.
    - Do not edit before understanding the failure boundary unless the cause is obvious.
 
 2. Identify ownership.
@@ -31,5 +32,6 @@ For bugs, flaky behavior, broken tests, regressions, unclear failures, or perfor
 6. Verify.
    - Add or update tests when behavior changes or the bug could regress.
    - Run narrow checks first, then broader checks when warranted.
+   - Record the confirmed root cause as a GOTCHA, or an open hazard as a RISK, with `nlm-memory remember` (see `project-memory`), so the next session finds it in a second.
 
 If you cannot reproduce, characterize with logs, code paths, version/config boundaries, and plausible failure invariants. Be explicit about what is confirmed versus assumed.

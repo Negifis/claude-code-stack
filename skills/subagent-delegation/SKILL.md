@@ -31,6 +31,15 @@ acceptance criteria; relevant files/evidence; explicit read/write scope and excl
 verification expected. Do not pass the conversation. The parent owns decomposition,
 requirements, integration, verification, and the final answer.
 
+Before a research or investigation lane, run `nlm-memory recall` on its question and put what
+memory holds in the packet, so the lane starts from it instead of rediscovering it.
+
+A lane that runs on `fable` also needs what Fable 5.1 does not do unprompted, unless its agent
+file already says it: that it runs autonomously and states an assumption instead of asking;
+that it requests every independent read or search in one response; and the exact shape of its
+final message, the only thing the parent sees. The reasons and the rest of the list are in
+`~/.claude/reference/model-routing.md` under Claude Fable 5.1.
+
 ## Ownership and review
 
 - One writer per file or tightly coupled scope.

@@ -17,7 +17,7 @@ template — it is a stack in daily use on Windows, published as-is.
 | Directory | What it holds |
 |---|---|
 | `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (1781 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
-| `skills/` | 16 skills for engineering workflow, verification, writing, delegation, chips and task start |
+| `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
 | `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
 | `tools/` | `worktree-audit.mjs` — parks unsaved work and prunes stale worktrees (the `Setup` maintenance hook) |
@@ -138,6 +138,7 @@ python hooks/hygiene_hooks_test.py
 | `task-start` | Starting work on a tracked issue in its own worktree, branch and named session |
 | `current-docs` | Anything version-sensitive about a library, API, framework or CLI |
 | `codebase-memory` | Structural queries — symbols, callers, call chains, change impact |
+| `project-memory` | Before research or diagnosis, recall durable memory; once a root cause, decision, constraint or command is confirmed, record it (needs the NotebookLM bridge, which is not published) |
 | `subagent-delegation` | Deciding whether a bounded lane is worth a subagent |
 | `canonical-state` | A requirement changed, a handover is coming, or the same fix failed twice |
 | `compact-instructions` | Writing or reviewing compaction and handoff summaries |
@@ -271,11 +272,14 @@ authors, and you should install them from the source:
 - Anthropic's own bundled skills — `playwright`, `webapp-testing`, `theme-factory`
 - Figma's `figma`, `figma-implement-design`, `figma-create-design-system-rules`
 
-Also left out: the NotebookLM memory bridge. `CLAUDE.md` still carries its one paragraph
-(pointing at `reference/notebooklm-memory.md`) and `reference/environment.md` still lists the
-bridge, because both files are published exactly as they run locally; neither the reference
-file nor the bridge is here, since they depend on tooling that isn't published. Delete that
-paragraph, or ignore it, if you don't run NotebookLM.
+Also left out: the NotebookLM memory bridge and its `nlm-memory` command. `CLAUDE.md`, the
+`project-memory` skill, the recall and record steps in several skills (`canonical-state`,
+`current-docs`, `engineering-workflow`, `root-cause-engineering`, `subagent-delegation`,
+`development-verification`) and `/adversarial-review-internal` call it, and
+`reference/environment.md` describes it, because those files are published exactly as they run
+locally. Neither the bridge nor its reference (`reference/notebooklm-memory.md`) is here, since
+they depend on tooling that isn't published. Without the bridge those steps have nothing to
+call: delete them, or ignore them, if you don't run NotebookLM.
 
 ---
 
