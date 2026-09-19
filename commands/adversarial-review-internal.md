@@ -73,9 +73,10 @@ The command owns only reviewer runtime continuity:
 
 ## 4. Memory and reporting
 
-NotebookLM context is optional evidence, never a prerequisite. Use injected context first; make
-at most one focused query when a prior decision could change the verdict. Persist only reusable
-terminal findings after the gate completes, best effort.
+Memory is optional evidence, never a prerequisite. Use what the hooks injected first; run at most
+one `nlm-memory recall` when a prior decision could change the verdict. After the gate completes,
+record a reusable finding — a confirmed root cause, a constraint the review established — with
+`nlm-memory remember`.
 
 Do not dump every reviewer message into the conversation. Summarize blocking findings, fixes,
 ledger dispositions, exact checks, and the terminal state. End with the receipt required by

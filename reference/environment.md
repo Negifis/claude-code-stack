@@ -24,8 +24,9 @@ auto-memory is disabled (`autoMemoryEnabled: false`) — do not read or write it
 
 ## Subagent definitions
 
-Agent frontmatter is the source of truth for that agent's default tools and model. Read
-`model-routing.md` only when a bounded lane needs an explicit override; model routing is
+Agent frontmatter is the source of truth for that agent's default `tools`, `model`, `effort` and
+`maxTurns`. Read `model-routing.md` when a bounded lane needs an explicit override, and its Claude
+Fable 5.1 section before writing the prompt of an agent that runs on `fable`; model routing is
 guidance, not a mandatory gate. Do not maintain a second roster here.
 
 Claude Code's documentation (https://code.claude.com/docs/en/sub-agents) says the next delegation
@@ -187,6 +188,19 @@ each is closed — the chips waiting for the acceptance of the session that open
 `mcp__ccd_session_mgmt__send_message` on both `PostToolUse` (`hook-notified`) and
 `PostToolUseFailure` (`hook-notify-failed`), because a parent that runs unattended refuses
 delivery outright, and a chip must not be held hostage to a send that cannot succeed.
+
+## NotebookLM memory
+
+`~/.codex/notebooklm-sync/bin/nlm_sync.py` is the bridge every agent's memory goes through; the
+machine reference is `reference/notebooklm-memory.md`, the working guidance the `project-memory`
+skill. Six registrations in `settings.json` run it, none of them touching the network:
+`SessionStart` (`hook-session-start`, the memory card), `UserPromptSubmit` (`hook-user-prompt`),
+`PreToolUse` on `^(?:WebSearch|WebFetch|Agent|Task|mcp__plugin_context7_context7__.*)$`
+(`hook-pre-tool`), `PostToolUseFailure` on `Bash|PowerShell` (`hook-tool-failure`), `Stop`
+(`hook-stop`) and `CwdChanged` (`hook-cwd-changed`); a seventh, `notebooklm_mcp_guard.py`, guards
+the MCP server. The network work runs in the Task Scheduler task `\NotebookLM\Memory maintenance`
+(`bin/install-maintenance-task.ps1`). The regression suites are
+`~/.codex/notebooklm-sync/tests/` — run with `python -m pytest -q` from that directory.
 
 ## Windows tooling
 
