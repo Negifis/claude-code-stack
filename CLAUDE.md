@@ -87,8 +87,14 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
 - Inspect the relevant files, tests, configuration, and nearby patterns before editing; fix the
   owning layer; keep edits minimal in surface but complete in responsibility; preserve
   diagnostics, public contracts, schemas, generated artifacts, and tests. No broad fallbacks,
-  silent error suppression, arbitrary retries, weakened tests, lint disabling, unsafe casts, or
-  compatibility shims unless explicitly justified.
+  silent error suppression, arbitrary retries, unsafe casts, or compatibility shims unless
+  explicitly justified.
+- Every failure a check reports — tests, e2e, lint, types, build, any other — is fixed at its
+  root, never by fitting the test or the rule to the code; first decide whether the code
+  regressed. A pre-existing or out-of-scope failure goes to a chip or a subagent; none is
+  ignored. Write a test only against behavior verified to work. Never disable a check, and
+  re-enable any found disabled — no exceptions. Procedures: `development-verification` §4,
+  `root-cause-engineering`, `engineering-workflow`.
 - Keep tool output out of context: tail or grep a log, read a fragment, filter test output to
   failures, never paste a large diff twice.
 - The worktree may be dirty: never revert unrelated user changes, and stop to ask when an

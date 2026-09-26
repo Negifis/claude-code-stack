@@ -66,19 +66,21 @@ truth is the active `~/.codex/config.toml`, its `*.config.toml` profiles and nat
 under `~/.codex/agents/`. Read the relevant settings instead of maintaining another model
 catalog in this reference.
 
-The user selects Astra for all native Codex work. The root baseline is `gpt-6-astra` with
-`medium` effort. Discovery and deterministic checks use configured `explorer`/`test_runner`
-roles at `low`, bounded implementation uses `implementer` at `medium`, and independent review
-uses `reviewer`/`adversarial-reviewer` at `high`. Higher effort is justified by a concrete
+The user selects Sol for native Codex work and keeps Luna where it was chosen: the `explorer`
+role and the `low` and `research` profiles run on `gpt-6-luna`. The root baseline is `gpt-6-sol`
+with `medium` effort. Discovery uses the configured `explorer` role, deterministic checks use
+`test_runner` at `low`, bounded implementation uses `implementer` at `medium`, and independent
+review uses `reviewer`/`adversarial-reviewer` at `high`. Higher effort is justified by a concrete
 unresolved question after collecting evidence; return to the sufficient lower effort afterward.
-Do not silently fall back to another model when Astra is unavailable.
+Do not silently fall back to another model when Sol is unavailable.
 
 Use the companion's supported `--effort high` for an independent review and its baseline for
 ordinary implementation. Verify the installed parser before using another level. The installed
 codex-plugin-cc 1.0.6 accepts flags only through `xhigh`; do not claim its flag reaches `max`
-or `ultra`. Native Codex 0.154.0 supports `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
-Its existing `deep` profile selects high and `max` selects max; the `low` profile selects low.
-Do not use `none` or `minimal` for Astra, enable Fast mode, or change billing automatically.
+or `ultra`. Native Codex 0.156.1 supports `low`, `medium`, `high`, `xhigh`, `max`, `ultra` for
+`gpt-6-sol`. Its existing `deep` profile selects high and `max` selects max; the `low` profile
+selects low. Do not use `none` or `minimal` for Sol, enable Fast mode, or change billing
+automatically.
 
 For native invocations, `codex --profile <name>` layers the matching
 `$CODEX_HOME/<name>.config.toml`. A `-c model_reasoning_effort=<level>` override applies to that
@@ -110,11 +112,12 @@ Give Codex a self-contained task:
     Expected output:
     - diff summary, files changed, commands run + results, remaining risks / skipped checks
 
-## Prompting GPT-6 Astra
+## Prompting GPT-6 (OpenAI's Astra guidance)
 
 Source: OpenAI's model guidance for GPT-6 Astra,
-https://developers.openai.com/api/docs/guides/latest-model. Five behaviours differ from Sol, and
-each has a prompt answer:
+https://developers.openai.com/api/docs/guides/latest-model. It names five behaviours in which
+Astra differs from GPT-5.6 Sol. Codex lanes run on `gpt-6-sol`, and packets still follow these
+answers: they cost nothing there and keep a packet valid if a lane runs on Astra.
 
 - **It stops to ask more often.** Where more input could change the result it asks instead of
   assuming, and in a non-interactive `codex exec` run that ends the turn without the result.
@@ -131,11 +134,13 @@ each has a prompt answer:
 - **It tests broadly.** Name the checks a change needs; a reversible, low-impact change gets no
   tests that mirror its implementation.
 
-Parameters: model `gpt-6-astra`; effort `low` to `max` (plus `ultra` in Codex), never `none` —
-keep a lane's current effort when moving it to Astra and raise it only on a measured failure;
-the model's default verbosity is `low` (the user config sets `medium`); the migration guide
-removes `temperature`, `top_p` and `top_logprobs` from requests. The installed stable Codex 0.154.0 catalog confirms Astra support; verify the actual executable used by the wrapper. The plugin's bundled `gpt-5-4-prompting`
-skill predates Astra; for Codex tasks this section wins where they differ.
+Parameters: model `gpt-6-sol`; effort `low` to `max` (plus `ultra` in Codex), never `none` —
+keep a lane's current effort when moving it to another model and raise it only on a measured
+failure; the user config sets verbosity `medium`; the migration guide removes `temperature`,
+`top_p` and `top_logprobs` from requests. Codex 0.156.1 lists `gpt-6-sol` and runs it on the
+ChatGPT account; 0.154.0 refused it, so verify the actual executable used by the wrapper. The
+plugin's bundled `gpt-5-4-prompting` skill predates GPT-6; for Codex tasks this section wins
+where they differ.
 
 ## When neither engine can run
 

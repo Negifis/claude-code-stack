@@ -20,6 +20,10 @@ such precondition and leaves HEAD, the branch and the working tree untouched.
 Fail-open by design — WorktreeRemove cannot be blocked and the removal proceeds either way —
 but never silent about it: a failure is printed and recorded in the snapshot log, because the
 one thing worse than losing the work is losing it without anyone noticing.
+
+Claude Code 2.1.236 fires WorktreeRemove only for a worktree a WorktreeCreate hook built; its
+own git worktrees it removes itself, unlinking their reparse points first, and this hook does
+not run for them. None is configured here, so the hook waits for the day one is.
 """
 import os
 import sys
@@ -178,7 +182,9 @@ def main():
     payload = hc.read_payload()
     if payload is None:
         return 0
-    path = payload.get("path") or payload.get("cwd")
+    # Claude Code sends the tree as `worktree_path`. `cwd` is the session's own directory — for a
+    # subagent's worktree, the parent's checkout — so it is never a stand-in for the tree.
+    path = payload.get("worktree_path") or payload.get("path")
     if not path:
         return 0
     try:

@@ -1,6 +1,6 @@
 ---
 name: root-cause-engineering
-description: Before editing on a bug, flaky test, regression, unclear failure, performance problem or production incident.
+description: Before editing on a bug, a failing test, lint or type check, a flaky test, a regression, an unclear failure, a performance problem or a production incident.
 ---
 
 # Root-Cause Engineering Protocol
@@ -25,12 +25,14 @@ For bugs, flaky behavior, broken tests, regressions, unclear failures, or perfor
    - Why did it happen here?
    - Why did existing tests/checks miss it?
    - What is the smallest responsible layer that should own the fix?
+   - For a failing test, lint or type check: which side is wrong, the code or the check? Decide from the requirement, the contract, the history of both sides (`git log`, `git blame`, the change that turned it red) and the code's observed behavior, never from which side is easier to change. Suspect the code first: a check that passed before and fails now has most likely caught a regression.
 
 5. Fix the cause.
    - Prefer contract, validation, data flow, lifecycle, type, schema, or state ownership fixes over local masking.
+   - Fix a regression in the code. Fix a lint or type error in the code too, unless the check's configuration is shown wrong (a wrong path, resolver, stub or version); then correct that configuration without disabling, excluding or suppressing anything. Change or remove a test only when the behavior it asserts is shown wrong, or was changed or removed on purpose, and say which in the change. Never edit an assertion, expected value, snapshot, fixture or tolerance to match what the code now produces, and never skip or suppress the check.
 
 6. Verify.
-   - Add or update tests when behavior changes or the bug could regress.
+   - Add or update tests when behavior changes or the bug could regress. A regression test fails on the unfixed code and passes on the fix: run it both ways.
    - Run narrow checks first, then broader checks when warranted.
    - Record the confirmed root cause as a GOTCHA, or an open hazard as a RISK, with `nlm-memory remember` (see `project-memory`), so the next session finds it in a second.
 

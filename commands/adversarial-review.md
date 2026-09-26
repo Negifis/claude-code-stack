@@ -55,10 +55,14 @@ use a variable assigned a literal value in the same command
 (`REVIEW_ID=r2; … < /c/tmp/codex-packet-${REVIEW_ID}.md`); a value computed at run time
 (`$(date +%s)`), a variable nothing assigns, `codex --profile x exec`, or `bash -c "codex exec …"`
 leave the launch unrecognizable and it binds nothing.
-Write the packet by its full path rather than after a `cd` into a scratch directory, and launch
-from the candidate's repository: a launch that starts outside any repository is a command the
-snapshots cannot measure, and it expires the very verdict filed at its start (report a269a6fc).
-A launch that begins with `cd <repo> &&` counts as starting in that repository. When the marker
+Write the packet by its full path rather than after a `cd` into a scratch directory, and keep the
+launch command to the launch alone: `REVIEW_ID=<literal>`, at most a `cd`, and the `codex exec`
+below as it stands — bare `codex`, only the options shown, its packet on stdin and its stderr in
+`/c/tmp`, joined by `;`, `&&` or a newline. Such a command writes nothing the candidate holds and
+expires no verdict wherever it starts, so a candidate with no repository keeps its verdict too
+(reports a269a6fc, a5767180). Anything else in it — a write, a pipe onward, another program or
+option, a variable Codex reads — makes it an ordinary command, and one that starts outside any
+repository then expires the very verdict filed at its start. When the marker
 hook left no copy of the packet, the Stop hook reads the file itself, but only while nothing has
 written it since the launch — a round without a copy binds nothing once the next round
 overwrites its file.
@@ -102,7 +106,7 @@ timeout 3600 codex exec --ignore-user-config \
   --disable computer_use --disable browser_use --disable browser_use_external \
   --disable image_generation --disable apps --disable in_app_browser \
   --disable skill_search --disable tool_suggest \
-  -m gpt-6-astra -c model_reasoning_effort=high -c tools.web_search=true \
+  -m gpt-6-sol -c model_reasoning_effort=high -c tools.web_search=true \
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
@@ -125,8 +129,9 @@ Compare the sets, never the timestamps: those names are truncated to whole secon
 concurrent session can look newer than the round that actually ran. `--last` is only for the
 case where nothing else on the machine could have started a session in between.
 
-The model is `gpt-6-astra`, which an older CLI refuses with `requires a newer version of Codex`
-(the verified versions are in `reference/codex-routing.md`). That refusal is recorded as an
+The model is `gpt-6-sol`, which an older CLI refuses with `requires a newer version of Codex`
+or, as 0.154.0 did, with `is not supported when using Codex with a ChatGPT account` (the
+verified versions are in `reference/codex-routing.md`). Either refusal is recorded as an
 outage like a usage limit. The fix is `npm install -g @openai/codex@latest` followed by
 `python ~/.claude/hooks/codex_lane.py clear`, which lifts the recorded outage at once; never an
 older model in this command.
@@ -138,10 +143,12 @@ the multi-agent feature stay listed because only one is live in this build and d
 
 Shell and web search both survive this — verified by a probe that read a local file and searched
 the web in one lean turn. Delta rounds repeat the same flags on `codex exec resume`, since they
-are per-invocation and `--ignore-user-config` does not disturb the stored session. Reasoning
+are per-invocation and `--ignore-user-config` does not disturb the stored session; the session id
+may stand right after `resume` or after the options, and either spelling is still a pure launch
+that expires no verdict. Reasoning
 effort is `high` for every round: `xhigh` round-1 runs were the ones that exhausted the Codex
 usage window in August 2026 and turned the lane into a fallback to the native reviewer, and
-OpenAI's migration guidance for Astra is to keep a lane's effective effort rather than retune it
+OpenAI's GPT-6 migration guidance is to keep a lane's effective effort rather than retune it
 with the model; `reviewer.toml` on the Codex side runs the same role at `high`.
 
 Four residuals worth knowing. Skills are discovered from `CODEX_HOME/skills` rather than from
@@ -174,8 +181,9 @@ check results. Give Codex a self-contained read-only packet with:
 - remediation delta and affected interfaces on later rounds;
 - severity bar and the required final verdict.
 
-GPT-6 Astra asks instead of assuming when it sees room for interpretation, and it weighs
-instructions from skills and `AGENTS.md` more heavily than earlier models; in a non-interactive
+GPT-6 models may ask instead of assuming when they see room for interpretation (OpenAI documents
+this for Astra), and they weigh instructions from skills and `AGENTS.md` more heavily than earlier
+models; in a non-interactive
 run a question is a round without a verdict. So every packet also says, plainly: the review is
 fully authorized read-only work that ends with its verdict line and never with a question; this
 packet and the role outrank skills and the global `AGENTS.md` for this lane, so no skill's

@@ -647,6 +647,52 @@ def test_a_spawn_that_never_lands_is_cleaned_up(root):
     check("and no branch", branches == "", branches)
 
 
+def make_junction(target, link):
+    """A directory junction on Windows, a directory symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(target, link)
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def refused_chip_with_a_junction(root, name, extra=None):
+    """A chip whose spawn was refused after its tree got an ignored `node_modules` junction to a
+    directory outside it; returns the tree and the file the junction leads to."""
+    repo = make_repo(root, name + "-repo")
+    with open(os.path.join(repo, ".git", "info", "exclude"), "a", encoding="utf-8") as handle:
+        handle.write("node_modules\n")
+    shared = os.path.join(root, name + "-shared", "pkg")
+    os.makedirs(shared)
+    kept = os.path.join(shared, "index.js")
+    with open(kept, "w", encoding="utf-8") as handle:
+        handle.write("module.exports = 1;\n")
+    _, out = spawn(repo, session="transcript-" + name, tool_use_id="toolu_" + name, land=False)
+    worktree = out["hookSpecificOutput"]["updatedInput"]["cwd"]
+    make_junction(os.path.dirname(shared), os.path.join(worktree, "node_modules"))
+    if extra:
+        write(worktree, extra, "work in progress\n")
+    spawn_failed(repo, "toolu_" + name, session="transcript-" + name)
+    return worktree, kept
+
+
+def test_a_refused_spawn_never_reaches_through_a_junction(root):
+    """Git for Windows walks into a junction when it removes a tree and deletes what it points at
+    (2026-09-19): discarding a chip must take the link, never the target's contents."""
+    worktree, kept = refused_chip_with_a_junction(root, "junction")
+    check("the refused chip's tree is gone", not os.path.isdir(worktree), worktree)
+    check("the directory its junction led to is intact", os.path.isfile(kept), kept)
+
+
+def test_a_refused_spawn_holding_work_keeps_its_links(root):
+    """A tree git will not remove keeps everything, its links included."""
+    worktree, kept = refused_chip_with_a_junction(root, "junction-busy", extra="work.txt")
+    check("a tree holding work stays", os.path.isdir(worktree), worktree)
+    check("with its junction still in place",
+          os.path.isfile(os.path.join(worktree, "node_modules", "pkg", "index.js")))
+    check("and the target intact", os.path.isfile(kept), kept)
+
+
 def test_a_repository_with_no_commits_still_gets_a_way_back(root):
     fresh = os.path.join(root, "unborn-repo")
     os.makedirs(fresh)
@@ -1499,6 +1545,8 @@ def main():
             test_spawn_hook_does_not_register_twice,
             test_a_prompt_quoting_the_heading_is_still_registered,
             test_a_spawn_that_never_lands_is_cleaned_up,
+            test_a_refused_spawn_never_reaches_through_a_junction,
+            test_a_refused_spawn_holding_work_keeps_its_links,
             test_a_repository_with_no_commits_still_gets_a_way_back,
             test_an_explicit_subdirectory_is_preserved,
             test_spawn_outside_a_repository_still_gets_a_way_back,

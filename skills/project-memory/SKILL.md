@@ -5,9 +5,10 @@ description: Recall durable memory before researching, diagnosing a failure or d
 
 # Project Memory
 
-Durable memory lives in NotebookLM and is shared by Claude Code, Codex and Antigravity. A local
-mirror answers a lookup in under a second, so recalling costs less than rediscovering: check memory
-first whenever the question may already have been answered in an earlier session.
+Durable memory lives in NotebookLM and is shared by Claude Code, Codex and Antigravity. Recall asks
+the notebooks your question and returns their grounded, cited answer beside the matching local
+entries, so recalling costs less than rediscovering: check memory first whenever the question may
+already have been answered in an earlier session.
 
 ## Recall when the question arises
 
@@ -22,16 +23,21 @@ Recall before you:
 - continue after compaction, when the summary may have dropped a decision the work rests on.
 
 ```powershell
-nlm-memory recall "<question or error text>"      # local mirror, under a second
-nlm-memory recall "<question>" --deep             # also asks the notebooks: grounded, cited, ~20 s
+nlm-memory recall "<question or error text>"      # asks the project and GLOBAL notebooks, 30-60 s, never over 100 s
+nlm-memory recall "<id, command or error>" --local  # the local mirror only, under a second
 nlm-memory recall --id <id>                       # one entry in full
 nlm-memory recall "<question>" --scope project    # project | global | all (default)
 ```
 
-The fast recall matches the words of the question against entries, notes and migrated memory; use
-`--deep` for "why" and history questions that need synthesis across sources. A recalled entry is
-evidence with a date, not a fact about current code: check the repository before relying on it, and
-say when memory and the repository disagree.
+Ask a real question — why, how, what was decided, what broke last time — and NotebookLM answers it
+from every source it holds, citing them; the local entries listed under the answer carry ids to open
+in full. `--local` suits an exact identifier, a command or an error string, where a keyword match is
+enough. Give the call up to two minutes in a shell tool. A notebook that cannot answer — an expired
+sign-in, which the maintenance run or `nlm-memory relogin` renews, or no answer within the budget —
+is named as such, and the rest still prints. A recalled entry is evidence with a date,
+not a fact about current code: check the repository before relying on it, and say when memory and
+the repository disagree. The notebook's answer is a synthesis and can repeat a rule a later entry
+replaced; when it disagrees with a dated entry, the entry wins.
 
 The hooks recall on their own where they can: the session opens with a memory card, and a prompt, a
 web search, a docs lookup or a failed command that matches memory brings the matching entries into
@@ -56,6 +62,19 @@ nlm-memory remember --type GOTCHA --summary "<one self-contained statement>" `
 nlm-memory remember --scope global ...            # knowledge not tied to one project
 nlm-memory remember ... --supersedes <id>         # replaces an entry that proved wrong
 ```
+
+`nlm-memory` is a cmd.exe shim, and cmd.exe parses its arguments again: `%NAME%` expands anywhere,
+and a double quote inside the text, or an argument with no space in it, leaves `&`, `|`, `<`, `>`
+and `^` open to it — the entry is cut short or a command runs. Text that carries any of them goes to
+the bridge the shim runs, with the same arguments in single quotes:
+
+```powershell
+$env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" "$HOME\.codex\notebooklm-sync\bin\nlm_sync.py" `
+  remember --type GOTCHA --summary '<statement>' --evidence '<text with "quotes" & > signs>'
+```
+
+The code-work gate reads that call as the same bookkeeping as the shim's.
 
 A good entry reads correctly on its own a month later: the summary states the fact, the rationale the
 mechanism, the evidence where to check it. One fact per entry.

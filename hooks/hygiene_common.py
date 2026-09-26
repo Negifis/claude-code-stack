@@ -10,9 +10,13 @@ a register somebody actually writes.
 Deliberately self-contained. These hooks must keep working when a neighbouring hook family
 is renamed or broken, and every one of them is fail-open: a hook that cannot do its job
 must never cost the user their session or their worktree.
+
+Run directly, `unlink-links <worktree>` strips a worktree of its directory links before a
+removal done by hand, the step `chip_handoff.py` takes before each of its own.
 """
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -235,3 +239,90 @@ def clear_tree_lock(path, session_id):
     holders = _live_holders(_load_holders(path))
     holders.pop(str(session_id), None)
     return _store_holders(path, holders)
+
+
+def directory_link(path, info):
+    """Whether an entry, by its own lstat `info`, is a link a recursive removal could walk through:
+    on Windows any directory reparse point — a junction, a directory symlink, or another kind of
+    redirection, dangling or not — read from the attributes every Python 3 reports (`is_junction`
+    exists only from 3.12, and an older interpreter would see no junctions at all); elsewhere a
+    symlink to a directory."""
+    if os.name == "nt":
+        attributes = info.st_file_attributes
+        return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    and attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+    return stat.S_ISLNK(info.st_mode) and os.path.isdir(path)
+
+
+def unlink_directory_links(root):
+    """Remove every directory link under a tree that is about to be removed — the link, never what
+    it points at — without entering any of them. Returns (removed, failed); the tree is safe to
+    remove only when `failed` is empty.
+
+    Git for Windows walks into a live junction when `git worktree remove` deletes a tree and
+    deletes the target's contents: on 2026-09-19 removing one worktree emptied a live session's
+    tree through its `node_modules` junction. Claude Code unlinks reparse points before removing
+    a worktree itself; everything here that removes one does the same first. A root that is
+    itself a link is refused, not entered, and a reparse point that is a real directory refuses
+    `rmdir` and fails the tree.
+    """
+    removed, failed, pending = [], [], [root]
+    try:
+        if directory_link(root, os.lstat(root)):
+            return removed, [root]
+    except OSError:
+        return removed, [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as listing:
+                entries = list(listing)
+        except OSError:
+            failed.append(directory)
+            continue
+        for entry in entries:
+            try:
+                if directory_link(entry.path, entry.stat(follow_symlinks=False)):
+                    # RemoveDirectory drops a junction or a directory symlink, not its target.
+                    (os.rmdir if os.name == "nt" else os.unlink)(entry.path)
+                    removed.append(entry.path)
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+            except OSError:
+                failed.append(entry.path)
+    return removed, failed
+
+
+def linked_worktree(path):
+    """Whether `path` is a linked worktree — never a repository's main checkout, whose links are
+    its own business."""
+    ok, own = git(path, "rev-parse", "--path-format=absolute", "--git-dir")
+    common_ok, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return ok and common_ok and bool(own) and os.path.normcase(own) != os.path.normcase(common)
+
+
+def main(argv):
+    """`unlink-links <worktree>...` — the directory links out of worktrees about to be removed by
+    hand. Exits 1 when a tree is not a linked worktree or a link would not go, so a following
+    `&& git worktree remove` stops there."""
+    if len(argv) < 2 or argv[0] != "unlink-links":
+        print("usage: hygiene_common.py unlink-links <worktree>...", file=sys.stderr)
+        return 2
+    status = 0
+    for tree in argv[1:]:
+        if not linked_worktree(tree):
+            print("{}: not a linked worktree, left alone".format(tree), file=sys.stderr)
+            status = 1
+            continue
+        removed, failed = unlink_directory_links(tree)
+        for path in removed:
+            print("unlinked {}".format(path))
+        for path in failed:
+            print("could not unlink or read {}".format(path), file=sys.stderr)
+        status = status or (1 if failed else 0)
+    return status
+
+
+if __name__ == "__main__":
+    configure_utf8_streams()
+    sys.exit(main(sys.argv[1:]))

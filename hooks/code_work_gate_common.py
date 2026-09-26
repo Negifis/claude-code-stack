@@ -272,15 +272,39 @@ def git_text(cwd, arguments, timeout, stdin=None):
     return result[1] if result and result[0] == 0 else None
 
 
-def refs_digest(cwd, timeout=3):
-    """A digest of every ref and what it points at, or None outside a repository.
+# The literal a shell command carries to declare itself the review lane's launch.
+REVIEW_INTENT_TOKEN = "CODE_WORK_GATE_REVIEW"
 
-    A commit on a side branch, a tag, a stash, a push that moved a remote-tracking ref: each
-    changes this, while an aborted rebase or an undone edit leaves it as it was.
-    """
+
+def local_refs(listing):
+    """A `for-each-ref` listing without the remote-tracking refs — what a marker opened before
+    branches were left out of the digest holds (see `pinned_refs`)."""
+    return "".join(line for line in listing.splitlines(True) if not line.startswith("refs/remotes/"))
+
+
+# The refs other sessions and fetches move all the time: a repository's worktrees share one ref
+# store, and every other session's commit, merge or chip finish moves a branch (report 2b8bbfb1);
+# a fetch moves the remote-tracking ones (report fb6a9be6). Everything else — tags, the stash,
+# notes — stays in the digest, and a commit made here is found through the worktree's own HEAD
+# reflog instead (`code_work_gate_stop.kept_commit`).
+SHARED_REF_PREFIXES = ("refs/heads/", "refs/remotes/")
+
+
+def pinned_refs(listing):
+    """A `for-each-ref --format='%(refname) %(objectname)'` listing without branches and
+    remote-tracking refs."""
+    return "".join(line for line in listing.splitlines(True) if not line.startswith(SHARED_REF_PREFIXES))
+
+
+def refs_digest(cwd, timeout=3):
+    """A digest of every ref but the branches and remote-tracking ones, and what they point at,
+    or None outside a repository: a tag, a stash or a note made while the candidate is open
+    changes it, a branch another session moves or a fetch does not."""
     import hashlib
     listing = git_text(cwd, ["for-each-ref", "--format=%(refname) %(objectname)"], timeout)
-    return hashlib.sha256(listing.encode("utf-8", "replace")).hexdigest() if listing is not None else None
+    if listing is None:
+        return None
+    return hashlib.sha256(pinned_refs(listing).encode("utf-8", "replace")).hexdigest()
 
 
 def identity_root(identity):

@@ -38,8 +38,11 @@ CAPACITY_RE = re.compile(
     r"^ERR(?:OR)?:\s*(?:Selected )?model is at capacity", re.IGNORECASE | re.MULTILINE
 )
 # A model newer than the installed CLI is refused on every launch until the CLI is upgraded.
+# CLI 0.154.0 refused gpt-6-sol with the ChatGPT-account wording; 0.156.1 accepted it.
 UPGRADE_RE = re.compile(
-    r"^ERR(?:OR)?:[^\n]*requires a newer version of Codex", re.IGNORECASE | re.MULTILINE
+    r"^ERR(?:OR)?:[^\n]*(?:requires a newer version of Codex"
+    r"|model is not supported when using Codex with a ChatGPT account)",
+    re.IGNORECASE | re.MULTILINE,
 )
 # When the CLI names no retry time, this is how long a launch is not worth trying again.
 DEFAULT_OUTAGE = 30 * 60.0
