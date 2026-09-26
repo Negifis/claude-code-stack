@@ -15,10 +15,9 @@ import sys
 import tempfile
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import hygiene_common as hc  # noqa: E402
+import hygiene_common as hc
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
 FAILURES = []
 
@@ -360,13 +359,21 @@ def test_unlink_command_spares_a_main_checkout(root):
     git(repo, "worktree", "remove", "--force", wt)
 
 
+NO_OLDER_PYTHON = "skip - no Python 3.11 on PATH"
+
+
 def older_python():
-    """An interpreter on PATH older than 3.12, which has no `is_junction`, or None."""
+    """A Python 3.11 on PATH, or None.
+
+    3.11 is the oldest release the hooks support and the last one without `isjunction`. An older
+    interpreter is outside that promise (a Python 2 cannot even parse the hooks), so a failure
+    under it would say nothing about junctions.
+    """
     for name in ("python", "python3", "py"):
         found = shutil.which(name)
         if not found:
             continue
-        proc = subprocess.run([found, "-c", "import sys; print(sys.version_info < (3, 12))"],
+        proc = subprocess.run([found, "-c", "import sys; print((3, 11) <= sys.version_info < (3, 12))"],
                               capture_output=True, text=True, timeout=60)
         if proc.returncode == 0 and proc.stdout.strip() == "True":
             return found
@@ -377,7 +384,7 @@ def test_unlink_command_under_an_older_python(root):
     """The advice names a bare `python`, which may be older than 3.12; the links must still go."""
     older = older_python()
     if not older:
-        print("skip - no interpreter older than 3.12 on PATH")
+        print(NO_OLDER_PYTHON)
         return
     repo = make_repo(root, "repo-unlink-older")
     shared = os.path.join(root, "unlink-older-shared")

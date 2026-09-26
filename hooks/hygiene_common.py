@@ -246,12 +246,13 @@ def directory_link(path, info):
     on Windows any directory reparse point — a junction, a directory symlink, or another kind of
     redirection, dangling or not — read from the attributes every Python 3 reports (`is_junction`
     exists only from 3.12, and an older interpreter would see no junctions at all); elsewhere a
-    symlink to a directory."""
+    symlink to a directory, or a dangling one whatever it once named: a POSIX link records no
+    type once its target is gone, and unlinking it touches nothing behind it."""
     if os.name == "nt":
         attributes = info.st_file_attributes
         return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
                     and attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
-    return stat.S_ISLNK(info.st_mode) and os.path.isdir(path)
+    return stat.S_ISLNK(info.st_mode) and (os.path.isdir(path) or not os.path.exists(path))
 
 
 def unlink_directory_links(root):

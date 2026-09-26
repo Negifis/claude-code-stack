@@ -54,6 +54,10 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
   independent adversarial review — Codex first
   (`/adversarial-review`, after `codex_lane.py check`), the native reviewer when Codex cannot
   deliver a verdict. One engine per round, never both.
+- XHIGH is judged, never a path floor: nearly research-grade solutions, complex cryptography,
+  very fragile chains of logic, critical security. It runs the HIGH track with every lane at its
+  XHIGH level: the lenses' `-xhigh` profiles, and the XHIGH launch of `/adversarial-review`, else
+  `adversarial-reviewer-xhigh`.
 - `VERDICT: APPROVED` ends review; a new round needs a changed candidate or new evidence, and a
   clean merge or rebase of this session's own approved candidate is not re-reviewed. `ESCALATE`
   ends only the review loop; the parent continues with the skill's bounded closure and, after
@@ -61,7 +65,8 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
   branch, and open a ready or draft PR — never merge, deploy, force-push, bypass protection, or
   include unrelated user changes.
 - The Stop hook checks observable facts only (skill invoked, lane results, legal transitions,
-  a fresh approval for HIGH, a receipt), with a hard three-block cap per unchanged candidate;
+  a fresh approval for HIGH, from an XHIGH lane for XHIGH, a receipt), with a hard three-block
+  cap per unchanged candidate;
   the PostToolUse and prompt hooks name the open candidate's class and floor in advance. It
   lets a turn end while this session's own background task (a review, a suite, a server) is
   in flight: wait for the notification, never poll.

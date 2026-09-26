@@ -38,8 +38,7 @@ import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hygiene_common as hc  # noqa: E402
+import hygiene_common as hc
 
 hc.configure_utf8_streams()
 

@@ -7,11 +7,7 @@ Restricting this to the edit tools is the PostToolUse matcher's job.
 
 Fail-open: any error still lets the tool call through.
 """
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import continuity_common as cc  # noqa: E402
+import continuity_common as cc
 
 cc.configure_utf8_streams()
 

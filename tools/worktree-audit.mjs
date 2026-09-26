@@ -32,6 +32,7 @@ const SESSION_INDEX = join(homedir(), '.claude', 'state', 'session-index.jsonl')
 // a Codex config. Counting it as work would flag every tree and hide the real ones.
 const NOISE = [/^\.agents\/skills\//, /^\.codex\/config\.toml$/, /^\.rxa\//, /^\.design-sync\//];
 const NO_HOOKS_PATH = process.platform === 'win32' ? 'NUL' : '/dev/null';
+const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 
 function git(cwd, gitArgs, { allowFail = true, raw = false, env = null } = {}) {
   try {
@@ -269,7 +270,7 @@ if (stale.length) {
   // a node_modules junction. The links go first, as links; the removal runs only if they all did.
   const unlink = join(homedir(), '.claude', 'hooks', 'hygiene_common.py');
   console.log('\nStale and clean — never a plain `git worktree remove`: drop the directory links first,');
-  console.log(`  python "${unlink}" unlink-links <path> && git worktree remove <path>`);
+  console.log(`  ${PYTHON} "${unlink}" unlink-links <path> && git worktree remove <path>`);
   for (const w of stale) console.log(`  ${w.path}  [${w.branch}]  ${w.ageDays}d`);
 }
 if (gone.length) {

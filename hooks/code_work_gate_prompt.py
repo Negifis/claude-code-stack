@@ -12,11 +12,8 @@ nothing when no candidate is open, never blocks, and fails open.
 """
 import datetime
 import json
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import code_work_gate_common as cwg  # noqa: E402
+import code_work_gate_common as cwg
 
 cwg.configure_utf8_streams()
 

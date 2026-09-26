@@ -17,12 +17,9 @@ attempts in the same turn opens a fresh check, and the per-episode budget bounds
 Fail-open: malformed input, an unpersisted budget spend, or any uncaught error lets the
 session stop.
 """
-import os
 import re
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import continuity_common as cc  # noqa: E402
+import continuity_common as cc
 
 cc.configure_utf8_streams()
 

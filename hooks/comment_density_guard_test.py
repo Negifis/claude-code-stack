@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 
-HOOK = r"C:\Users\in\.claude\hooks\comment_density_guard.py"
+HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comment_density_guard.py")
 
 CHRONY_BLOAT = """# Ubuntu's default is `makestep 1 3`: step only during the first three updates, slew
 # afterwards.
@@ -354,6 +354,14 @@ def main():
         if got != want:
             ok = False
         print("{} {:24} want={:4} got={:5} {}".format(flag, name, want, got, detail))
+    # Two denials spend a file's budget. `a.py` keeps its own where case tells it from `A.py`;
+    # on Windows the two names are one file with one budget.
+    session = "budget%d" % os.getpid()
+    got = [run("Edit", name, "", NARRATION_ONELINE, session)[0] for name in ("A.py", "A.py", "a.py")]
+    want = ["deny", "deny", "pass" if os.name == "nt" else "deny"]
+    if got != want:
+        ok = False
+    print("{} {:24} want={} got={}".format("OK " if got == want else "FAIL", "budget per file", want, got))
     print("\nALL PASS" if ok else "\nFAILURES")
     return 0 if ok else 1
 

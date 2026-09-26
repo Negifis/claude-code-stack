@@ -71,10 +71,18 @@ the gate could not resolve keep it open; the block names which.
 - **STANDARD** — a bounded logic or user-visible change with limited blast radius. Run
   affected tests and static checks and one `simplify-reviewer` lane. Add independent review
   only for a concrete complexity, uncertainty, or integration risk.
-- **HIGH** — security/auth/permissions, data/schema/migrations, concurrency/distributed
-  state, public contracts, production/release, irreversible effects, or a broad
-  cross-component diff. Run affected checks, one broad final check when warranted, the three
-  simplify lenses, and one independent adversarial review.
+- **HIGH** — security, auth and permissions short of critical, data/schema/migrations,
+  concurrency/distributed state, public contracts, production/release, irreversible effects,
+  or a broad cross-component diff. Run affected checks, one broad final check when warranted,
+  the three simplify lenses, and one independent adversarial review.
+- **XHIGH** — work where a subtle error is both likely and expensive: a nearly research-grade
+  solution (a novel algorithm, a numerical or probabilistic method, a correctness argument
+  close to a proof); complex cryptography (protocols, key handling, constant-time code); a
+  change to a very fragile chain of logic (a state machine or protocol where one wrong transition
+  silently breaks a guarantee, an evidence binding such as this gate's, an invariant several
+  components rely on); critical security, where a flaw exposes
+  secrets, keys, money or every account at once. Run what HIGH runs with every lane at its
+  XHIGH level: the lenses' `-xhigh` profiles and a review from an XHIGH lane (section 6).
 
 Judge risk by blast radius, reversibility, data sensitivity, observability, and rollback — not
 line count or a sensitive-looking filename. The Stop hook enforces a lower bound on lasting
@@ -89,6 +97,11 @@ artifacts so ambiguity cannot downgrade work:
 - agent configuration that executes or grants authority — hooks, agent, command and skill
   definitions, settings and MCP wiring, `CLAUDE.md`, `AGENTS.md` — is at least HIGH. Prose
   beside it (rules, decisions, runbooks) is ordinary documentation at STANDARD.
+
+No path reaches XHIGH: it is a judgment, declared in the `verified` receipt, and the Stop hook
+then holds the candidate to the XHIGH lanes. A closure receipt (`pr-ready`, `draft-blocked`)
+states no risk, so the hook holds it to the path floor; an XHIGH candidate still owes its XHIGH
+lanes under this skill.
 
 Throwaway artifacts and unresolved shell mutations set no risk floor: they are operational work
 under section 2. Raise risk above the floor when behavior requires it; never lower it. The
@@ -135,7 +148,7 @@ so the receipt shape is never a surprise.
 ## 5. Bounded simplify
 
 Simplification applies to lasting artifacts only and never to operational work. It is
-required for STANDARD and HIGH and optional for LOW (a local pass for a concrete readability,
+required for STANDARD, HIGH and XHIGH and optional for LOW (a local pass for a concrete readability,
 reuse, control-flow, type/error, resource, or efficiency concern).
 
 - **STANDARD** — exactly one foreground `simplify-reviewer` lane (`run_in_background: false`)
@@ -144,6 +157,10 @@ reuse, control-flow, type/error, resource, or efficiency concern).
   `simplify-reuse-reviewer`, `simplify-quality-reviewer` and `simplify-efficiency-reviewer`,
   each on the same bounded scope. All three results are required; a lone `simplify-reviewer`
   does not satisfy HIGH, and the complete trio satisfies STANDARD.
+- **XHIGH** — the same three lenses from their XHIGH profiles, launched together in the
+  foreground: `simplify-reuse-reviewer-xhigh`, `simplify-quality-reviewer-xhigh` and
+  `simplify-efficiency-reviewer-xhigh`, Opus 5.5 at max effort. An XHIGH run stands in for its
+  HIGH lens; a HIGH lens never satisfies XHIGH.
 - Follow the `simplify` skill for the packet. Apply only accepted behavior-preserving findings
   and rerun affected checks.
 - Maximum two runs of any one lane per candidate: the second only as that lane's delta
@@ -155,7 +172,7 @@ reuse, control-flow, type/error, resource, or efficiency concern).
 
 ## 6. Finite independent review
 
-For HIGH risk on a lasting artifact, or when the user explicitly requests it, run exactly one
+For HIGH or XHIGH risk on a lasting artifact, or when the user explicitly requests it, run exactly one
 review lane per round, chosen in this order:
 
 1. **Codex** through `/adversarial-review`, launched into the background
@@ -170,6 +187,12 @@ review lane per round, chosen in this order:
    completion notification, when Codex is unavailable, reports an outage, fails before a
    verdict on its one allowed resume, or the user declines it. Say which engine reviewed and
    why when it was not Codex.
+
+XHIGH follows the same order at the XHIGH level: the Codex lane on `gpt-6-astra` at `ultra`
+effort (the XHIGH launch in `/adversarial-review`), else `adversarial-reviewer-xhigh` at max
+effort through `/adversarial-review-internal`. The Stop hook reads the level from the rollout
+log's record of the turn that stated the verdict, or from the reviewer profile the call named,
+never from the launch command; an approval from a HIGH lane does not close an XHIGH receipt.
 
 Both lanes satisfy the gate; neither adds an obligation to run the other, and there is no third —
 `reference/model-routing.md` records why, before anyone proposes one. Every verdict must be
@@ -320,7 +343,7 @@ rediscover — a root cause, an accepted decision, a constraint, a verified comm
 End implementation work with exactly one factual receipt as the final non-empty line:
 
 ```
-[gate] verified: <LOW|STANDARD|HIGH>; <candidate and decisive checks/review>
+[gate] verified: <LOW|STANDARD|HIGH|XHIGH>; <candidate and decisive checks/review>
 [gate] operational: <what was established before executing>; <verified effect on the system>
 [gate] no-change: <why nothing was modified>
 [gate] pr-ready: <PR URL, or branch plus exact publication handoff>

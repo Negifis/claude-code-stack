@@ -8,7 +8,7 @@ workflow that must not drift are enforced by deterministic hooks that read the s
 transcript and block the `Stop` event, while the parts that need judgment stay in skills.
 
 This repo is the enforcement half plus the skills that pair with it. It is not a starter
-template — it is a stack in daily use on Windows, published as-is.
+template — it is a stack in daily use on Windows and on a Linux execution VM, published as-is.
 
 ---
 
@@ -16,9 +16,9 @@ template — it is a stack in daily use on Windows, published as-is.
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2135 gate assertions, 70 continuity checks, 48 guard cases, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2231 gate assertions, 76 continuity checks, 49 guard checks, chip and hygiene suites) |
 | `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
-| `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — and an `Explore` profile that overrides the built-in one |
+| `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
 | `tools/` | `worktree-audit.mjs` — parks unsaved work and prunes stale worktrees (the `Setup` maintenance hook); `file-holders.ps1` — names the processes holding a file open (Windows) |
 | `reference/` | On-demand docs the model reads only when relevant — model routing, Codex routing, config layout, and the September 2026 usage optimization with its measured baseline |
@@ -45,6 +45,10 @@ transcript or don't:
   `simplify-quality-reviewer`, `simplify-efficiency-reviewer`);
 - for a high-risk candidate, an independent adversarial review produced a verdict, and that
   verdict is *newer* than the last change to a lasting artifact;
+- an XHIGH candidate — a level the `verified` receipt declares, never one a path sets — has
+  those lens results from the lenses' `-xhigh` profiles and its verdict from an XHIGH review
+  lane (`adversarial-reviewer-xhigh`, or a Codex turn the rollout log records on the XHIGH
+  model and effort);
 - the review verdict came from a session that was actually briefed with the reviewer role —
   printing the string `VERDICT: APPROVED` without running a review does not pass;
 - the candidate reached a terminal state instead of trailing off.

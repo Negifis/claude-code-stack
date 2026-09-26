@@ -111,6 +111,27 @@ timeout 3600 codex exec --ignore-user-config \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
 
+An XHIGH candidate's rounds run on the XHIGH model at its maximum effort, and a longer cap that
+still ends inside those two hours; every other flag stays as above:
+
+```bash
+timeout 7000 codex exec --ignore-user-config \
+  --disable plugins --disable hooks --disable memories \
+  --disable multi_agent --disable multi_agent_v2 \
+  --disable computer_use --disable browser_use --disable browser_use_external \
+  --disable image_generation --disable apps --disable in_app_browser \
+  --disable skill_search --disable tool_suggest \
+  -m gpt-6-astra -c model_reasoning_effort=ultra -c tools.web_search=true \
+  --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
+  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
+```
+
+The gate reads the level from the rollout log's record of the turn that stated the verdict, not
+from this command, so an XHIGH round launched on the first template does not close an XHIGH
+receipt. `gpt-6-astra` at `ultra` ran on Codex 0.156.1 with this account on 2026-09-26. When an
+XHIGH round's Astra launch fails, the round goes to `adversarial-reviewer-xhigh`, never to Sol: a
+Sol verdict cannot close an XHIGH receipt.
+
 No `--json` here: plain mode leaves the output file readable as the review itself, which is
 what you report from, and it is what a foreground result would have to be. With the hooks disabled nothing appends a
 trailer and plain mode prints the final message alone — verified: a lean run asked for two lines
@@ -129,7 +150,7 @@ Compare the sets, never the timestamps: those names are truncated to whole secon
 concurrent session can look newer than the round that actually ran. `--last` is only for the
 case where nothing else on the machine could have started a session in between.
 
-The model is `gpt-6-sol`, which an older CLI refuses with `requires a newer version of Codex`
+The model is `gpt-6-sol` (`gpt-6-astra` on an XHIGH round), which an older CLI refuses with `requires a newer version of Codex`
 or, as 0.154.0 did, with `is not supported when using Codex with a ChatGPT account` (the
 verified versions are in `reference/codex-routing.md`). Either refusal is recorded as an
 outage like a usage limit. The fix is `npm install -g @openai/codex@latest` followed by
@@ -145,11 +166,12 @@ Shell and web search both survive this — verified by a probe that read a local
 the web in one lean turn. Delta rounds repeat the same flags on `codex exec resume`, since they
 are per-invocation and `--ignore-user-config` does not disturb the stored session; the session id
 may stand right after `resume` or after the options, and either spelling is still a pure launch
-that expires no verdict. Reasoning
-effort is `high` for every round: `xhigh` round-1 runs were the ones that exhausted the Codex
-usage window in August 2026 and turned the lane into a fallback to the native reviewer, and
-OpenAI's GPT-6 migration guidance is to keep a lane's effective effort rather than retune it
-with the model; `reviewer.toml` on the Codex side runs the same role at `high`.
+that expires no verdict. Below the gate's XHIGH risk level every round runs at `high`: rounds at
+Codex's own `xhigh` effort were the ones that exhausted the usage window in August 2026 and
+turned the lane into a fallback to the native reviewer, and OpenAI's GPT-6 migration guidance is
+to keep a lane's effective effort rather than retune it with the model; `reviewer.toml` on the
+Codex side runs the same role at `high`. XHIGH rounds run at `ultra` by the user's choice,
+accepting that cost for the rare work that level covers.
 
 Four residuals worth knowing. Skills are discovered from `CODEX_HOME/skills` rather than from
 the config, so they still load and still consume their 2% budget; there is no global switch, and

@@ -17,7 +17,7 @@ call is not.
 - a focused specialist check;
 - one read-only adversarial review for high-risk work;
 - the simplify lanes `simplify` requires: one `simplify-reviewer` for STANDARD, the three lens
-  agents for HIGH — one pass, not a panel;
+  agents for HIGH, their `-xhigh` profiles for XHIGH — one pass, not a panel;
 - independent QA whose evidence can be checked by the parent.
 
 Keep small, linear, tightly coupled, destructive, sensitive, and ordinary sequential work local.

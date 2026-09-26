@@ -15,6 +15,11 @@ import tempfile
 import time
 import uuid
 
+import code_work_gate_common as cwg
+import code_work_gate_mark as marker_hook
+import code_work_gate_stop as gate
+import codex_lane
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STOP_HOOK = os.path.join(HERE, "code_work_gate_stop.py")
 # Every throwaway home below is named after this process. The suite tears these trees down and
@@ -22,6 +27,38 @@ STOP_HOOK = os.path.join(HERE, "code_work_gate_stop.py")
 # mid-scenario: that is what made the Codex-evidence cases fail intermittently whenever a second
 # run - a mutation sweep, a second terminal - happened to overlap this one.
 RUN = "gate_{}".format(os.getpid())
+# POSIX keeps the system temp directory at /tmp, which the gate reads as a drive-root temp
+# directory: a file in a subdirectory there that is no repository is a throwaway, so every
+# lasting-file fixture below would be graded as one. The suite's temp root moves under the home
+# directory, where a temp file is an ordinary file, as under Windows' AppData\Local\Temp. The hook
+# subprocesses inherit it, which also keeps their state apart from real sessions'.
+POSIX_TEMP = None
+# Where real sessions' throwaway files go, whatever this suite does with its own temp root below.
+SYSTEM_TEMP = tempfile.gettempdir()
+if os.name != "nt":
+    POSIX_TEMP = os.path.join(os.path.expanduser("~"), ".cache", RUN + "_tmp")
+    os.makedirs(POSIX_TEMP, exist_ok=True)
+    os.environ["TMPDIR"] = POSIX_TEMP
+    tempfile.tempdir = None
+# Synthetic places, as Windows spells them — a drive, Git Bash's /c/… form, the user's temp
+# directory — and what each is on POSIX. A case that passes a place through the file system, a
+# command's `cd` or a place pattern names it with `native`, so it means the same absolute place
+# on both platforms.
+NATIVE_SPELLINGS = (
+    ("C:/Users/in/AppData/Local/Temp", "/tmp"),
+    ("/c/Users/in", "/home/in"), ("C:/Users/in", "/home/in"), ("c:/users/in", "/home/in"),
+    ("/c/tmp", "/tmp"), ("C:/tmp", "/tmp"), ("c:/tmp", "/tmp"),
+    ("C:/repo", "/repo"), ("c:/repo", "/repo"),
+)
+
+
+def native(text):
+    """`text` with each synthetic Windows place spelled as this platform spells it."""
+    if os.name == "nt":
+        return text
+    for windows, posix in NATIVE_SPELLINGS:
+        text = text.replace(windows, posix)
+    return text
 # The hook reads the Codex CLI's rollout logs as proof a review actually ran; point both the
 # suite and the hook subprocesses at a throwaway home so the developer's real one is untouched.
 CODEX_HOME = os.path.join(tempfile.gettempdir(), RUN + "_codex_home")
@@ -50,8 +87,9 @@ def _discard_fixtures():
     naming a temp directory, and a real session resolving a path under that directory would
     read a finished test as a live competing writer.
     """
-    for tree in (CODEX_HOME, CLAUDE_CONFIG_DIR, AGENT_HOME):
-        shutil.rmtree(tree, ignore_errors=True)
+    for tree in (CODEX_HOME, CLAUDE_CONFIG_DIR, AGENT_HOME, POSIX_TEMP):
+        if tree:
+            shutil.rmtree(tree, ignore_errors=True)
     try:
         registry = cwg.claims_root()
         for name in os.listdir(registry):
@@ -63,11 +101,7 @@ def _discard_fixtures():
 
 atexit.register(_discard_fixtures)
 
-sys.path.insert(0, HERE)
-import code_work_gate_common as cwg  # noqa: E402
-import code_work_gate_mark as marker_hook  # noqa: E402
 mark = marker_hook
-import code_work_gate_stop as gate  # noqa: E402
 
 PASSED = 0
 
@@ -182,13 +216,15 @@ def skill_use(stamp, name, call_id):
     }])
 
 
-def agent_use(stamp, subtype, call_id, run_in_background=False):
+def agent_use(stamp, subtype, call_id, run_in_background=False, model=None):
     payload = {
         "subagent_type": subtype,
         "prompt": "bounded packet",
     }
     if run_in_background is not None:
         payload["run_in_background"] = run_in_background
+    if model:
+        payload["model"] = model
     return entry(stamp, "assistant", [{
         "type": "tool_use",
         "id": call_id,
@@ -232,7 +268,6 @@ def write_transcript(events):
 SIMPLIFY_LENSES = list(gate.SIMPLIFY_LENSES)
 SIMPLIFY_LANE_ONLY = [gate.SIMPLIFY_LANE]
 PROMPT_HOOK = os.path.join(HERE, "code_work_gate_prompt.py")
-import codex_lane  # noqa: E402
 
 
 def simplify_wave(events, stamp, prefix, subtypes):
@@ -244,21 +279,22 @@ def simplify_wave(events, stamp, prefix, subtypes):
     return stamp
 
 
-def base_events(include_simplify=False):
+def base_events(include_simplify=False, lenses=SIMPLIFY_LENSES):
     events = [skill_use(120, "development-verification", "skill-dev")]
     if include_simplify:
         events.append(skill_use(121, "simplify", "skill-simplify"))
-        simplify_wave(events, 122, "simplify", SIMPLIFY_LENSES)
+        simplify_wave(events, 122, "simplify", lenses)
     return events
 
 
-def add_review(events, stamp, call_id, result, is_error=False):
-    events.append(agent_use(stamp, "adversarial-reviewer", call_id))
+def add_review(events, stamp, call_id, result, is_error=False, subtype="adversarial-reviewer",
+               model=None):
+    events.append(agent_use(stamp, subtype, call_id, model=model))
     events.append(tool_result(stamp + 0.5, call_id, result, is_error=is_error))
 
 
 def add_codex_review(events, stamp, call_id, command, result, is_error=False,
-                     run_in_background=None, tool="Bash", codex_ran=True):
+                     run_in_background=None, tool="Bash", codex_ran=True, turn=None):
     """A shell review call, plus the rollout log the Codex CLI writes while it runs.
 
     `codex_ran=False` is the forgery case: the command printed a verdict, but no Codex process
@@ -268,7 +304,7 @@ def add_codex_review(events, stamp, call_id, command, result, is_error=False,
                            run_in_background=run_in_background, tool=tool))
     events.append(tool_result(stamp + 0.5, call_id, result, is_error=is_error))
     if codex_ran:
-        log_codex_run(stamp + 0.4, result)
+        log_codex_run(stamp + 0.4, result, turn=turn)
 
 
 CODEX_COMMAND = 'node "codex-companion.mjs" adversarial-review "--wait CODE_WORK_GATE_REVIEW"'
@@ -311,22 +347,31 @@ def codex_cli_output(text):
     )
 
 
+AGENTS_DIR = os.path.join(os.path.dirname(HERE), "agents")
+
+
+def profile_parts(name):
+    """An agent profile's front matter and body, split where the harness splits them."""
+    with open(os.path.join(AGENTS_DIR, name + ".md"), encoding="utf-8") as stream:
+        _, front, body = stream.read().split("---", 2)
+    return front, body
+
+
 def reviewer_role_text():
     """The role text a Codex review session must have been given, as the hook reads it."""
-    with open(os.path.join(os.path.dirname(HERE), "agents", "adversarial-reviewer.md"),
-              encoding="utf-8") as stream:
-        return stream.read().split("---", 2)[-1]
+    return profile_parts("adversarial-reviewer")[1]
 
 
 def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True,
                   partial_role=False, briefed_at=None, filler_bytes=0, earlier=None,
-                  packet="Round 1 packet."):
+                  packet="Round 1 packet.", turn=None):
     """One Codex rollout log in the CLI's own shape.
 
     `logged` is what the session said, and only an assistant record stamped inside the call's
     window can vouch for a result: `role` and `said_at` exist so a test can put the same text in
     the prompt the call supplied, or in the older part of a resumed session. `briefed` writes the
     reviewer role into the session's input, which is what marks it a review rather than an errand.
+    `turn` is the (model, effort) the CLI records for the turn that says `logged`.
     """
     # Discovery only looks a week back, so the folder has to be today's, not a fixed date.
     day = os.path.join(CODEX_HOME, "sessions", *time.strftime("%Y %m %d").split())
@@ -365,6 +410,11 @@ def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True
             }) + "\n"
             stream.write(line)
             written += len(line)
+        if turn:
+            stream.write(json.dumps({
+                "timestamp": iso(stamp if said_at is None else said_at), "type": "turn_context",
+                "payload": {"model": turn[0], "effort": turn[1]},
+            }) + "\n")
         stream.write(json.dumps({
             "timestamp": iso(stamp if said_at is None else said_at),
             "type": "response_item",
@@ -375,9 +425,9 @@ def log_codex_run(stamp, logged="", role="assistant", said_at=None, briefed=True
     return path
 
 
-def run(script, payload):
+def run(script, payload, python=sys.executable):
     proc = subprocess.run(
-        [sys.executable, script],
+        [python, script],
         input=json.dumps(payload),
         text=True,
         encoding="utf-8",
@@ -1093,9 +1143,10 @@ def midturn_notification(stamp, task_id, output_file, status="completed"):
     return notification_records(stamp, notification_text_for(task_id, output_file, status), midturn=True)
 
 
-def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True):
+def background_review_events(now, task_id, out_file, ack_text, notify_status="completed", notify=True,
+                             lenses=SIMPLIFY_LENSES):
     events = [skill_use(now - 890, "development-verification", "skill-dev")]
-    simplify_wave(events, now - 880, "simplify", SIMPLIFY_LENSES)
+    simplify_wave(events, now - 880, "simplify", lenses)
     events.append(bash_use(now - 700, "codex-" + task_id, CODEX_BG_COMMAND,
                            run_in_background=(True if "running in background" in ack_text else None)))
     events.append(tool_result(now - 699, "codex-" + task_id, ack_text))
@@ -1348,8 +1399,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
     finally:
         cleanup(sid, locals().get("transcript"))
 
-    # A repository that does not ignore case cannot vouch for lower-cased paths; past the path
-    # cap the marker cannot name every lasting path.
+    # A repository that does not ignore case cannot vouch for lower-cased paths, which the marker
+    # keeps only where the file system ignores case; past the path cap the marker cannot name
+    # every lasting path.
     sid = session()
     try:
         open_by_edit(sid, upper, "print('cased')" + chr(10))
@@ -1358,8 +1410,15 @@ with tempfile.TemporaryDirectory(prefix="cwg_restored_") as tree:
         transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
         subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "false"], check=False, capture_output=True)
         result = stop_with(sid, transcript, "[gate] no-change: reverted")
-        check("a repository that does not ignore case keeps the candidate open",
-              result.get("decision") == "block" and "still differs" in result["reason"], result)
+        if cwg.CASE_FOLDED_PATHS:
+            check("a repository that does not ignore case keeps the candidate open",
+                  result.get("decision") == "block" and "still differs" in result["reason"], result)
+        else:
+            check("where paths keep their case, the repository's case setting does not matter",
+                  result.get("continue") is True and "decision" not in result, result)
+            open_by_edit(sid, upper, "print('cased')" + chr(10))
+            with open(upper, "w", encoding="utf-8") as stream:
+                stream.write("print('u')" + chr(10))
         subprocess.run(["git", "-C", tree, "config", "core.ignorecase", "true"], check=False, capture_output=True)
         marker, _ = gate_paths(sid)
         data = cwg.read_json(marker) or {}
@@ -1544,7 +1603,7 @@ for label, command, name, expect_recorded in (
 
 # --- how a launch is read: any spelling of codex, one exec segment, no conditional execution
 for command, fed, tail in (
-    ("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err  # CODE_WORK_GATE_REVIEW", True, "C:/tmp/p.md"),
+    (native("timeout 3600 codex exec --ignore-user-config - < /c/tmp/p.md 2>/c/tmp/x.err  # CODE_WORK_GATE_REVIEW"), True, native("C:/tmp/p.md")),
     ('PYTHONIOENCODING=utf-8 "C:/tools/Codex.exe" exec - < "C:/tmp/q.md"', True, "C:/tmp/q.md"),
     ("CODEX EXEC - < p.md", True, "p.md"),
     ("true || codex exec - < p.md", True, ""),
@@ -1553,7 +1612,7 @@ for command, fed, tail in (
     ("codex exec - <<'PY'", False, ""),
     ("codex exec -", False, ""),
     ("cat < notes.md | grep x", True, ""),
-    ("REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err", True, "C:/tmp/codex-packet-r7.md"),
+    (native("REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err"), True, native("C:/tmp/codex-packet-r7.md")),
     ("codex exec - < /c/tmp/codex-packet-${UNSET}.md", True, ""),
 ):
     launch = marker_hook.codex_launch(command)
@@ -1567,12 +1626,12 @@ CONTINUED_LAUNCH = (
     'cd "C:/repo" && REVIEW_ID=r9 ; timeout 3600 codex exec --ignore-user-config \\' + chr(10)
     + "  --disable plugins --disable hooks \\" + chr(10)
     + "  -m gpt-6-sol -c model_reasoning_effort=high \\" + chr(10)
-    + "  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW"
+    + native("  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW")
 )
 launch = marker_hook.codex_launch(CONTINUED_LAUNCH)
 check("a launch written over continued lines still names its packet",
       launch["fed"] is True
-      and launch["path"].replace(chr(92), "/") == "C:/tmp/codex-packet-r9.md", launch)
+      and launch["path"].replace(chr(92), "/") == native("C:/tmp/codex-packet-r9.md"), launch)
 check("the redirect stays in the segment that runs codex",
       any("codex exec" in segment and "codex-packet" in segment
           for segment in marker_hook.shell_segments(CONTINUED_LAUNCH)),
@@ -1635,15 +1694,15 @@ for shell, marker in (("Bash", chr(92)), ("PowerShell", "`")):
               {"tool_name": shell, "tool_input": {"command": commented}}) is True, commented)
 check("a marker on the last line, after the trailing tag, is no continuation to undo",
       marker_hook.codex_launch(CONTINUED_LAUNCH)["path"].replace(chr(92), "/")
-      == "C:/tmp/codex-packet-r9.md")
+      == native("C:/tmp/codex-packet-r9.md"))
 # The `||` and the assignment must be read on the joined text, or a launch that may be skipped
 # binds a capture and a split assignment resolves to nothing.
 check("a || split across a continuation still hides the launch",
       marker_hook.codex_launch("true |\\" + chr(10) + "| codex exec - < p.md")["path"] == "")
 check("an assignment split across a continuation still resolves",
       marker_hook.codex_launch(
-          "REVIEW_ID=\\" + chr(10) + "r9; codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md"
-      )["path"].replace(chr(92), "/") == "C:/tmp/codex-packet-r9.md")
+          "REVIEW_ID=\\" + chr(10) + native("r9; codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md")
+      )["path"].replace(chr(92), "/") == native("C:/tmp/codex-packet-r9.md"))
 
 # --- the fingerprint: records that cannot imitate one another, existence by presence, the index included
 with tempfile.TemporaryDirectory(prefix="cwg_fp_") as tree:
@@ -2159,8 +2218,8 @@ def agent_notification(stamp, task_id, result, status="completed", midturn=False
     return notification_records(stamp, agent_notification_text(task_id, result, status), midturn)
 
 
-def add_background_review(events, stamp, call_id, agent_id):
-    events.append(agent_use(stamp, "adversarial-reviewer", call_id, run_in_background=True))
+def add_background_review(events, stamp, call_id, agent_id, subtype="adversarial-reviewer"):
+    events.append(agent_use(stamp, subtype, call_id, run_in_background=True))
     events.append(tool_result(stamp + 0.5, call_id,
                               "Async agent launched successfully. (This tool result is internal metadata.)\n"
                               "agentId: {} (internal ID - do not mention to user.)".format(agent_id)))
@@ -2786,9 +2845,9 @@ for command, expected in (
     ("git -c core.fsmonitor=./evil.sh status", True),
     ("RIPGREP_CONFIG_PATH=./evil rg foo", True),
     # A redirect into a throwaway file writes nothing lasting, in its Git Bash spelling too (dc30d302).
-    ("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/x.md", False),
-    ("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/repo/body.md", True),
-    ("gh pr edit 2 --body-file /c/tmp/x.md && gh pr view 2 --json url", False),
+    (native("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/x.md"), False),
+    (native("cd /c/tmp/repo && gh pr view 2 --json body -q .body > /c/tmp/repo/body.md"), True),
+    (native("gh pr edit 2 --body-file /c/tmp/x.md && gh pr view 2 --json url"), False),
     ("gh -R o/r pr view 2 && gh --repo=o/r api repos/o/r", False),
     ("gh pr checkout 7", True),
     ("gh --repo o/r pr checkout 7", True),
@@ -2825,6 +2884,8 @@ for command, expected in (
     ("find . -name '*.tmp' -print0 | xargs -0 rm", True),
     ("grep tee notes.txt", False),
     ("echo x > nul.txt", True),
+    # The null device only on Windows; elsewhere `nul` is a file like any other.
+    ("echo x > nul", os.name != "nt"),
     ("echo x | sudo -u root tee f.txt", True),
     ("command -v rm", False),
     ("cat x &> f.txt", True),
@@ -3014,10 +3075,14 @@ try:
     check("clearing restores the lane", codex_lane.clear_state() and codex_lane.status()[0] is True, codex_lane.status())
     check(
         "the stderr redirect of the lean command is found",
-        codex_lane.stderr_file_of("timeout 3600 codex exec --ignore-user-config - < /c/tmp/codex-packet-1.md 2>/c/tmp/codex-1.err  # CODE_WORK_GATE_REVIEW")
-        == "C:/tmp/codex-1.err",
-        codex_lane.stderr_file_of("x 2>/c/tmp/codex-1.err"),
+        codex_lane.stderr_file_of(native("timeout 3600 codex exec --ignore-user-config - < /c/tmp/codex-packet-1.md 2>/c/tmp/codex-1.err  # CODE_WORK_GATE_REVIEW"))
+        == native("C:/tmp/codex-1.err"),
+        codex_lane.stderr_file_of(native("x 2>/c/tmp/codex-1.err")),
     )
+    check("a Git Bash /c/... spelling is a drive only on Windows",
+          codex_lane.windows_path("/c/tmp/codex-1.err")
+          == ("C:/tmp/codex-1.err" if os.name == "nt" else "/c/tmp/codex-1.err"),
+          codex_lane.windows_path("/c/tmp/codex-1.err"))
     err_path = os.path.join(AGENT_HOME, "codex-probe.err")
     with open(err_path, "w", encoding="utf-8") as stream:
         stream.write("tokens used\nERROR: You've hit your usage limit. try again at 3:30 PM.\n")
@@ -3031,12 +3096,21 @@ try:
     check("an errand is ignored", codex_lane.record_from_command("git status", "You've hit your usage limit") is False, "ignored")
     check(
         "a redirect variable is resolved from the same command",
-        codex_lane.stderr_file_of('REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err')
-        == "C:/tmp/codex-r7.err",
-        codex_lane.stderr_file_of('REVIEW_ID=r7; x 2>/c/tmp/codex-${REVIEW_ID}.err'),
+        codex_lane.stderr_file_of(native('REVIEW_ID=r7; timeout 3600 codex exec - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err'))
+        == native("C:/tmp/codex-r7.err"),
+        codex_lane.stderr_file_of(native('REVIEW_ID=r7; x 2>/c/tmp/codex-${REVIEW_ID}.err')),
     )
-    capture_dir = codex_lane.CAPTURE_GLOB.rsplit("/", 1)[0]
-    os.makedirs(capture_dir, exist_ok=True)
+    # The fallback globs the review command's capture directory, C:/tmp (Git Bash's /c/tmp) or
+    # /tmp on Linux, by its absolute path, so it finds a capture whatever directory the hook runs
+    # in. Spelled apart from CAPTURE_GLOB, the check fails when the glob drifts from the command;
+    # the cases below show the fallback finding a capture in the directory its glob names.
+    check("the capture fallback looks where the review command writes its captures",
+          codex_lane.CAPTURE_GLOB == native("C:/tmp") + "/codex-*.err", codex_lane.CAPTURE_GLOB)
+    # The cases below plant refusals, which a real session's fallback would read as its own
+    # outage in the shared directory: they run in a directory of the suite's own.
+    capture_dir = tempfile.mkdtemp(prefix=RUN + "_captures_")
+    real_capture_glob = codex_lane.CAPTURE_GLOB
+    codex_lane.CAPTURE_GLOB = os.path.join(capture_dir, "codex-*.err")
     stale = os.path.join(capture_dir, "codex-gate-test-stale.err")
     fresh = os.path.join(capture_dir, "codex-gate-test-fresh.err")
     try:
@@ -3070,11 +3144,8 @@ try:
             codex_lane.status(),
         )
     finally:
-        for stray in (stale, fresh):
-            try:
-                os.remove(stray)
-            except OSError:
-                pass
+        codex_lane.CAPTURE_GLOB = real_capture_glob
+        shutil.rmtree(capture_dir, ignore_errors=True)
     codex_lane.write_state({"unavailable_until": "garbage", "reason": "x"})
     check("a corrupt record reads as available", codex_lane.status()[0] is True, codex_lane.status())
     codex_lane.clear_state()
@@ -4746,7 +4817,7 @@ def candidate_repo(directory, branch):
     commit_paths(directory, "src/seed.py", "seed")
 
 
-def mark_edit(sid, repo, relative, content="changed = True"):
+def mark_edit(sid, repo, relative, content="changed = True", python=sys.executable):
     """One gated edit reported through the marker hook, as PostToolUse delivers it."""
     target = os.path.join(repo, *relative.split("/"))
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -4758,11 +4829,11 @@ def mark_edit(sid, repo, relative, content="changed = True"):
         "tool_name": "Edit",
         "cwd": repo,
         "tool_input": {"file_path": target},
-    })
+    }, python)
     return cwg.normalize_path(target)
 
 
-def mark_shell(sid, repo, command, action=None):
+def mark_shell(sid, repo, command, action=None, python=sys.executable):
     """A mutating shell call as production delivers it: the snapshot pair around the work."""
     payload = {
         "session_id": sid,
@@ -4771,10 +4842,10 @@ def mark_shell(sid, repo, command, action=None):
         "cwd": repo,
         "tool_input": {"command": command},
     }
-    run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"))
+    run(MARK_HOOK, dict(payload, hook_event_name="PreToolUse"), python)
     if action:
         action()
-    run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"))
+    run(MARK_HOOK, dict(payload, hook_event_name="PostToolUse"), python)
 
 
 def age_marker(sid, seconds):
@@ -5166,19 +5237,19 @@ for path in (
 check("author is not auth", gate.minimum_risk(["src/author.ts"]) == "STANDARD")
 
 for path in (
-    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
-    "C:/tmp/sid/scratchpad/push.py",
+    native("C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py"),
+    native("C:/tmp/sid/scratchpad/push.py"),
     "/tmp/wipe.sh",
     "/var/tmp/rotate.py",
-    "C:/Users/in/.claude/state/checkpoints/proj.md",
-    "C:/Users/in/.claude/plans/plan.md",
+    native("C:/Users/in/.claude/state/checkpoints/proj.md"),
+    native("C:/Users/in/.claude/plans/plan.md"),
 ):
     check("throwaway artifact is not gated: {}".format(path), not cwg.is_gated(path), path)
     check("throwaway artifact is not durable: {}".format(path), not cwg.durable_paths([path]), path)
 
 for path in (
-    "C:/tmp/charon-whatsnew/backend/src/services/featureRegistry.ts",
-    "C:/Users/in/AppData/Local/Temp/build-clone/src/app.py",
+    native("C:/tmp/charon-whatsnew/backend/src/services/featureRegistry.ts"),
+    native("C:/Users/in/AppData/Local/Temp/build-clone/src/app.py"),
 ):
     check("a working clone under a temp root stays gated: {}".format(path), cwg.is_gated(path), path)
 
@@ -5221,35 +5292,41 @@ for path in (".env", ".env.production", "deploy/server.pem", "keys/id_ed25519"):
 check("environment plumbing is not a secret", gate.minimum_risk(["src/env.ts"]) == "STANDARD")
 
 for path in (
-    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
+    native("C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py"),
     "/tmp/wipe.sh",
-    "C:/tmp/sid/scratchpad/push.py",
+    native("C:/tmp/sid/scratchpad/push.py"),
 ):
     check("ephemeral matcher agrees with the gate: {}".format(path), cwg.is_ephemeral(path), path)
 
 for path in (
-    "C:/tmp/charon-whatsnew/backend/src/app.ts",
-    "C:/repo/.claude/state-machine/runner.py",
-    "C:/repo/src/scratchpadding.ts",
-    "C:/repo/.claude/plans/rollout.md",
-    "C:/repo/.claude/state/registry.json",
+    native("C:/tmp/charon-whatsnew/backend/src/app.ts"),
+    native("C:/repo/.claude/state-machine/runner.py"),
+    native("C:/repo/src/scratchpadding.ts"),
+    native("C:/repo/.claude/plans/rollout.md"),
+    native("C:/repo/.claude/state/registry.json"),
     "C:/backup/appdata/local/temp/keep.py",
 ):
     check("ephemeral matcher does not overreach: {}".format(path), not cwg.is_ephemeral(path), path)
 
 for path in (
-    "C:/Users/in/.claude/state/checkpoints/proj.md",
-    "C:/Users/in/.claude/plans/plan.md",
+    native("C:/Users/in/.claude/state/checkpoints/proj.md"),
+    native("C:/Users/in/.claude/plans/plan.md"),
     "/home/dev/.claude/state/checkpoints/proj.md",
 ):
     check("home bookkeeping is ephemeral: {}".format(path), cwg.is_ephemeral(path), path)
 
+# A place is matched in the platform's case: on Windows `/TMP` and `.Claude` are `/tmp` and
+# `.claude`, elsewhere they are other directories, and the files there are lasting.
+for path in ("/TMP/wipe.sh", native("C:/Users/in/.Claude/state/checkpoints/proj.md")):
+    check("a place pattern matches in the platform's case: {}".format(path),
+          cwg.is_ephemeral(path) is cwg.CASE_FOLDED_PATHS, path)
+
 
 # The harness's scratch tree at every depth, not only the scratchpad directory inside it.
 SCRATCH_HELPERS = [
-    "C:/Users/in/AppData/Local/Temp/claude/bound_digests.py",
-    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py",
-    "C:/Users/in/AppData/Local/Temp/claude/proj/sid/notes/helper.py",
+    native("C:/Users/in/AppData/Local/Temp/claude/bound_digests.py"),
+    native("C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py"),
+    native("C:/Users/in/AppData/Local/Temp/claude/proj/sid/notes/helper.py"),
     "/tmp/claude/fix_r1.py",
 ]
 for path in SCRATCH_HELPERS:
@@ -5278,8 +5355,8 @@ for path in (
 # project rather than the agent's own bookkeeping. Every file in it is graded by path exactly
 # as the same file is in an ordinary worktree; before that, a delegated session's whole diff
 # looked ephemeral, so its candidate stayed OPERATIONAL and no review could close it.
-CHIP_TREE = "C:/Users/in/.claude/state/chips/trees/wa-tg-tun-new-fix-a1b2c3d4"
-ORDINARY_TREE = "C:/Users/in/Desktop/Projects/wa-tg-tun-new"
+CHIP_TREE = native("C:/Users/in/.claude/state/chips/trees/wa-tg-tun-new-fix-a1b2c3d4")
+ORDINARY_TREE = native("C:/Users/in/Desktop/Projects/wa-tg-tun-new")
 for relative in (
     "backend/src/core/ConnectionManager.ts",
     "hooks/code_work_gate_common.py",
@@ -5326,11 +5403,11 @@ check(
 # The exemption stops at the tree directory: the rest of `state` is the hooks' own bookkeeping
 # and stays throwaway, including the chip cards and the index beside the worktrees themselves.
 for path in (
-    "C:/Users/in/.claude/state/chips/trees/by-tree.json",
-    "C:/Users/in/.claude/state/chips/a1b2c3d4.json",
-    "C:/Users/in/.claude/state/gate-events.jsonl",
-    "C:/Users/in/.claude/state/checkpoints/proj.md",
-    "C:/Users/in/.claude/plans/rollout.md",
+    native("C:/Users/in/.claude/state/chips/trees/by-tree.json"),
+    native("C:/Users/in/.claude/state/chips/a1b2c3d4.json"),
+    native("C:/Users/in/.claude/state/gate-events.jsonl"),
+    native("C:/Users/in/.claude/state/checkpoints/proj.md"),
+    native("C:/Users/in/.claude/plans/rollout.md"),
     "/home/dev/.claude/state/chips/by-parent/parent.json",
 ):
     check("state outside a chip worktree stays ungated: {}".format(path), not cwg.is_gated(path), path)
@@ -5412,13 +5489,13 @@ with tempfile.TemporaryDirectory(prefix="cwg_unresolved_") as outside:
 check(
     "an empty snapshot vouches only for the trees it covers",
     marker_hook.outside_snapshot(
-        ["c:/users/in/.claude/hooks/gate.py"], ["C:/repo"]
-    ) == ["c:/users/in/.claude/hooks/gate.py"],
+        [cwg.normalize_path("C:/Users/in/.claude/hooks/gate.py")], ["C:/repo"]
+    ) == [cwg.normalize_path("C:/Users/in/.claude/hooks/gate.py")],
 )
 check(
     "a watched configuration tree is one of the trees a command is judged against",
     marker_hook.outside_snapshot(
-        ["c:/users/in/.claude/hooks/gate.py"],
+        [cwg.normalize_path("C:/Users/in/.claude/hooks/gate.py")],
         ["C:/repo"],
         ["C:/Users/in/.claude/hooks"],
     ) == [],
@@ -5428,7 +5505,7 @@ check(
     # machine-managed plugin tree the gate still grades HIGH.
     "an unwatched pocket of a configuration home is never vouched for",
     marker_hook.outside_snapshot(
-        ["c:/users/in/.claude/plugins/repo/hook.js"],
+        [cwg.normalize_path("C:/Users/in/.claude/plugins/repo/hook.js")],
         [],
         ["C:/Users/in/.claude/hooks", "C:/Users/in/.claude/skills"],
     ) != [],
@@ -5436,7 +5513,7 @@ check(
 check(
     "a skipped subdirectory inside a watched tree is not vouched for either",
     marker_hook.outside_snapshot(
-        ["c:/users/in/.claude/skills/x/node_modules/tool.js"],
+        [cwg.normalize_path("C:/Users/in/.claude/skills/x/node_modules/tool.js")],
         [],
         ["C:/Users/in/.claude/skills"],
     ) != [],
@@ -5444,7 +5521,7 @@ check(
 check(
     "a watched file vouches for itself",
     marker_hook.outside_snapshot(
-        ["c:/users/in/.claude/settings.json"], [], ["C:/Users/in/.claude/settings.json"]
+        [cwg.normalize_path("C:/Users/in/.claude/settings.json")], [], ["C:/Users/in/.claude/settings.json"]
     ) == [],
 )
 check(
@@ -5452,13 +5529,13 @@ check(
     # repository; Git reports on them either way.
     "a repository vouches for source in a directory a configuration home would skip",
     marker_hook.outside_snapshot(
-        ["c:/repo/src/pages/plans/planrow.tsx", "c:/repo/src/state/store.ts"],
+        [cwg.normalize_path("C:/repo/src/pages/plans/planrow.tsx"), cwg.normalize_path("C:/repo/src/state/store.ts")],
         ["C:/repo"],
     ) == [],
 )
 check(
     "an empty snapshot vouches for paths under its root",
-    marker_hook.outside_snapshot(["c:/repo/src/app.ts"], ["C:/repo"]) == [],
+    marker_hook.outside_snapshot([cwg.normalize_path("C:/repo/src/app.ts")], ["C:/repo"]) == [],
 )
 check(
     "a sibling directory is not under the snapshot root",
@@ -5478,7 +5555,7 @@ check(
 sid = session()
 try:
     marker, _ = gate_paths(sid)
-    scratch = os.path.join(tempfile.gettempdir(), "cwg_scratch_probe.py")
+    scratch = os.path.join(SYSTEM_TEMP, "cwg_scratch_probe.py")
     run(MARK_HOOK, {
         "session_id": sid,
         "hook_event_name": "PostToolUse",
@@ -5623,7 +5700,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_config_home_") as home:
             data = cwg.read_json(marker) or {}
             check(
                 "a hand-written skill in the same tree is still named",
-                any(path.endswith("/skills/hand-written/skill.md")
+                any(path.endswith(cwg.normalize_path("/skills/hand-written/SKILL.md"))
                     for path in data.get("paths") or []),
                 data,
             )
@@ -6355,10 +6432,10 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
     cwg.claims_root = lambda: registry
     try:
         now = time.time()
-        target = "c:/repo/src/app.py"
+        target = native("c:/repo/src/app.py")
         check(
             "an announcement inside the window is foreign",
-            cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], now=now)
+            cwg.publish_claims(stale, paths=[native("C:/repo/src/app.py")], now=now)
             and cwg.foreign_activity("reader", now - 1, now)[0] == {target},
             cwg.read_json(cwg.claim_path(stale)),
         )
@@ -6372,15 +6449,15 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
         )
         check(
             "an open shell window is reported with its working directory",
-            cwg.publish_claims(stale, shell_start_ts=now, cwd="C:/repo", now=now)
-            and cwg.foreign_activity("reader", now - 1, now)[2] == {"c:/repo"},
+            cwg.publish_claims(stale, shell_start_ts=now, cwd=native("C:/repo"), now=now)
+            and cwg.foreign_activity("reader", now - 1, now)[2] == {native("c:/repo")},
             cwg.read_json(cwg.claim_path(stale)),
         )
         check(
             "an announcement outlives any prompt, however long it is left open",
-            cwg.publish_claims(stale, paths=["C:/repo/src/slow.py"], pending=True,
+            cwg.publish_claims(stale, paths=[native("C:/repo/src/slow.py")], pending=True,
                                now=now - cwg.SHELL_WINDOW_LIMIT - 60)
-            and "c:/repo/src/slow.py"
+            and native("c:/repo/src/slow.py")
             in cwg.foreign_activity("reader", now, now + 2 * cwg.CLAIM_HORIZON)[1],
             cwg.read_json(cwg.claim_path(stale)),
         )
@@ -6395,7 +6472,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
         check(
             "no elapsed time retires a file that still announces something",
             cwg.foreign_activity("reader", now, now + 400 * 86400.0)[1]
-            == {"c:/repo/src/slow.py"}
+            == {native("c:/repo/src/slow.py")}
             and os.path.exists(cwg.claim_path(stale)),
             cwg.read_json(cwg.claim_path(stale)),
         )
@@ -6406,11 +6483,11 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
         check(
             "other sessions announcing edits do not displace an older announcement",
             all(
-                cwg.publish_claims(other, paths=["C:/repo/src/x{}.py".format(index)],
+                cwg.publish_claims(other, paths=[native("C:/repo/src/x{}.py").format(index)],
                                    pending=True, now=now + index)
                 for index, other in enumerate(crowd)
             )
-            and "c:/repo/src/slow.py"
+            and native("c:/repo/src/slow.py")
             in cwg.foreign_activity("reader", now, now + 400 * 86400.0)[1]
             and os.path.exists(cwg.claim_path(stale)),
             sorted(os.listdir(cwg.claims_root()))[:3],
@@ -6430,12 +6507,12 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
             "a registry too large for one scan is unread, not silent",
             all(
                 cwg.publish_claims(cwg.session_key(session()),
-                                   paths=["C:/repo/src/many{}.py".format(index)], now=now)
+                                   paths=[native("C:/repo/src/many{}.py").format(index)], now=now)
                 for index in range(cwg.SCAN_LIMIT + 1)
             )
             and cwg.foreign_activity("reader", now - 1, now)[3] is True
-            and mark.own_delta("reader", "c:/repo", ["c:/repo/src/mine.py"], now - 1, False,
-                               [("c:/repo", ())]) == ([], ["c:/repo/src/mine.py"]),
+            and mark.own_delta("reader", native("c:/repo"), [native("c:/repo/src/mine.py")], now - 1, False,
+                               [(native("c:/repo"), ())]) == ([], [native("c:/repo/src/mine.py")]),
             len(os.listdir(cwg.claims_root())),
         )
         for name in list(os.listdir(cwg.claims_root())):
@@ -6445,8 +6522,8 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
             "a claim file past the horizon is dropped rather than believed",
             # Promoted first, because only a file with nothing outstanding is the sweep's to
             # take: an announcement is what keeps one alive past the horizon.
-            cwg.publish_claims(stale, paths=["C:/repo/src/slow.py"], now=now)
-            and cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], now=now)
+            cwg.publish_claims(stale, paths=[native("C:/repo/src/slow.py")], now=now)
+            and cwg.publish_claims(stale, paths=[native("C:/repo/src/app.py")], now=now)
             and cwg.foreign_activity("reader", now, now + cwg.CLAIM_HORIZON + 1)
             == (set(), set(), set(), False)
             and not os.path.exists(cwg.claim_path(stale)),
@@ -6462,24 +6539,24 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
         cwg.remove(cwg.claim_path(stale))
         check(
             "a relative announced path resolves to the same key the edit records",
-            cwg.publish_claims(stale, paths=["src/app.py"], cwd="C:/repo")
+            cwg.publish_claims(stale, paths=["src/app.py"], cwd=native("C:/repo"))
             and target in (cwg.read_json(cwg.claim_path(stale)) or {}).get("claims", {}),
             cwg.read_json(cwg.claim_path(stale)),
         )
         check(
             "settling a path promotes it out of the announced map",
-            cwg.publish_claims(stale, paths=["C:/repo/src/app.py"], pending=True)
-            and cwg.publish_claims(stale, paths=["C:/repo/src/app.py"])
+            cwg.publish_claims(stale, paths=[native("C:/repo/src/app.py")], pending=True)
+            and cwg.publish_claims(stale, paths=[native("C:/repo/src/app.py")])
             and target in (cwg.read_json(cwg.claim_path(stale)) or {}).get("claims", {})
             and target not in (cwg.read_json(cwg.claim_path(stale)) or {}).get("pending", {}),
             cwg.read_json(cwg.claim_path(stale)),
         )
         check(
             "an unconfirmed announcement is not read as a settled claim",
-            cwg.publish_claims(stale, paths=["C:/repo/src/only-announced.py"], pending=True)
-            and "c:/repo/src/only-announced.py"
+            cwg.publish_claims(stale, paths=[native("C:/repo/src/only-announced.py")], pending=True)
+            and native("c:/repo/src/only-announced.py")
             not in cwg.foreign_activity("reader", time.time() - 1)[0]
-            and "c:/repo/src/only-announced.py"
+            and native("c:/repo/src/only-announced.py")
             in cwg.foreign_activity("reader", time.time() - 1)[1],
             cwg.read_json(cwg.claim_path(stale)),
         )
@@ -6489,7 +6566,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_claims_unit_") as registry:
         )
         check(
             "a still-open shell window survives the cycle that closed around it",
-            cwg.publish_claims(stale, shell_start_ts=time.time(), cwd="C:/repo")
+            cwg.publish_claims(stale, shell_start_ts=time.time(), cwd=native("C:/repo"))
             and not cwg.retire_claims(stale)
             and os.path.exists(cwg.claim_path(stale)),
         )
@@ -6513,6 +6590,7 @@ with io.open(settings_file, encoding="utf-8") as stream:
 events = registered.get("hooks") or {}
 marker_events = {}
 shell_form = []
+isolated = []
 for event, groups in events.items():
     for group in groups or ():
         for hook in group.get("hooks") or ():
@@ -6521,6 +6599,9 @@ for event, groups in events.items():
                 marker_events.setdefault(event, []).append(group.get("matcher") or "")
             if hook.get("type") == "command" and "args" not in hook:
                 shell_form.append("{}: {}".format(event, invocation[0]))
+            script = next((index for index, part in enumerate(invocation) if part.endswith(".py")), 0)
+            if any(re.fullmatch(r"-[A-Za-z]*[IP][A-Za-z]*", part) for part in invocation[1:script]):
+                isolated.append("{}: {}".format(event, " ".join(invocation)))
 check(
     "a run only ever cleans up after itself",
     session().startswith(RUN + "_test_"),
@@ -6550,6 +6631,13 @@ check(
     not shell_form,
     shell_form,
 )
+# A hook finds its sibling modules in its own folder, which Python puts first on sys.path when it
+# runs a script; -I, -P and PYTHONSAFEPATH leave that folder out.
+check(
+    "every Python hook runs with its own folder on the import path",
+    not isolated and not (registered.get("env") or {}).get("PYTHONSAFEPATH"),
+    (isolated, (registered.get("env") or {}).get("PYTHONSAFEPATH")),
+)
 
 
 # --- a capture outlives the candidate it was taken under, and the role is cut out of a packet
@@ -6560,7 +6648,8 @@ def rollout_records(records):
     `log_codex_run` writes a single round, briefed with the role's body. Neither of the two
     shapes this section needs is expressible there: a session resumed for a second round holds
     two briefs and two answers in the one file the first round opened, and a packet assembled
-    from the whole role file has to reach the log spelled exactly as the launch fed it.
+    from the whole role file has to reach the log spelled exactly as the launch fed it. A role of
+    "turn" writes the `turn_context` the CLI opens a turn with, `text` being its (model, effort).
     """
     day = os.path.join(CODEX_HOME, "sessions", *time.strftime("%Y %m %d").split())
     os.makedirs(day, exist_ok=True)
@@ -6568,6 +6657,10 @@ def rollout_records(records):
     with open(path, "w", encoding="utf-8") as stream:
         stream.write(json.dumps({"timestamp": iso(records[0][0]), "type": "session_meta"}) + "\n")
         for stamp, role, text in records:
+            if role == "turn":
+                stream.write(json.dumps({"timestamp": iso(stamp), "type": "turn_context",
+                                         "payload": {"model": text[0], "effort": text[1]}}) + "\n")
+                continue
             stream.write(json.dumps({
                 "timestamp": iso(stamp), "type": "response_item",
                 "payload": {"type": "message", "role": role, "content": [{
@@ -7038,7 +7131,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
               cwg.read_json(gate_paths(sid)[0]))
         shell = {"session_id": sid, "cwd": tree, "tool_name": "Bash",
                  "tool_input": {"command": "sed -i s/x/x/ hooks/reviewed.py"}}
-        scratch = os.path.join(tempfile.gettempdir(), "claude", "proj", "sid", "scratchpad", "note.md")
+        scratch = os.path.join(SYSTEM_TEMP, "claude", "proj", "sid", "scratchpad", "note.md")
         for label, extra, kwargs in (
             ("an unresolved command", [], {"unresolved": True}),
             ("an unattributed change", [], {"unattributed_risk": "STANDARD"}),
@@ -7066,7 +7159,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_commit_fp_") as tree:
         mark_edit(sid, tree, "hooks/reviewed.py", "print('kept across a throwaway close')")
         close_now(sid)
         recorded = (cwg.read_json(gate_paths(sid)[1]) or {}).get("closed_content")
-        scratch = os.path.join(tempfile.gettempdir(), "claude", "proj", "sid", "scratchpad", "run.py")
+        scratch = os.path.join(SYSTEM_TEMP, "claude", "proj", "sid", "scratchpad", "run.py")
         marker_hook.record_paths({"session_id": sid, "cwd": tree, "tool_name": "Write",
                                   "tool_input": {"file_path": scratch}}, [scratch])
         close_now(sid, kind="operational")
@@ -7214,8 +7307,10 @@ with tempfile.TemporaryDirectory(prefix="cwg_directory_plan_") as base:
     os.makedirs(left)
     os.makedirs(right)
     forward = base.replace(chr(92), "/")
-    git_bash = "/" + forward[0].lower() + forward[2:]
+    # Git Bash's spelling of the drive path; a POSIX shell names the directory itself.
+    git_bash = "/" + forward[0].lower() + forward[2:] if os.name == "nt" else forward
     right_forward = right.replace(chr(92), "/")
+    right_backslashed = right.replace("/", chr(92))
 
     def plan(command, cwd, shell):
         start, targets = marker_hook.directory_plan(command, cwd, shell)
@@ -7241,7 +7336,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_directory_plan_") as base:
         ("PowerShell's Set-Location with a named path",
          "Set-Location -Path '{}'; git status".format(right), left, "PowerShell", ("right", ["right"])),
         ("an unquoted backslash path in bash is not that path",
-         "cd {} && make".format(right), left, "Bash", (None, [])),
+         "cd {} && make".format(right_backslashed), left, "Bash", (None, [])),
         ("a heredoc body is not read as shell",
          "python - <<'PY'\ncd {}\nPY".format(right_forward), left, "Bash", ("left", [])),
         ("pushd is a change too", "pushd ../right && make && popd", left, "Bash", ("right", ["right"])),
@@ -7803,8 +7898,8 @@ FOREGROUND_TRAILER = ("\nagentId: {id} (use SendMessage with to: '{id}', summary
                       "to continue this agent)\n<usage>subagent_tokens: 1</usage>")
 
 
-def foreground_review(events, stamp, call_id, agent_id, result):
-    add_review(events, stamp, call_id, result + FOREGROUND_TRAILER.format(id=agent_id))
+def foreground_review(events, stamp, call_id, agent_id, result, subtype="adversarial-reviewer"):
+    add_review(events, stamp, call_id, result + FOREGROUND_TRAILER.format(id=agent_id), subtype=subtype)
 
 
 def send_message(events, stamp, call_id, agent_id, resumed=True):
@@ -8183,14 +8278,14 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
     sid = session()
     try:
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("a clean upstream merge records none of the files it brought in",
-              bool(paths) and not (paths & brought), entry)
-        check("and leaves an operational candidate", not cwg.candidate_shape(entry)["persistent"], entry)
+              bool(paths) and not (paths & brought), marker_entry)
+        check("and leaves an operational candidate", not cwg.candidate_shape(marker_entry)["persistent"], marker_entry)
         mark_shell(sid, work, "git commit -m merge",
                    action=lambda: git_as_gate(work, "commit", "--quiet", "-m", "merge"))
-        entry, paths = recorded(sid)
-        check("committing the merge records none of them either", not (paths & brought), entry)
+        marker_entry, paths = recorded(sid)
+        check("committing the merge records none of them either", not (paths & brought), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8203,10 +8298,10 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
                 stream.write("sneaked = True\n")
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main && echo sneaked >> src/app.py",
                    action=merge_and_write)
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("a file written after the merge in the same command is recorded as rewritten",
-              at("src/app.py") in paths and at("src/app.py") in (entry.get("content_paths") or []), entry)
-        check("while the rest of the merge is not", not (paths & (brought - {at("src/app.py")})), entry)
+              at("src/app.py") in paths and at("src/app.py") in (marker_entry.get("content_paths") or []), marker_entry)
+        check("while the rest of the merge is not", not (paths & (brought - {at("src/app.py")})), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8220,9 +8315,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
         git_as_gate(work, "checkout", "--quiet", "main")
         mark_shell(sid, work, "git merge --no-ff --no-commit side",
                    action=lambda: git_as_gate(work, "merge", "--no-ff", "--no-commit", "side", check=False))
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("a merge of a branch that is not upstream records every file it brought in",
-              {at("src/side.py"), at("src/new.py")} <= paths, entry)
+              {at("src/side.py"), at("src/new.py")} <= paths, marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8236,18 +8331,18 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
         mark_edit(sid, work, "src/extra.py", "extra = 1")
         verdict_ts = time.time()
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("a clean merge into the candidate's own file leaves a mark naming what it merged",
-              bool((entry.get("content_marks") or [{}])[-1].get("merge"))
-              and not (paths & (brought - {own})), entry)
+              bool((marker_entry.get("content_marks") or [{}])[-1].get("merge"))
+              and not (paths & (brought - {own})), marker_entry)
         mark_shell(sid, work, "git add src/extra.py",
                    action=lambda: git_as_gate(work, "add", "src/extra.py"))
-        entry, _ = recorded(sid)
+        marker_entry, _ = recorded(sid)
         check("a verdict from before the merge still covers the candidate after the next measurement",
-              float(entry.get("last_durable_ts") or 0.0) > verdict_ts and covers_now(entry, verdict_ts), entry)
+              float(marker_entry.get("last_durable_ts") or 0.0) > verdict_ts and covers_now(marker_entry, verdict_ts), marker_entry)
         mark_edit(sid, work, "src/shared.py", "rewritten = True")
-        entry, _ = recorded(sid)
-        check("an edit after the merge still retires it", not covers_now(entry, verdict_ts), entry)
+        marker_entry, _ = recorded(sid)
+        check("an edit after the merge still retires it", not covers_now(marker_entry, verdict_ts), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8265,11 +8360,11 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
             git_as_gate(work, "add", "src/extra.py")
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main && git add src/extra.py",
                    action=merge_and_stage)
-        entry, _ = recorded(sid)
+        marker_entry, _ = recorded(sid)
         check("a merge beside a staging of reviewed bytes still carries the verdict",
-              float(entry.get("last_durable_ts") or 0.0) > verdict_ts
-              and bool((entry.get("content_marks") or [{}])[-1].get("merge"))
-              and covers_now(entry, verdict_ts), entry)
+              float(marker_entry.get("last_durable_ts") or 0.0) > verdict_ts
+              and bool((marker_entry.get("content_marks") or [{}])[-1].get("merge"))
+              and covers_now(marker_entry, verdict_ts), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8278,8 +8373,8 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
     try:
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
         mark_shell(sid, work, "git merge --abort", action=lambda: git_as_gate(work, "merge", "--abort"))
-        entry, paths = recorded(sid)
-        check("abandoning a clean upstream merge records none of its files", not (paths & brought), entry)
+        marker_entry, paths = recorded(sid)
+        check("abandoning a clean upstream merge records none of its files", not (paths & brought), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8294,9 +8389,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
             git_as_gate(work, "merge", "--abort")
             git_as_gate(work, "checkout", "--", "src/stay.py")
         mark_shell(sid, work, "git merge --abort && git checkout -- src/stay.py", action=abandon_and_discard)
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("an abandoned merge sets aside only what it had staged, not dirt the same command discards",
-              at("src/stay.py") in paths and not (paths & brought), entry)
+              at("src/stay.py") in paths and not (paths & brought), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8306,10 +8401,10 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
         put(work, "src/shared.py", "own line 1\n" + shared_base.split("\n", 1)[1])
         git_as_gate(work, "commit", "--quiet", "-am", "own first line")
         mark_shell(sid, work, "git merge --no-ff --no-commit origin/main", action=merge_upstream)
-        entry, paths = recorded(sid)
+        marker_entry, paths = recorded(sid)
         check("a conflicted path stays recorded while the clean ones do not",
               at("src/shared.py") in paths
-              and not (paths & {at("src/app.py"), at("src/new.py"), at("src/gone.py")}), entry)
+              and not (paths & {at("src/app.py"), at("src/new.py"), at("src/gone.py")}), marker_entry)
     finally:
         cleanup(sid)
         restart()
@@ -8467,8 +8562,9 @@ del os.environ["CWG_MERGE_JUDGE_BUDGET"]
 
 # --- a read-only lane's own commands do not expire the verdict it is producing (report a1c7b71b)
 check("cmp only compares", marker_hook.read_only_pipeline("cmp backend/schema.sql mirror/schema.sql && echo same"))
-check("the read-only lanes are the reviewer, Explore and Plan",
+check("the read-only lanes are the reviewer, its XHIGH profile, Explore and Plan",
       marker_hook.read_only_lane({"agent_type": "adversarial-reviewer"})
+      and marker_hook.read_only_lane({"agent_type": cwg.XHIGH_REVIEWER})
       and marker_hook.read_only_lane({"agent_type": "Explore"})
       and marker_hook.read_only_lane({"agent_type": "Plan"})
       and not marker_hook.read_only_lane({"agent_type": "general-purpose"})
@@ -8560,8 +8656,8 @@ check("in PowerShell `NAME=value` is no assignment, so the variable names no too
 
 # --- a write that lands only in a throwaway file, a heredoc's body and `$(cat …)` (report dc30d302);
 # the memory bridge under an interpreter and PowerShell's literal assignments (report c2a8dfe0)
-SCRATCHPAD = "C:/Users/in/AppData/Local/Temp/claude/C--Users-in/0738d3d1/scratchpad"
-BRIDGE = "C:/Users/in/.codex/notebooklm-sync/bin/nlm_sync.py"
+SCRATCHPAD = native("C:/Users/in/AppData/Local/Temp/claude/C--Users-in/0738d3d1/scratchpad")
+BRIDGE = native("C:/Users/in/.codex/notebooklm-sync/bin/nlm_sync.py")
 REPORTED_MR = (
     'S="{0}"; cat > "$S/mr.md" <<\'EOF\'\nCloses #484 (with) {{braces}} & > x | y\n$(not run)\nEOF\n'
     'cd "C:/tmp/chip" && glab mr create --draft --title "fix(gateway): x" '
@@ -8579,16 +8675,18 @@ for label, shell, command, expected in (
      'S="{0}"; git log > "$S/a"; git diff >> "$S"/b'.format(SCRATCHPAD), True),
     ("an unquoted heredoc of plain text", "Bash", 'cat > "{}/x" <<EOF\nplain $HOME text\nEOF'.format(SCRATCHPAD), True),
     ("a quoted `>` is text", "Bash", 'grep "a > b" file.txt', True),
+    # A backslash separates only on Windows; elsewhere these three name files of their own.
     ("a Windows path in single quotes", "PowerShell",
-     "git diff > '" + SCRATCHPAD.replace("/", "\\") + "\\d.patch'", True),
+     "git diff > '" + SCRATCHPAD.replace("/", "\\") + "\\d.patch'", os.name == "nt"),
     ("the bridge's remember under python", "Bash",
      'python "{}" remember --type GOTCHA --summary "a > b & {{c}}" --evidence "e"'.format(BRIDGE), True),
-    ("the reported PowerShell bridge call", "PowerShell", REPORTED_BRIDGE, True),
+    ("the reported PowerShell bridge call", "PowerShell", REPORTED_BRIDGE, os.name == "nt"),
     ("the project-memory skill's direct call", "PowerShell",
      "$env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'\n"
      "& \"$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe\" "
      "\"$HOME\\.codex\\notebooklm-sync\\bin\\nlm_sync.py\" `\n"
-     "  remember --type GOTCHA --summary '<statement>' --evidence '<text with \"quotes\" & > signs>'", True),
+     "  remember --type GOTCHA --summary '<statement>' --evidence '<text with \"quotes\" & > signs>'",
+     os.name == "nt"),
     ("a heredoc into a lasting file", "Bash", 'cat > "src/notes.md" <<\'EOF\'\nx\nEOF', False),
     ("an unquoted heredoc that substitutes", "Bash", 'cat > "{}/x" <<EOF\n$(rm -rf src)\nEOF'.format(SCRATCHPAD), False),
     ("a heredoc fed to python", "Bash", "python - <<'PY'\nprint(1)\nPY", False),
@@ -8636,7 +8734,7 @@ check("the reported MR command can expire no verdict, though it plainly writes",
 REVIEW_FLAGS = ("--ignore-user-config \\\n  --disable plugins --disable hooks --disable memories \\\n"
                 "  -m gpt-6-sol -c model_reasoning_effort=high -c tools.web_search=true \\\n"
                 "  --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \\\n")
-REVIEW_TAIL = "  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW"
+REVIEW_TAIL = native("  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW")
 REVIEW_LAUNCH = "REVIEW_ID=g17r1; timeout 3600 codex exec " + REVIEW_FLAGS + REVIEW_TAIL
 for label, command, expected in (
     ("the command's own template", REVIEW_LAUNCH, True),
@@ -8653,45 +8751,45 @@ for label, command, expected in (
     ("a session word in a round that resumes nothing",
      REVIEW_LAUNCH.replace("--skip-git-repo-check", "--skip-git-repo-check 01a0ce53-b934-77b1-ad82-c5c39113957b"),
      False),
-    ("a launch after a cd", "cd /c/Users/in && " + REVIEW_LAUNCH, True),
-    ("a launch followed by a write", REVIEW_LAUNCH + "\necho x > /c/Users/in/.claude/new.md", False),
-    ("a write followed by a launch", "echo x > /c/Users/in/.claude/new.md; " + REVIEW_LAUNCH, False),
+    ("a launch after a cd", native("cd /c/Users/in && ") + REVIEW_LAUNCH, True),
+    ("a launch followed by a write", REVIEW_LAUNCH + native("\necho x > /c/Users/in/.claude/new.md"), False),
+    ("a write followed by a launch", native("echo x > /c/Users/in/.claude/new.md; ") + REVIEW_LAUNCH, False),
     ("stderr into a lasting file",
-     REVIEW_LAUNCH.replace("2>/c/tmp/codex-${REVIEW_ID}.err", "2>/c/Users/in/.claude/x.err"), False),
+     REVIEW_LAUNCH.replace(native("2>/c/tmp/codex-${REVIEW_ID}.err"), native("2>/c/Users/in/.claude/x.err")), False),
     ("no review marker", REVIEW_LAUNCH.replace("# CODE_WORK_GATE_REVIEW", ""), False),
     ("a packet from a heredoc", "codex exec - <<'EOF'\nreview\nEOF\n# CODE_WORK_GATE_REVIEW", False),
     ("output piped on", REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW",
-                                              " | tee /c/Users/in/.claude/out.md  # CODE_WORK_GATE_REVIEW"), False),
+                                              native(" | tee /c/Users/in/.claude/out.md  # CODE_WORK_GATE_REVIEW")), False),
     ("an id computed at run time", REVIEW_LAUNCH.replace("REVIEW_ID=g17r1", "REVIEW_ID=$(date +%s)"), False),
-    ("a tool variable beside it", "GIT_DIR=/c/tmp/x; " + REVIEW_LAUNCH, False),
-    ("another codex subcommand", "REVIEW_ID=x; codex login - < /c/tmp/codex-packet-x.md  # CODE_WORK_GATE_REVIEW", False),
+    ("a tool variable beside it", native("GIT_DIR=/c/tmp/x; ") + REVIEW_LAUNCH, False),
+    ("another codex subcommand", native("REVIEW_ID=x; codex login - < /c/tmp/codex-packet-x.md  # CODE_WORK_GATE_REVIEW"), False),
     ("the subcommand in capitals, as codex_launch reads it", REVIEW_LAUNCH.replace("codex exec", "codex EXEC"), True),
     # The G17 review's own attacks: an option that writes, options read at run time, a program by path,
     # a reader beside the launch, a variable Codex reads.
     ("an option that writes a file",
-     REVIEW_LAUNCH.replace("--skip-git-repo-check", "--skip-git-repo-check -o /c/Users/in/Documents/review.md"), False),
+     REVIEW_LAUNCH.replace("--skip-git-repo-check", native("--skip-git-repo-check -o /c/Users/in/Documents/review.md")), False),
     ("options read at run time",
-     REVIEW_LAUNCH.replace("--skip-git-repo-check", "--skip-git-repo-check $(cat /c/tmp/options.txt)"), False),
+     REVIEW_LAUNCH.replace("--skip-git-repo-check", native("--skip-git-repo-check $(cat /c/tmp/options.txt)")), False),
     ("a codex named by path", REVIEW_LAUNCH.replace("codex exec", "./codex exec"), False),
     ("a pipe onward, even to a reader", REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", " | cat  # CODE_WORK_GATE_REVIEW"), False),
     ("a reader on the next line", REVIEW_LAUNCH + "\ngit status", False),
-    ("CODEX_HOME given a value", "CODEX_HOME=/c/Users/in/Documents/codex; " + REVIEW_LAUNCH, False),
+    ("CODEX_HOME given a value", native("CODEX_HOME=/c/Users/in/Documents/codex; ") + REVIEW_LAUNCH, False),
     ("an option the template does not pass", REVIEW_LAUNCH.replace("--skip-git-repo-check", "--skip-git-repo-check --json"), False),
-    ("stderr merged instead of kept aside", REVIEW_LAUNCH.replace("2>/c/tmp/codex-${REVIEW_ID}.err", "2>&1"), False),
+    ("stderr merged instead of kept aside", REVIEW_LAUNCH.replace(native("2>/c/tmp/codex-${REVIEW_ID}.err"), "2>&1"), False),
     ("sent to the background by `&`",
      REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", " &  # CODE_WORK_GATE_REVIEW"), False),
     ("an `&` inside the comment, which runs nothing", REVIEW_LAUNCH + " &", True),
     ("two launches", REVIEW_LAUNCH + "\n" + REVIEW_LAUNCH, False),
     ("a substitution inside double quotes", REVIEW_LAUNCH.replace("-m gpt-6-sol", '-m "$(true)"'), False),
-    ("a second stdin redirect", REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", " < /c/tmp/other.md  # CODE_WORK_GATE_REVIEW"), False),
+    ("a second stdin redirect", REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", native(" < /c/tmp/other.md  # CODE_WORK_GATE_REVIEW")), False),
     ("comment lines around it", "# round 1\n# CODE_WORK_GATE_REVIEW\n" + REVIEW_LAUNCH + "\n# done", True),
     ("a command after two comment lines", "# a\n# b\ngit status\n" + REVIEW_LAUNCH, False),
     # Comments that start their lines: cutting one used to leave the loop on the same spot.
     ("three comment lines in a row", "#a\n#b\n#c\n" + REVIEW_LAUNCH, True),
     # The G17 round-2 attacks: a comment naming another packet for the binding, and more than one `cd`.
     ("a comment that assigns another id", REVIEW_LAUNCH + " REVIEW_ID=g17r9", False),
-    ("two cd segments", "cd /c/Users/in; cd /c/tmp; " + REVIEW_LAUNCH, False),
-    ("a cd after the launch", REVIEW_LAUNCH + "\ncd /c/tmp", False),
+    ("two cd segments", native("cd /c/Users/in; cd /c/tmp; ") + REVIEW_LAUNCH, False),
+    ("a cd after the launch", REVIEW_LAUNCH + native("\ncd /c/tmp"), False),
 ):
     check("a review launch only: {}".format(label), marker_hook.review_launch_only(command) is expected, command)
 check("a PowerShell launch is not read as one", not marker_hook.review_launch_only(REVIEW_LAUNCH, "PowerShell"))
@@ -8701,8 +8799,8 @@ check("the variables Codex reads are tool variables everywhere",
 check("the plain launch is no write-capable command, the one that also writes is",
       not marker_hook.write_capable({"tool_name": "Bash", "tool_input": {"command": REVIEW_LAUNCH}})
       and marker_hook.write_capable({"tool_name": "Bash", "tool_input": {
-          "command": REVIEW_LAUNCH + "\necho x > /c/Users/in/.claude/new.md"}}))
-check("a Git Bash drive path to a throwaway file is one", marker_hook.read_only_pipeline("git diff > /c/tmp/d.patch"))
+          "command": REVIEW_LAUNCH + native("\necho x > /c/Users/in/.claude/new.md")}}))
+check("a Git Bash drive path to a throwaway file is one", marker_hook.read_only_pipeline(native("git diff > /c/tmp/d.patch")))
 check("`${NAME}` is no brace group, a brace group still is",
       marker_hook.read_only_pipeline("grep x ${FILE}") is True
       and marker_hook.read_only_pipeline("{ git status; }") is False
@@ -8710,6 +8808,14 @@ check("`${NAME}` is no brace group, a brace group still is",
 check("the bridge is bookkeeping only under an interpreter, never for the home rule",
       marker_hook.bookkeeping_script('python "{}" remember x'.format(BRIDGE), bridge=True) is not None
       and marker_hook.bookkeeping_script('python "{}" remember x'.format(BRIDGE)) is None)
+# The hooks' own scripts are named in the platform's case and by its own separator: elsewhere
+# `GATE_INBOX.py` and `hooks\gate_inbox.py` are other files, which may write anything.
+UPPER_INBOX = 'python "{}" ack x'.format(native("C:/Users/in/.claude/hooks/GATE_INBOX.py"))
+BACKSLASHED_INBOX = 'python "hooks\\gate_inbox.py" ack x'
+check("a state-only hook script is recognized only as the platform names it",
+      (marker_hook.bookkeeping_script(UPPER_INBOX) is not None) is cwg.CASE_FOLDED_PATHS
+      and (marker_hook.bookkeeping_script(BACKSLASHED_INBOX) is not None) is (os.name == "nt"),
+      (marker_hook.bookkeeping_script(UPPER_INBOX), marker_hook.bookkeeping_script(BACKSLASHED_INBOX)))
 
 # --- the directory holding a configuration home is not inside it (report b26e3641)
 agents_home = os.path.join(AGENT_HOME, ".agents")
@@ -8740,7 +8846,8 @@ with tempfile.TemporaryDirectory(prefix="cwg_bookkeeping_") as base:
     for command, expires, tool in (('NLM=~/.local/bin/nlm-memory.cmd; $NLM recall "why"', False, "Bash"),
                                    ('python -c "print(1)"', True, "Bash"),
                                    (REPORTED_MR, False, "Bash"),
-                                   (REPORTED_BRIDGE, False, "PowerShell"),
+                                   # Its backslashed bridge path is another file off Windows.
+                                   (REPORTED_BRIDGE, os.name != "nt", "PowerShell"),
                                    (REVIEW_LAUNCH, False, "Bash"),
                                    (REVIEW_LAUNCH + "\necho x > src/new.py", True, "Bash")):
         sid = session()
@@ -8763,13 +8870,13 @@ with tempfile.TemporaryDirectory(prefix="cwg_unmeasured_") as repo:
     try:
         target = mark_edit(sid, repo, "src/candidate.py", "value = 1")
         marker, _ = gate_paths(sid)
-        entry = cwg.read_json(marker)
+        marker_entry = cwg.read_json(marker)
         check("a measurement keeps the lasting paths' stats",
-              target in (entry.get("content_stats") or {}), entry)
-        unchanged = gate.unmeasured_change(entry, time.time())
+              target in (marker_entry.get("content_stats") or {}), marker_entry)
+        unchanged = gate.unmeasured_change(marker_entry, time.time())
         check("with nothing changed there is nothing to catch up, only the time the stats matched",
               unchanged is not None and unchanged[1] is None
-              and unchanged[0]["content_marks"] == entry["content_marks"], unchanged)
+              and unchanged[0]["content_marks"] == marker_entry["content_marks"], unchanged)
         before_fix = time.time()
         time.sleep(0.05)
         # The fix lands while the marker hooks are cancelled, so no mark records it.
@@ -8778,7 +8885,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_unmeasured_") as repo:
         fixed_at = os.stat(fixed).st_mtime_ns / 1e9
         time.sleep(0.05)
         after_fix = time.time()
-        caught, added = gate.unmeasured_change(entry, time.time())
+        caught, added = gate.unmeasured_change(marker_entry, time.time())
         check("the unmeasured change gets a mark at its modification time",
               (added or {}).get("cause", {}).get("reason") == gate.UNMEASURED_REASON
               and abs(added["ts"] - fixed_at) < 0.01, caught)
@@ -8788,7 +8895,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_unmeasured_") as repo:
               caught)
         filler = [{"ts": 1.0 + index, "fp": "old{}".format(index)} for index in range(marker_hook.CONTENT_MARKS_KEPT)]
         crowded, crowded_added = gate.unmeasured_change(
-            dict(entry, content_marks=filler + list(entry["content_marks"])), time.time())
+            dict(marker_entry, content_marks=filler + list(marker_entry["content_marks"])), time.time())
         check("the catch-up keeps the marker's cap on marks and still reports the mark it added",
               len(crowded["content_marks"]) == marker_hook.CONTENT_MARKS_KEPT
               and crowded_added is not None and crowded["content_marks"][-1]["fp"] == added["fp"], crowded)
@@ -8869,7 +8976,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_many_folders_") as repo:
         subprocess.run(["git", "-C", root, "add", "--", relative], check=True)
         with open(target, "w", encoding="utf-8") as stream:
             stream.write("three = 3\n")
-    by_dir = {cwg.normalize_path(os.path.join(repo, *folder.split("/"))): ["mod.py"] for folder in folders}
+    by_dir = {cwg.normalize_path(os.path.join(repo, *folder.split("/"))): [cwg.normalize_path("Mod.py")] for folder in folders}
     by_dir[cwg.normalize_path(os.path.join(inner, "src"))] = ["seed.py"]
     calls, real_run = [], cwg.git_run
     cwg.git_run = lambda *args, **kwargs: calls.append(args[1][:2]) or real_run(*args, **kwargs)
@@ -8886,7 +8993,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_many_folders_") as repo:
     check("six folders in two repositories ask git four times per repository", located == 8, calls[:located])
     check("a folder placed by its path answers as git placing it does", together == alone, (together, alone))
     check("a mixed-case folder spelled in lower case keeps its staged divergence",
-          [name for name, _ in together[cwg.normalize_path(os.path.dirname(deep))]] == ["mod.py"], together)
+          [name for name, _ in together[cwg.normalize_path(os.path.dirname(deep))]] == [cwg.normalize_path("Mod.py")], together)
     check("a folder inside a nested repository belongs to that repository",
           [name for name, _ in together[cwg.normalize_path(os.path.join(inner, "src"))]] == ["seed.py"], together)
     check("with discovery moved by the environment, git places every folder itself",
@@ -8901,6 +9008,60 @@ with tempfile.TemporaryDirectory(prefix="cwg_many_folders_") as repo:
     first, gone = cwg.normalize_path(os.path.join(repo, "docs")), cwg.normalize_path(two)
     check("a folder that is not there is placed by git, which calls it no repository",
           marker_hook.staged_divergences_by_dir({first: ["mod.py"], gone: ["mod.py"]})[gone] == [])
+
+# A link or a junction on the way up to a repository already found may lead git elsewhere, so git
+# places that folder itself. Python below 3.12 has no `isjunction`: the call raised there, the
+# fail-open marker dropped the whole write, and a file a shell command put in a second folder of a
+# repository never reached the candidate.
+with tempfile.TemporaryDirectory(prefix="cwg_linked_folder_") as repo:
+    from hygiene_hooks_test import NO_OLDER_PYTHON, make_junction, older_python
+
+    candidate_repo(repo, "linked-folder")
+    top = cwg.normalize_path(subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"],
+                                            capture_output=True, text=True, check=True).stdout.strip())
+    plain = os.path.join(repo, "src", "plain")
+    os.makedirs(plain)
+    # The junction leads into the same temporary tree, so removing the tree can reach nothing else.
+    os.makedirs(os.path.join(repo, "target", "inner"))
+    make_junction(os.path.join(repo, "target"), os.path.join(repo, "src", "linked"))
+    behind = os.path.join(repo, "src", "linked", "inner")
+    plain_answer, behind_answer = (marker_hook.repository_of(folder, [top]) for folder in (plain, behind))
+    check("a folder of a repository already found is placed by its path",
+          plain_answer == (top, "src/plain"), plain_answer)
+    check("a folder behind a junction or a link is left to git", behind_answer is None, behind_answer)
+    older = older_python()
+    if older is None:
+        print(NO_OLDER_PYTHON)
+    else:
+        sid = session()
+        try:
+            mark_edit(sid, repo, "src/plain/one.py", python=older)
+            written = os.path.join(repo, "src", "other", "two.py")
+
+            def write_second_folder():
+                os.makedirs(os.path.dirname(written))
+                with open(written, "w", encoding="utf-8") as stream:
+                    stream.write("two = 2\n")
+
+            mark_shell(sid, repo, "python -c writer", action=write_second_folder, python=older)
+            paths = (cwg.read_json(gate_paths(sid)[0]) or {}).get("paths") or []
+            check("under Python older than 3.12 a shell command's file in a second folder reaches the candidate",
+                  any(path.endswith("/src/other/two.py") for path in paths), paths)
+            with open(cwg.event_log_path(), encoding="utf-8") as stream:
+                durable = [line for line in stream if '"durable"' in line and cwg.session_key(sid) in line]
+            check("and the ledger records it as a durable change",
+                  any("/src/other/two.py" in line for line in durable), durable)
+        finally:
+            cleanup(sid)
+        probe = subprocess.run([older, "-c", "; ".join((
+            "import json, sys",
+            "sys.path.insert(0, sys.argv[1])",
+            "import code_work_gate_mark as marker",
+            "print(json.dumps([marker.repository_of(folder, [sys.argv[2]]) for folder in sys.argv[3:]]))",
+        )), HERE, top, plain, behind], capture_output=True, text=True, encoding="utf-8")
+        check("and places both folders as this interpreter does, a junction included",
+              probe.returncode == 0 and json.loads(probe.stdout) == [[top, "src/plain"], None],
+              probe.stdout + probe.stderr)
 
 # Two index entries whose names differ only in case, as a repository made elsewhere can hold: the
 # last one listed answers for the name, so a change staged to the other is not the candidate's, and
@@ -8930,6 +9091,36 @@ with tempfile.TemporaryDirectory(prefix="cwg_case_pair_") as repo:
     check("committing the twin's change leaves the fingerprint alone",
           before_commit is not None and marker_hook.content_fingerprint([cwg.normalize_path(lower)]) == before_commit,
           before_commit)
+
+check("only the platform's own separator becomes a slash, and only Windows lowers a path",
+      cwg.normalize_path("Src\\A.py") == ("src/a.py" if cwg.CASE_FOLDED_PATHS else "Src\\A.py"),
+      cwg.normalize_path("Src\\A.py"))
+# Where case and a backslash are part of a name, `A.py` and `a.py` are two files with an index
+# entry each, and `x\y.py` is one file: a change staged to `A.py` is its own divergence and moves
+# its fingerprint, and a change to `x\y.py` moves that file's (Linux port review, round 1).
+if not cwg.CASE_FOLDED_PATHS:
+    with tempfile.TemporaryDirectory(prefix="cwg_case_twins_") as repo:
+        candidate_repo(repo, "case-twins")
+        for name, text in (("A.py", "upper = 1\n"), ("a.py", "lower = 1\n"), ("x\\y.py", "slash = 1\n")):
+            with open(os.path.join(repo, "src", name), "w", encoding="utf-8") as stream:
+                stream.write(text)
+        commit_paths(repo, "src", "twins")
+        upper = os.path.join(repo, "src", "A.py")
+        before_stage = marker_hook.content_fingerprint([cwg.normalize_path(upper)])
+        staged = subprocess.run(["git", "-C", repo, "hash-object", "-w", "--stdin"], input="upper = 2\n",
+                                capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", repo, "update-index", "--cacheinfo", "100644,{},src/A.py".format(staged)],
+                       check=True)
+        twins = marker_hook.staged_divergences(os.path.join(repo, "src"), ["A.py", "a.py"])
+        check("a change staged to `A.py` is its own divergence beside `a.py`", twins == [("A.py", staged)], twins)
+        check("the staged change moves `A.py`'s fingerprint", before_stage is not None
+              and marker_hook.content_fingerprint([cwg.normalize_path(upper)]) != before_stage, before_stage)
+        slashed = os.path.join(repo, "src", "x\\y.py")
+        before_edit = marker_hook.content_fingerprint([cwg.normalize_path(slashed)])
+        with open(slashed, "w", encoding="utf-8") as stream:
+            stream.write("slash = 2\n")
+        check("a change to a name holding a backslash moves that file's fingerprint", before_edit is not None
+              and marker_hook.content_fingerprint([cwg.normalize_path(slashed)]) != before_edit, before_edit)
 
 # An unmerged path diverges with its last stage, as the index listing gave it.
 with tempfile.TemporaryDirectory(prefix="cwg_unmerged_") as repo:
@@ -8991,10 +9182,10 @@ with tempfile.TemporaryDirectory(prefix="cwg_no_snapshot_") as repo:
         run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash",
                         "tool_use_id": "shell-{}".format(uuid.uuid4().hex), "cwd": repo,
                         "tool_input": {"command": "glab api projects | python -c 'print(1)'"}})
-        entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
-        cause = (entry.get("content_marks") or [{}])[-1].get("cause") or {}
+        marker_entry = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+        cause = (marker_entry.get("content_marks") or [{}])[-1].get("cause") or {}
         check("a command whose PreToolUse hook left no snapshot is marked so",
-              cause.get("no_snapshot") is True and cause.get("reason") == "unresolved-write-capable", entry)
+              cause.get("no_snapshot") is True and cause.get("reason") == "unresolved-write-capable", marker_entry)
     finally:
         cleanup(sid)
 
@@ -9038,6 +9229,203 @@ try:
           cwg.read_json(state_file))
 finally:
     cleanup(sid)
+
+
+# --- XHIGH: the lanes an XHIGH receipt is held to, and where each lane's level is read from
+XHIGH_RECEIPT = "[gate] verified: XHIGH; KDF rewrite, XHIGH lenses and an XHIGH approval"
+XHIGH_SUBJECT = "the KDF rewrite"
+ASTRA_TURN = (cwg.XHIGH_CODEX_MODEL, cwg.XHIGH_CODEX_EFFORT)
+SOL_TURN = ("gpt-6-sol", "high")
+# The launch may name any model: only the turn the rollout log records decides the level.
+ASTRA_COMMAND = CODEX_CLI_COMMAND.replace(
+    "codex exec", "codex exec -m gpt-6-astra -c model_reasoning_effort=ultra")
+NOT_XHIGH_LANE = "did not come from an XHIGH lane"
+
+
+def xhigh_case(add_lanes, receipt=XHIGH_RECEIPT, lenses=gate.XHIGH_LENSES, last_ts=110.0,
+               durable_ts=None):
+    """A crypto-path candidate whose simplify pass ran `lenses`, then `add_lanes(events)`."""
+    sid = session()
+    seed(sid, ["C:/repo/src/crypto/kdf.ts"], last_ts=last_ts, durable_ts=durable_ts)
+    events = base_events(include_simplify=True, lenses=lenses)
+    add_lanes(events)
+    return stop_with(sid, events, receipt)
+
+
+def xhigh_native(events, subtype=cwg.XHIGH_REVIEWER, verdict="APPROVED", stamp=130, model=None):
+    add_review(events, stamp, "xreview-{}".format(stamp), review_text(verdict, XHIGH_SUBJECT),
+               subtype=subtype, model=model)
+
+
+def reuse_lens_overridden(events):
+    """The XHIGH reuse lens run with a model passed on the call, then the XHIGH reviewer approves."""
+    events.append(agent_use(125, gate.XHIGH_LENSES[0], "xreuse-override", model="sonnet"))
+    events.append(tool_result(125.5, "xreuse-override", "No actionable findings."))
+    xhigh_native(events)
+
+
+def resumed_approval(subtype):
+    """A reviewer on `subtype` answers REVISE, then approves in a round SendMessage resumed."""
+    def add_lanes(events):
+        foreground_review(events, 130, "xreview-1", "agent-x2", review_text("REVISE", XHIGH_SUBJECT),
+                          subtype=subtype)
+        send_message(events, 132, "send-132", "agent-x2")
+        events.extend(round_notification(140, "agent-x2", review_text("APPROVED", XHIGH_SUBJECT),
+                                         "send-132"))
+    return add_lanes
+
+
+def native_background_approval(events):
+    add_background_review(events, 130, "xbg-1", "agent-x1", subtype=cwg.XHIGH_REVIEWER)
+    events.extend(agent_notification(140, "agent-x1", review_text("APPROVED", XHIGH_SUBJECT)))
+
+
+def stale_xhigh_then_high(events):
+    """An XHIGH approval that an edit at 133 made stale, then a current approval below XHIGH."""
+    xhigh_native(events, stamp=130)
+    xhigh_native(events, subtype="adversarial-reviewer", stamp=135)
+
+
+def turn_records(first, logged, said, tie):
+    """A briefed log's records from `first` on: turns (model, effort) and "said", in this order,
+    each at its own stamp or, with `tie`, all at one — as records written in one millisecond are."""
+    records = [(first, "developer", reviewer_role_text() + "\n\nXHIGH turn packet.")]
+    for index, item in enumerate(logged):
+        stamp = first + 0.1 + (0.0 if tie else index / 10.0)
+        records.append((stamp, "assistant", said) if item == "said" else (stamp, "turn", item))
+    return records
+
+
+def codex_turns(*logged, tie=False):
+    """A foreground Codex round whose log holds `logged` (see `turn_records`)."""
+    said = codex_cli_output(review_text("APPROVED", XHIGH_SUBJECT))
+
+    def add_lanes(events):
+        events.append(bash_use(130, "xcodex-2", CODEX_COMMAND))
+        events.append(tool_result(131, "xcodex-2", said))
+        rollout_records(turn_records(130.1, logged, said, tie))
+    return xhigh_case(add_lanes)
+
+
+def xhigh_background(turn=None, logged=None):
+    """An XHIGH candidate whose Codex round ran in the background: its turn logged as `turn`, or
+    its log holding `logged` at one stamp (see `turn_records`)."""
+    now = time.time()
+    task_id = "xtask" + uuid.uuid4().hex[:5]
+    out_file = os.path.join(tasks_dir, task_id + ".output")
+    said = codex_cli_output(review_text("APPROVED", XHIGH_SUBJECT))
+    write_review_output(out_file, said, now - 601)
+    sid = session()
+    seed(sid, ["C:/repo/src/crypto/kdf.ts"], first_ts=now - 900, last_ts=now - 800, durable_ts=now - 800)
+    events = background_review_events(now, task_id, out_file,
+                                      DETACHED_ACK.format(id=task_id, out=out_file),
+                                      lenses=gate.XHIGH_LENSES)
+    if logged:
+        rollout_records(turn_records(now - 660, logged, said, tie=True))
+    else:
+        log_codex_run(now - 650, said, turn=turn)
+    return stop_with(sid, events, XHIGH_RECEIPT)
+
+
+def verified(result):
+    return result.get("continue") is True and "decision" not in result
+
+
+def blocked(result, *reasons):
+    return result.get("decision") == "block" and all(
+        reason in result.get("reason", "") for reason in reasons)
+
+
+check("XHIGH ranks above HIGH, and no path floor reaches it",
+      cwg.RISK_ORDER["XHIGH"] > cwg.RISK_ORDER["HIGH"]
+      and cwg.minimum_risk(["C:/repo/src/crypto/kdf.ts"]) == "HIGH", cwg.RISK_ORDER)
+check("an XHIGH receipt parses with its level",
+      gate.receipt_of(XHIGH_RECEIPT) == ("verified", XHIGH_RECEIPT.split(": ", 1)[1], "XHIGH"),
+      gate.receipt_of(XHIGH_RECEIPT))
+check("an XHIGH lens stands in for its HIGH lens, at HIGH and in the STANDARD trio",
+      gate.simplify_missing("STANDARD", {lens: "current" for lens in gate.XHIGH_LENSES}) == []
+      and gate.simplify_missing("HIGH", {gate.SIMPLIFY_LENSES[0]: "current",
+                                         gate.XHIGH_LENSES[1]: "current",
+                                         gate.XHIGH_LENSES[2]: "current"}) == [])
+for label, add_lanes, receipt, lenses, expect in (
+    ("the XHIGH lenses and the XHIGH reviewer's approval verify an XHIGH receipt",
+     xhigh_native, XHIGH_RECEIPT, gate.XHIGH_LENSES, None),
+    ("an approval from the HIGH reviewer does not, and the block names what it read",
+     lambda events: xhigh_native(events, subtype="adversarial-reviewer"), XHIGH_RECEIPT,
+     gate.XHIGH_LENSES, (NOT_XHIGH_LANE, "came from a lane below XHIGH; XHIGH lanes stated nothing")),
+    ("an XHIGH REVISE is no approval",
+     lambda events: xhigh_native(events, verdict="REVISE"), XHIGH_RECEIPT, gate.XHIGH_LENSES,
+     ("no terminal APPROVED",)),
+    ("the HIGH lenses do not stand in for their XHIGH runs",
+     xhigh_native, XHIGH_RECEIPT, gate.SIMPLIFY_LENSES, (gate.XHIGH_LENSES[0],)),
+    ("the XHIGH lanes satisfy a HIGH receipt",
+     xhigh_native, VERIFIED_HIGH, gate.XHIGH_LENSES, None),
+    ("a resumed round of the XHIGH reviewer keeps its level",
+     resumed_approval(cwg.XHIGH_REVIEWER), XHIGH_RECEIPT, gate.XHIGH_LENSES, None),
+    ("a resumed round of the HIGH reviewer does not gain it",
+     resumed_approval("adversarial-reviewer"), XHIGH_RECEIPT, gate.XHIGH_LENSES, (NOT_XHIGH_LANE,)),
+    ("the XHIGH reviewer's verdict read at its background notification is an XHIGH approval",
+     native_background_approval, XHIGH_RECEIPT, gate.XHIGH_LENSES, None),
+    ("the XHIGH reviewer run with a model passed on the call is below XHIGH",
+     lambda events: xhigh_native(events, model="haiku"), XHIGH_RECEIPT, gate.XHIGH_LENSES,
+     (NOT_XHIGH_LANE,)),
+    ("an XHIGH lens run with a model passed on the call is not that XHIGH lens",
+     reuse_lens_overridden, XHIGH_RECEIPT, gate.XHIGH_LENSES[1:], (gate.XHIGH_LENSES[0],)),
+    ("but it still proves its HIGH lens",
+     reuse_lens_overridden, VERIFIED_HIGH, gate.XHIGH_LENSES[1:], None),
+):
+    result = xhigh_case(add_lanes, receipt, lenses)
+    check("XHIGH: " + label, verified(result) if expect is None else blocked(result, *expect), result)
+result = xhigh_case(stale_xhigh_then_high, last_ts=133.0, durable_ts=133.0)
+check("XHIGH: a stale XHIGH approval lends no level to a current approval below it",
+      blocked(result, NOT_XHIGH_LANE), result)
+for label, command, turn, expect_ok in (
+    ("a Codex round whose turn ran on the XHIGH model and effort is an XHIGH approval",
+     CODEX_COMMAND, ASTRA_TURN, True),
+    ("a Codex round the command says ran on the XHIGH model but whose log shows Sol is not",
+     ASTRA_COMMAND, SOL_TURN, False),
+    ("a Codex round on the XHIGH model below its effort is not",
+     CODEX_COMMAND, (cwg.XHIGH_CODEX_MODEL, "high"), False),
+    ("a Codex round whose log records no turn is not", CODEX_COMMAND, None, False),
+):
+    result = xhigh_case(lambda events: add_codex_review(
+        events, 130, "xcodex-1", command,
+        codex_cli_output(review_text("APPROVED", XHIGH_SUBJECT)), turn=turn))
+    check("XHIGH foreground: " + label,
+          verified(result) if expect_ok else blocked(result, NOT_XHIGH_LANE), result)
+result = codex_turns(ASTRA_TURN, "said")
+check("XHIGH foreground: the turn opened before the verdict decides its level", verified(result), result)
+result = codex_turns(SOL_TURN, "said", ASTRA_TURN)
+check("XHIGH foreground: an XHIGH turn after the verdict does not raise it",
+      blocked(result, NOT_XHIGH_LANE), result)
+result = codex_turns(SOL_TURN, "said", ASTRA_TURN, tie=True)
+check("XHIGH foreground: nor does one logged in the verdict's own millisecond",
+      blocked(result, NOT_XHIGH_LANE), result)
+result = codex_turns(ASTRA_TURN, "said", SOL_TURN, tie=True)
+check("XHIGH foreground: in one millisecond, the turn opened before the verdict still decides",
+      verified(result), result)
+result = xhigh_background(logged=(SOL_TURN, "said", ASTRA_TURN))
+check("XHIGH background: an XHIGH turn in the verdict's millisecond does not raise it",
+      blocked(result, NOT_XHIGH_LANE), result)
+result = xhigh_background(ASTRA_TURN)
+check("XHIGH background: a Codex round on the XHIGH model and effort is an XHIGH approval",
+      verified(result), result)
+result = xhigh_background(SOL_TURN)
+check("XHIGH background: a Codex round on the HIGH lane's model is not",
+      blocked(result, NOT_XHIGH_LANE), result)
+
+# The XHIGH profiles are the HIGH prompts re-pinned: a drift between the two would review XHIGH
+# work by rules no HIGH lane follows.
+for base, xhigh, pins in [
+    (lens, stronger, ("model: claude-opus-5-5", "effort: max"))
+    for lens, stronger in zip(gate.SIMPLIFY_LENSES, gate.XHIGH_LENSES)
+] + [("adversarial-reviewer", cwg.XHIGH_REVIEWER, ("effort: max",))]:
+    front, body = profile_parts(xhigh)
+    check("the {} profile runs the {} prompt unchanged".format(xhigh, base),
+          body == profile_parts(base)[1], xhigh)
+    check("the {} profile is named for its lane and pinned to {}".format(xhigh, ", ".join(pins)),
+          "\nname: {}\n".format(xhigh) in front
+          and all("\n{}\n".format(pin) in front for pin in pins), front)
 
 
 print("PASS: {} assertions".format(PASSED))

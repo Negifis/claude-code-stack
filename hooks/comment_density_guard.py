@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 MIN_COMMENTS = 5          # below this, no ratio is worth acting on
 CODE_RATIO = 3            # comments must exceed this multiple of added code
@@ -197,7 +198,7 @@ def classify(lines, token):
             mark = line[:3]
             # An opener whose close is outside the window is more likely a stray closer;
             # reading it as an opener would swallow every following line.
-            if line.count(mark) < 2 and any(mark in l for l in lines[index + 1:]):
+            if line.count(mark) < 2 and any(mark in later for later in lines[index + 1:]):
                 triple = mark
             out.append("skip")
             continue
@@ -305,7 +306,14 @@ def strikes(session, path):
     persistence failure reports the budget as already spent.
     """
     tmp = os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP")
-    if not tmp or not os.path.isdir(tmp):
+    if not tmp:
+        # Linux usually sets none of them; reading only those gave every edit there a spent
+        # budget, so the guard never denied. The platform's own lookup covers it.
+        try:
+            tmp = tempfile.gettempdir()
+        except OSError:
+            return GIVE_UP_AFTER + 1
+    if not os.path.isdir(tmp):
         return GIVE_UP_AFTER + 1
     store = os.path.join(tmp, "cdg_{}.json".format(
         "".join(c if c.isalnum() or c in "-_" else "_" for c in str(session or "x"))[:64]))
@@ -319,7 +327,9 @@ def strikes(session, path):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    key = str(path).replace("\\", "/").lower()
+    # One budget per file: Windows names it without regard to case or slash direction, while
+    # elsewhere `A.py` and `a.py` are two files.
+    key = str(path).replace("\\", "/").lower() if os.name == "nt" else str(path)
     try:
         count = int(data.get(key) or 0) + 1
     except (TypeError, ValueError):
