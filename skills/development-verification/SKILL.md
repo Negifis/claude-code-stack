@@ -61,7 +61,10 @@ manufacture a review for nothing. A fetch, branches other sessions moved in a re
 worktrees share one ref store, and files the candidate never touched do not count. A commit made
 here on another branch, a tag, a stash, a note, a commit pushed while the candidate was open (even one reset away since),
 a gitignored lasting file, a candidate past the marker's path cap, or a dirty tree after a command
-the gate could not resolve keep it open; the block names which.
+the gate could not resolve keep it open; the block names which. Git is the only witness of an undo:
+outside a repository, or for a lasting path in another checkout such as a workflow's or an agent's
+isolation worktree, the gate sees none, so that candidate closes on the persistent track, its review
+confirming what remains.
 
 ## 3. Classify risk
 
@@ -179,7 +182,7 @@ review lane per round, chosen in this order:
    (`run_in_background: true`) and judged at its completion notification from the rollout log
    Codex wrote in between, the packet opening on the contents of `agents/adversarial-reviewer.md`. Cross-engine
    judgment is worth more than a second opinion from the model that wrote the code. Run
-   `python ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
+   `python3 ~/.claude/hooks/codex_lane.py check` first: a recorded outage (usage limit, model
    at capacity, a CLI too old for the model) means the lane is skipped for this round, not
    retried.
 2. **The native `adversarial-reviewer`** through `/adversarial-review-internal`, in the
@@ -383,7 +386,7 @@ the block still stands, do not re-run lanes, do not poll, do not argue with the 
 report and finish honestly.
 
 ```
-python "~/.claude/hooks/gate_inbox.py" report --session <session id> --nonce <nonce> \
+python3 ~/.claude/hooks/gate_inbox.py report --session <session id> --nonce <nonce> \
   --block "<the block reason, verbatim>" \
   --facts "<what the transcript shows, with timestamps or tool ids>" --did "<what you did instead>"
 ```

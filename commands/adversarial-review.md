@@ -17,8 +17,11 @@ Raw arguments: $ARGUMENTS
 ## 0. Check the lane before paying for it
 
 ```bash
-python "C:\Users\in\.claude\hooks\codex_lane.py" check
+python3 ~/.claude/hooks/codex_lane.py check
 ```
+
+The same line runs in Git Bash here and on the Linux VMs, which have `python3` and no `python`;
+the gate reads it as bookkeeping on both.
 
 `CODEX_LANE: available` — continue below. `CODEX_LANE: unavailable until …` — the CLI itself
 refused an earlier launch (usage limit, model at capacity) and named when to retry; do not
@@ -58,9 +61,9 @@ leave the launch unrecognizable and it binds nothing.
 Write the packet by its full path rather than after a `cd` into a scratch directory, and keep the
 launch command to the launch alone: `REVIEW_ID=<literal>`, at most a `cd`, and the `codex exec`
 below as it stands — bare `codex`, only the options shown, its packet on stdin and its stderr in
-`/c/tmp`, joined by `;`, `&&` or a newline. Such a command writes nothing the candidate holds and
-expires no verdict wherever it starts, so a candidate with no repository keeps its verdict too
-(reports a269a6fc, a5767180). Anything else in it — a write, a pipe onward, another program or
+`/c/tmp`, joined by `;` or `&&`, the two joiners the lane's auto-mode rule allows. Such a
+command writes nothing the candidate holds and expires no verdict wherever it starts, so a
+candidate with no repository keeps its verdict too (reports a269a6fc, a5767180). Anything else in it — a write, a pipe onward, another program or
 option, a variable Codex reads — makes it an ordinary command, and one that starts outside any
 repository then expires the very verdict filed at its start. When the marker
 hook left no copy of the packet, the Stop hook reads the file itself, but only while nothing has
@@ -154,7 +157,7 @@ The model is `gpt-6-sol` (`gpt-6-astra` on an XHIGH round), which an older CLI r
 or, as 0.154.0 did, with `is not supported when using Codex with a ChatGPT account` (the
 verified versions are in `reference/codex-routing.md`). Either refusal is recorded as an
 outage like a usage limit. The fix is `npm install -g @openai/codex@latest` followed by
-`python ~/.claude/hooks/codex_lane.py clear`, which lifts the recorded outage at once; never an
+`python3 ~/.claude/hooks/codex_lane.py clear`, which lifts the recorded outage at once; never an
 older model in this command.
 
 The sandbox bypass is not optional here: the Windows restricted-token sandbox fails to start

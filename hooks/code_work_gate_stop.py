@@ -19,6 +19,7 @@ cycle is retired as unverified, preventing an infinite Stop loop.
 """
 import datetime
 import fnmatch
+import functools
 import hashlib
 import html
 import json
@@ -90,6 +91,18 @@ NOTIFICATION_CALL_RE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>")
 NOTIFICATION_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
 # An agent's notification carries its final message, HTML-escaped, as the result.
 NOTIFICATION_RESULT_RE = re.compile(r"<result>(.*?)</result>", re.S)
+# COMPAT: a subagent's final report can reach the parent as a hand-back, a peer message: an
+# `attachment` of type `queued_command` whose `origin` says `handback` and carries the report as
+# `body`. The Agent tool result and the notification `<result>` then hold only this pointer, and
+# the verdict is read from the hand-back of the agent it names (report 869967e7).
+HANDBACK_POINTER_RE = re.compile(
+    r"^\s*This agent's report was delivered to you as a message from \"([A-Za-z0-9_-]+)\" "
+    r"\(its SubagentHandback call\)"
+)
+# INVARIANT: a hand-back answers a call when recorded from a second before the call started to this
+# many seconds after its pointer; the harness writes it just before the pointer, and records from
+# its different parts keep no common order in time.
+HANDBACK_SLACK = 30.0
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 MAX_SIMPLIFY_PASSES = 2
@@ -146,6 +159,11 @@ _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
 # What each session was given inside the same window, from the same scan.
 _CODEX_GIVEN = {}
+# Whether the scan found the session briefed with the role on disk (None when the log could not be
+# read whole), and what an unbriefed one said in the window: they tell a result dropped for want of
+# the role from one nobody stated (report 87500a6c).
+_CODEX_BRIEFED = {}
+_CODEX_UNBRIEFED_SAID = {}
 # (model, effort) of the turn each record of `_CODEX_SAID` was said in, aligned with that list.
 _CODEX_TURNS = {}
 # The session being judged, for the ledger lines written from inside the transcript scan — and
@@ -368,6 +386,7 @@ def session_records(path, mtime_ns, size, started, finished):
     role = reviewer_role()
     briefed_at = None
     said, given, turn = [], [], None
+    complete = True
     try:
         with open(path, "rb") as raw:
             for line in read_span(raw, 0, min(size, CODEX_HEAD_BYTES)):
@@ -376,7 +395,11 @@ def session_records(path, mtime_ns, size, started, finished):
                     break
             # One byte back so the record starting exactly at that offset is not mistaken for
             # the partial line `read_span` discards.
-            for line in read_span(raw, max(0, seek_time(raw, size, started) - 1), size):
+            start = max(0, seek_time(raw, size, started) - 1)
+            # A window opening past the head leaves the log between them unread: a brief there
+            # goes unseen, so its absence is not established.
+            complete = start <= CODEX_HEAD_BYTES
+            for line in read_span(raw, start, size):
                 if '"turn_context"' in line:
                     # Output belongs to the turn opened last before it in the log's own order:
                     # records written in one millisecond share a stamp, so time cannot tell.
@@ -398,11 +421,16 @@ def session_records(path, mtime_ns, size, started, finished):
                         # A resumed round is briefed again, right before it answers.
                         briefed_at = stamp if briefed_at is None else min(briefed_at, stamp)
     except OSError:
-        pass
+        complete = False
     # Only what the session said after it was briefed counts, and normalizing is deferred until
-    # then: an errand's output is discarded whole, which on these logs is the common case.
+    # then: an errand's output, the common case on these logs, is normalized only if a result
+    # fails to bind and its reason is sought.
     _CODEX_GIVEN[key] = given
     kept = [] if briefed_at is None else [record for record in said if record[0] >= briefed_at]
+    # A read the shared budget cut short cannot tell that the role was never given.
+    complete = complete and _CODEX_RUNS["budget"] >= 0
+    _CODEX_BRIEFED[key] = True if briefed_at is not None else (False if complete else None)
+    _CODEX_UNBRIEFED_SAID[key] = said if briefed_at is None else ()
     _CODEX_TURNS[key] = [opened for _, _, opened in kept]
     _CODEX_SAID[key] = [(at, normalized(text), text) for at, text, _ in kept]
     return _CODEX_SAID[key]
@@ -520,9 +548,25 @@ def session_said_place(path, mtime_ns, size, started, finished, excerpt):
     return found
 
 
+# Why a session whose words the log plainly holds still binds nothing: the role it was given is not
+# the reviewer role on disk. Rounds went unbound as "no verdict" while the verdict sat in the log,
+# and saying so turns them into one fix (report 87500a6c).
+UNBRIEFED = ("was not briefed with the reviewer role on disk: a packet carries "
+             "agents/adversarial-reviewer.md word for word, and one with an edited role binds nothing")
+
+
+def unbriefed_said(key, started, finished, excerpt):
+    """Whether the session a scan found unbriefed (`session_records` under `key`) said `excerpt`
+    while the call was open. It names a reason and binds nothing."""
+    return _CODEX_BRIEFED.get(key) is False and any(
+        started <= at <= finished + CODEX_RUN_SLACK and excerpt in normalized(spoken)
+        for at, spoken, _ in _CODEX_UNBRIEFED_SAID.get(key, ()))
+
+
 def codex_produced(text, started, finished, since):
-    """(bound, tier): whether a Codex run overlapping this call logged the very output the call
-    returned, and the level of the turn that said it (`codex_tier`).
+    """(bound, tier, unbriefed): whether a Codex run overlapping this call logged the very output
+    the call returned, the level of the turn that said it (`codex_tier`), and, when nothing binds,
+    whether a session never briefed with the role on disk said it, which is then why.
 
     SECURITY: a run overlapping in time says only that some Codex process was busy nearby — a
     rescue, another session, a detached run — which any command printing a verdict could borrow.
@@ -536,7 +580,7 @@ def codex_produced(text, started, finished, since):
     # same way — and "VERDICT: APPROVED" alone is every approval ever written. A review that
     # states nothing loses the lane its evidence, which is the safe direction.
     if len(whole) < CODEX_MIN_BINDING:
-        return False, None
+        return False, None, False
     excerpt = whole[-CODEX_EXCERPT:]
     candidates = []
     for path, _ in codex_run_files(since):
@@ -557,8 +601,10 @@ def codex_produced(text, started, finished, since):
     for _, path, mtime_ns, size in candidates:
         place = session_said_place(path, mtime_ns, size, started, finished, excerpt)
         if place is not None:
-            return True, codex_tier(path, mtime_ns, size, started, finished, place)
-    return False, None
+            return True, codex_tier(path, mtime_ns, size, started, finished, place), False
+    return False, None, any(
+        unbriefed_said(codex_cache_key(path, mtime_ns, size, started, finished), started, finished, excerpt)
+        for _, path, mtime_ns, size in candidates)
 
 
 # A packet shorter than this is not distinctive enough to name a session.
@@ -625,6 +671,10 @@ def packet_of_launch(command, call_id, started=None):
     text = capture.get("text")
     if not isinstance(text, str):
         return True, "", "the capture holds no text"
+    if not text.strip():
+        # Not a short packet but none at all: the usual cause is a launch command that writes its
+        # own packet, which does not exist yet when the capture is taken (report 926b670b).
+        return True, "", "the packet file was absent or empty when the launch started"
     distinctive = distinctive_of(text)
     if len(distinctive) < PACKET_MIN_CHARS:
         return True, "", "the packet beyond the reviewer role is too short to name a session"
@@ -681,7 +731,7 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
         # Codex, so nothing existed when the marker hook looked before the command ran.
         return None, ("packet fed on stdin but nothing to bind by at launch ({}); write the "
                       "packet in its own call before launching").format(why), None
-    verdicts, given = {}, []
+    verdicts, given, briefed = {}, [], {}
     for path, _ in codex_run_files(since):
         try:
             stat = os.stat(path)
@@ -700,6 +750,8 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
                 verdicts[path] = (control, place, stat.st_mtime_ns, stat.st_size)
         if packet and session_given(path, stat.st_mtime_ns, stat.st_size, started, finished, packet):
             given.append(path)
+            briefed[path] = _CODEX_BRIEFED.get(
+                codex_cache_key(path, stat.st_mtime_ns, stat.st_size, started, finished))
 
     def answer(path):
         control, place, mtime_ns, size = verdicts[path]
@@ -713,6 +765,8 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
                        else "{} sessions were given this launch's packet".format(len(given)))
             return None, unbound, None
         if given[0] not in verdicts:
+            if briefed.get(given[0]) is False:
+                return None, "the session given the packet " + UNBRIEFED, None
             return None, "the session given the packet stated no verdict in the window", None
         return answer(given[0])
     if len(verdicts) != 1:
@@ -776,11 +830,51 @@ def resumed_agent(text):
     return agent if isinstance(agent, str) else None
 
 
+def handback_of(entry):
+    """The agent id and report of a hand-back delivery record, or (None, None): the command
+    absorbed mid-turn (`attachment` of type `queued_command`) or, when the session was idle, the
+    system turn (`user`) the harness writes, each carrying the harness's `origin`. The frame is
+    the body's first line and the report is indented under it, so no line of the report can pass
+    for the frame."""
+    attachment = entry.get("attachment")
+    if entry.get("type") == "attachment" and isinstance(attachment, dict) \
+            and attachment.get("type") == "queued_command":
+        origin = attachment.get("origin")
+    elif entry.get("type") == "user" and entry.get("promptSource") == "system":
+        origin = entry.get("origin")
+    else:
+        return None, None
+    if not isinstance(origin, dict) or origin.get("kind") != "peer" or origin.get("handback") is not True:
+        return None, None
+    agent, body = str(origin.get("from") or ""), str(origin.get("body") or "")
+    if not agent:
+        return None, None
+    frame, _, report = body.partition("\n")
+    return agent, (report if frame.startswith("[Subagent hand-back]") else body)
+
+
+def in_handback_window(recorded, started, pointed):
+    """Whether a hand-back recorded at `recorded` answers a call started at `started` whose result or
+    notification pointed at a hand-back at `pointed`."""
+    return started - 1 <= recorded <= pointed + HANDBACK_SLACK
+
+
+def take_handback(handbacks, agent, started, pointed):
+    """The latest unread hand-back from `agent` in the window of the call pointing at it, marked
+    read; None if none."""
+    for slot in reversed(handbacks.get(agent, ())):
+        if not slot[2] and in_handback_window(slot[0], started, pointed):
+            slot[2] = True
+            return slot[1]
+    return None
+
+
 def judge_background_agents(evidence, launches, notices_by_task):
     """File each backgrounded native review lane once all its notifications are read.
 
     The verdict is the control line in the notification's result — the harness's own record of
-    the agent's final message, HTML-escaped there — filed at the launch exactly as a background
+    the agent's final message, HTML-escaped there — or in the hand-back that result points at,
+    filed at the launch exactly as a background
     Codex verdict is: nothing edited after the launch was read by the lane, so a durable edit
     since then expires it. An agent notifies once per stop, and one that paused to wait for its
     own background suite reports first without a verdict, so the first notice that states a
@@ -872,6 +966,83 @@ def transcript_evidence(path, since, skill_since=None):
     resume_rounds = {}
     open_rounds = {}
     latest_rounds = {}
+    # Hand-backs by agent id as `[stamp, report, read]`, and the pointers recorded before theirs as
+    # `(started, pointed, finish, pointer)`; one still waiting when the scan ends is filed on its
+    # pointer, which states no verdict.
+    handbacks = {}
+    awaiting = {}
+
+    def fill_control(notice, text):
+        notice[2] = reviewer_control(text)
+
+    def read_or_await(agent, started, pointed, finish, pointer):
+        report = take_handback(handbacks, agent, started, pointed)
+        if report is None:
+            awaiting.setdefault(agent, []).append((started, pointed, finish, pointer))
+        else:
+            finish(report)
+
+    def settle(call, block, stamp, text):
+        """File one foreground result inside the window: a Codex shell call, a simplify lane or a
+        native review, `text` being what it reported."""
+        failed = bool(block.get("is_error"))
+        if call["kind"] == "external":
+            # A review round is a terminal control line the session log shows a Codex run producing
+            # while the call was open — text alone can be printed by anything, and `codex` also
+            # runs errands. The exit status decides only whether the verdict can be trusted, not
+            # whether it is read: a review that printed its verdict and then tripped over a
+            # pipeline still stated an opinion. `--required` is held to the same bar, so a status
+            # dump is an unavailable reviewer rather than a satisfied requirement.
+            control = reviewer_control(text)
+            stated = control[0] in ("ordinary", "closure")
+            bound, tier, unbriefed = codex_produced(
+                text, call["started"], stamp, skill_since
+            ) if stated else (False, None, False)
+            judged = bound and not failed
+            evidence["external_results"].append(
+                (
+                    stamp,
+                    block.get("tool_use_id"),
+                    call["required"],
+                    "success" if judged else "failure",
+                )
+            )
+            if judged:
+                record_control(evidence, stamp, control, tier=tier)
+                review_note(at=stamp,
+                            engine="codex", verdict=control[1], tier=tier)
+            elif bound or (stated and call["marked"]):
+                # An unattributable verdict is never filed as one, but dropping it would leave an
+                # earlier approval as the last word — so a call that declared itself the review
+                # lane is heard as failed activity, which reopens that approval. The declaration
+                # is needed only here: a result the session log vouches for has proved what it is.
+                evidence["review_failures"].append(stamp)
+                if bound:
+                    why = "the review call failed after stating its verdict"
+                elif unbriefed:
+                    why = "the Codex session that printed the verdict " + UNBRIEFED
+                else:
+                    why = "no Codex run's log shows the verdict the call printed"
+                evidence["unbound_reasons"].append((len(evidence["review_events"]), why))
+                record_control(evidence, stamp, ("unbound", None), malformed=True)
+            return
+        if call["kind"] == "simplify":
+            subtype = call["subtype"]
+            if failed:
+                evidence["simplify_failures"].setdefault(subtype, []).append(stamp)
+            elif text.strip():
+                evidence["simplify_successes"].setdefault(subtype, []).append(stamp)
+            return
+        if failed:
+            evidence["review_failures"].append(stamp)
+            evidence["review_events"].append((stamp, "failure", None))
+            return
+        control = reviewer_control(text)
+        tier = call.get("tier")
+        record_control(evidence, stamp, control, malformed=True, tier=tier)
+        if control[0] in ("ordinary", "closure"):
+            review_note(at=stamp, engine="native", verdict=control[1], tier=tier)
+
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
             for raw in stream:
@@ -880,6 +1051,7 @@ def transcript_evidence(path, since, skill_since=None):
                     and '"tool_result"' not in raw
                     and '"name"' not in raw
                     and "task-notification" not in raw
+                    and '"handback"' not in raw
                 ):
                     continue
                 try:
@@ -891,9 +1063,24 @@ def transcript_evidence(path, since, skill_since=None):
                     evidence["scan_failed"] = True
                     continue
                 stamp = parse_ts(entry.get("timestamp"))
-                if "task-notification" in raw and entry.get("type") in NOTIFICATION_RECORDS:
+                # SECURITY: a hand-back is read before any notification parsing, since its report is a
+                # subagent's own text: a notification block it quotes must never file a lane's verdict.
+                if entry.get("type") in ("attachment", "user") and '"handback"' in raw:
+                    agent, report = handback_of(entry)
+                    if agent:
+                        waiting = awaiting.get(agent) or []
+                        match = next((index for index, (started, pointed, _, _) in enumerate(waiting)
+                                      if in_handback_window(stamp, started, pointed)), None)
+                        if match is None:
+                            handbacks.setdefault(agent, []).append([stamp, report, False])
+                        else:
+                            waiting.pop(match)[2](report)
+                        continue
+                peer = isinstance(entry.get("origin"), dict) and entry["origin"].get("kind") == "peer"
+                if "task-notification" in raw and entry.get("type") in NOTIFICATION_RECORDS and not peer:
                     # Only the harness's own notification record is handled here; a tool
-                    # result that merely mentions the word is ordinary evidence below.
+                    # result that merely mentions the word is ordinary evidence below, and a
+                    # peer's message quoting one is that peer's text.
                     notices = NOTIFICATION_RE.findall(notification_text(entry))
                     for notice in notices:
                         status_match = NOTIFICATION_STATUS_RE.search(notice)
@@ -926,13 +1113,17 @@ def transcript_evidence(path, since, skill_since=None):
                                 # activity after the first. Only a completed lane's result is a
                                 # result; a killed or failed one's control is never read.
                                 found = NOTIFICATION_RESULT_RE.search(notice)
-                                control = (
-                                    reviewer_control(html.unescape(found.group(1) if found else ""))
-                                    if status == "completed" else None
-                                )
-                                agent_notices.setdefault(lane, []).append(
-                                    (stamp, status, control)
-                                )
+                                result = html.unescape(found.group(1)) if found else ""
+                                notice_entry = [stamp, status, None]
+                                if status == "completed":
+                                    notice_entry[2] = reviewer_control(result)
+                                    pointer = HANDBACK_POINTER_RE.match(result)
+                                    if pointer and pointer.group(1) == task_id:
+                                        # `review_lane` names only a launch one of these maps holds.
+                                        started = (resume_rounds.get(lane) or background_agents[lane])["started"]
+                                        read_or_await(task_id, started, stamp,
+                                                      functools.partial(fill_control, notice_entry), result)
+                                agent_notices.setdefault(lane, []).append(notice_entry)
                                 if open_rounds.get(task_id) == lane:
                                     del open_rounds[task_id]
                             call = background_calls.pop(task_id, None)
@@ -1183,76 +1374,25 @@ def transcript_evidence(path, since, skill_since=None):
                             continue
                     if call is None:
                         continue
-                    if call["kind"] == "review" and call["foreground"]:
-                        trailer = AGENT_TRAILER_RE.search(text)
-                        if trailer:
-                            review_agents[trailer.group(1)] = call
+                    agent_result = call["kind"] in ("review", "simplify")
+                    trailer = AGENT_TRAILER_RE.search(text) if agent_result else None
+                    if call["kind"] == "review" and call["foreground"] and trailer:
+                        review_agents[trailer.group(1)] = call
                     if (before_candidate or call.get("prior") or call["kind"] == "agent"
                             or not call["foreground"]):
                         continue
-                    failed = bool(block.get("is_error"))
-                    if call["kind"] == "external":
-                        # A review round is a terminal control line the session log shows a Codex
-                        # run producing while the call was open — text alone can be printed by
-                        # anything, and `codex` also runs errands. The exit status decides only
-                        # whether the verdict can be trusted, not whether it is read: a review
-                        # that printed its verdict and then tripped over a pipeline still stated
-                        # an opinion. `--required` is held to the same bar, so a status dump is
-                        # an unavailable reviewer rather than a satisfied requirement.
-                        control = reviewer_control(text)
-                        stated = control[0] in ("ordinary", "closure")
-                        bound, tier = codex_produced(
-                            text, call["started"], stamp, skill_since
-                        ) if stated else (False, None)
-                        judged = bound and not failed
-                        evidence["external_results"].append(
-                            (
-                                stamp,
-                                block.get("tool_use_id"),
-                                call["required"],
-                                "success" if judged else "failure",
-                            )
-                        )
-                        if judged:
-                            record_control(evidence, stamp, control, tier=tier)
-                            review_note(at=stamp,
-                                          engine="codex", verdict=control[1], tier=tier)
-                        elif bound or (stated and call["marked"]):
-                            # An unattributable verdict is never filed as one, but dropping it
-                            # would leave an earlier approval as the last word — so a call that
-                            # declared itself the review lane is heard as failed activity, which
-                            # reopens that approval. The declaration is needed only here: a
-                            # result the session log vouches for has proved what it is.
-                            evidence["review_failures"].append(stamp)
-                            evidence["unbound_reasons"].append((len(evidence["review_events"]), (
-                                "the review call failed after stating its verdict" if bound
-                                else "no Codex run's log shows the verdict the call printed")))
-                            record_control(evidence, stamp, ("unbound", None), malformed=True)
-                        continue
-                    if call["kind"] == "simplify":
-                        subtype = call["subtype"]
-                        if failed:
-                            evidence["simplify_failures"].setdefault(
-                                subtype, []
-                            ).append(stamp)
-                        elif text.strip():
-                            evidence["simplify_successes"].setdefault(
-                                subtype, []
-                            ).append(stamp)
-                        continue
-
-                    if failed:
-                        evidence["review_failures"].append(stamp)
-                        evidence["review_events"].append(
-                            (stamp, "failure", None)
-                        )
-                        continue
-                    control = reviewer_control(text)
-                    tier = call.get("tier")
-                    record_control(evidence, stamp, control, malformed=True, tier=tier)
-                    if control[0] in ("ordinary", "closure"):
-                        review_note(at=stamp,
-                                      engine="native", verdict=control[1], tier=tier)
+                    # SECURITY: only an agent's result is followed to a hand-back, since a shell
+                    # command can print the pointer's words, and never to another agent than the
+                    # harness's trailer names.
+                    pointer = HANDBACK_POINTER_RE.match(text) if agent_result else None
+                    if pointer and (trailer is None or trailer.group(1) == pointer.group(1)):
+                        read_or_await(pointer.group(1), call["started"], stamp,
+                                      functools.partial(settle, call, block, stamp), text)
+                    else:
+                        settle(call, block, stamp, text)
+        for waiting in awaiting.values():
+            for _, _, finish, pointer in waiting:
+                finish(pointer)
         judge_background_agents(evidence, dict(background_agents, **resume_rounds), agent_notices)
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the

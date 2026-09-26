@@ -98,7 +98,7 @@ implementation without touching a file.
 | Hook | Event | Effect |
 |------|-------|--------|
 | `continuity_session_start.py` | SessionStart | Restores the checkpoint — authoritative after compaction or resume, an unverified lead on a fresh start, not at all after `clear` |
-| `continuity_prompt.py` | UserPromptSubmit | Detects corrections, injects this contract, escalates to clean-room after two in a row, nudges the checkpoint on long tasks |
+| `continuity_prompt.py` | UserPromptSubmit | Detects corrections in the user's own turns, injects this contract, escalates to clean-room after two in a row, nudges the checkpoint on long tasks; a turn the harness delivers (a notification, a subagent's or another session's message) only resets the loop counters |
 | `continuity_loop_guard.py` | PreToolUse | Denies a third identical file read; warns on a third identical shell command |
 | `continuity_progress.py` | PostToolUse | An edit ends the generation, clears the loop counters, and counts toward the checkpoint nudge |
 | `continuity_stop.py` | Stop | Lints the final answer for edit-history residue in the few turns after a correction |

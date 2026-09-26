@@ -1,7 +1,7 @@
 ---
 description: "Show, write, or refresh the task checkpoint for this directory (survives compaction and restarts)."
 argument-hint: "[show|write|project]"
-allowed-tools: "Bash(python:*), Read, Write, Edit"
+allowed-tools: "Bash(python3:*), Read, Write, Edit"
 ---
 
 # Checkpoint
@@ -11,7 +11,7 @@ Argument: `$ARGUMENTS` (empty means `write`).
 Resolve the path first:
 
 ```bash
-python ~/.claude/hooks/continuity_checkpoint.py path
+python3 ~/.claude/hooks/continuity_checkpoint.py path
 ```
 
 ## show
@@ -19,7 +19,7 @@ python ~/.claude/hooks/continuity_checkpoint.py path
 Print the current checkpoint and say in one line whether it still matches the working tree:
 
 ```bash
-python ~/.claude/hooks/continuity_checkpoint.py show
+python3 ~/.claude/hooks/continuity_checkpoint.py show
 ```
 
 ## write (default)

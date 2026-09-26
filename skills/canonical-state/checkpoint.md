@@ -12,7 +12,7 @@ session costs one file read instead of a fresh investigation.
   home for it, and the team benefits. Check `.gitignore` first and do not commit working state
   without a real reason.
 - Exact path for the current directory:
-  `python ~/.claude/hooks/continuity_checkpoint.py path`
+  `python3 ~/.claude/hooks/continuity_checkpoint.py path`
   (`show` prints the contents, `template` prints the empty form). The SessionStart hook also
   states the path every time a session opens.
 
