@@ -1457,7 +1457,7 @@ def vouching_tree(path, roots):
     return None, ()
 
 
-def own_delta(session, cwd, candidates, window_start, write_shaped, roots):
+def own_delta(session, cwd, candidates, window_start, write_shaped, roots, command):
     """Split a snapshot delta into what this command answers for and what nobody can name.
 
     A before/after diff of the working repository and the configuration homes sees every write
@@ -1466,11 +1466,15 @@ def own_delta(session, cwd, candidates, window_start, write_shaped, roots):
     its own could be left holding paths it must then review, simplify and close on — which no
     receipt it can honestly write covers.
 
-    A write-shaped command keeps its whole delta. Its own text says it wrote something, which is
-    direct evidence about this session; another session announcing the same path only says that
-    session wrote it too. Subtracting on the weaker evidence would let a real in-place edit of a
-    sensitive file leave no candidate at all, and losing a durable write out of the gate is worse
-    than one extra review round.
+    A write-shaped command keeps its delta. Its own text says it wrote something, which is direct
+    evidence about this session; another session announcing the same path only says that session
+    wrote it too. Subtracting on the weaker evidence would let a real in-place edit of a sensitive
+    file leave no candidate at all, and losing a durable write out of the gate is worse than one
+    extra review round. What the text says stops at the names in it, though: a path another
+    session settled inside the window whose file name appears nowhere in the `command` is
+    ambiguous here — the floor stays, the path does not. An `rm` of scratch folders ahead of a test run had kept
+    another session's concurrent edit of a test file, and every later edit of that session then
+    moved this candidate's fingerprint and outdated its approval (report 92838fca).
 
     For every other command, two subtractions, in order of how much they prove. A path another
     session announced inside this window is that session's, recorded in its own marker. What is
@@ -1496,9 +1500,17 @@ def own_delta(session, cwd, candidates, window_start, write_shaped, roots):
     A registry too large to read in one scan puts everything left over on the ambiguous side for
     the same reason: what was not read cannot be evidence that nobody else owns it.
     """
-    if write_shaped:
-        return list(candidates), []
     claimed, announced, busy_dirs, overflow = cwg.foreign_activity(session, window_start)
+    if write_shaped:
+        spelled = cwg.fold_case(command)
+        mine, ambiguous = [], []
+        for path in candidates:
+            normalized = cwg.absolute_path(path, cwd)
+            if normalized in claimed and cwg.basename(normalized) not in spelled:
+                ambiguous.append(normalized)
+            else:
+                mine.append(path)  # raw, as a write-shaped delta always was
+        return mine, ambiguous
     mine = []
     ambiguous = []
     for path in candidates:
@@ -3141,6 +3153,7 @@ def main():
                     shell_write(data),
                     [(cwg.normalize_path(root), ()) for root in snapshot_roots if root]
                     + [(root, AGENT_CONFIG_SKIP) for root in watched_roots],
+                    str((data.get("tool_input") or {}).get("command") or ""),
                 )
                 # A change under a root the command neither ran in nor names is another
                 # session's work seen through a shared home, not this command's: on

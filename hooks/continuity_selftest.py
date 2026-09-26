@@ -344,6 +344,51 @@ def scenario_false_positives():
     check("8 false positives", blocked(stop(sid, "Вместо предыдущего варианта — пул.")),
           "a requirement change gets a fresh block budget")
 
+    # Turns the harness delivers are not the user's words: a hand-back that says "instead", another
+    # session that says "нет, не так", a notification that says "actually", a notice, and a
+    # compaction summary quoting old corrections move no requirements.
+    for n, text in enumerate((
+            '<agent-message from="a1b2c3">\n[Subagent hand-back] The report follows:\n'
+            "  Use the helper instead of the loop.",
+            "Another Claude session sent a message:\n<cross-session-message from=\"local_1\">"
+            "нет, не так — переделай</cross-session-message>",
+            '<cross-session-message from="local_2">вместо очереди используй пул</cross-session-message>',
+            "<task-notification>\n<task-id>b1</task-id>\n<summary>Actually the suite failed"
+            "</summary>\n</task-notification>",
+            "<system-reminder>\nThe user started your suggested background task task_1 in a separate "
+            "local session instead.\n</system-reminder>",
+            "This session is being continued from a previous conversation that ran out of context.\n"
+            "All user messages: \"нет, не так\", \"переделай\".")):
+        check("8 false positives", not context_of(prompt(forget("selftest-8h{}".format(n)), text)),
+              "a machine-delivered turn injects nothing")
+    # The harness also sets a notice in front of what the user typed; the words after it are theirs.
+    check("8 false positives",
+          "[Canonical state]" in context_of(prompt(
+              forget("selftest-8k"),
+              "<system-reminder>\nThe user started your suggested background task task_2 (\"Fix it\") "
+              "in a separate local session.\n</system-reminder>\n\nнет, не так")),
+          "a correction typed after a harness notice is still a correction")
+    sid = forget("selftest-8i")
+    prompt(sid, "нет, не так")
+    prompt(sid, "<task-notification>\n<task-id>b2</task-id>\n</task-notification>")
+    check("8 false positives",
+          "[Clean-room rebuild]" in context_of(prompt(sid, "опять не то, я же просил иначе")),
+          "a notification between two corrections leaves their streak intact")
+    sid = forget("selftest-8l")
+    prompt(sid, "нет, не так")
+    prompt(sid, "<system-reminder>\nThe user started your suggested background task task_3.\n</system-reminder>")
+    check("8 false positives",
+          "[Clean-room rebuild]" in context_of(prompt(sid, "опять не то, я же просил иначе")),
+          "a turn holding only a harness notice leaves a correction streak intact")
+    sid = forget("selftest-8j")
+    read = {"session_id": sid, "cwd": CWD, "tool_name": "Read",
+            "tool_input": {"file_path": os.path.join(CWD, "sample.txt")}}
+    run("continuity_loop_guard.py", read)
+    run("continuity_loop_guard.py", read)
+    prompt(sid, "<task-notification>\n<task-id>b3</task-id>\n</task-notification>")
+    check("8 false positives", not denied(run("continuity_loop_guard.py", read)),
+          "a notification still opens a new generation for the loop guard")
+
 
 # 9. Checkpoint trust: only a live checkpoint on a continuing session is authoritative.
 def scenario_checkpoint_trust():

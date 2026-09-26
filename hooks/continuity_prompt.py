@@ -60,6 +60,25 @@ HISTORY = [
 STRONG_RE = re.compile("|".join(STRONG), re.I)
 WEAK_RE = re.compile("|".join(WEAK), re.I)
 HISTORY_RE = re.compile("|".join(HISTORY), re.I)
+# Turns the harness delivers rather than the user types, each as its transcript opens it: a
+# background task's notification, a subagent's hand-back or another session's message (absorbed
+# mid-turn, or as an idle turn), the summary a compaction resumes from. Their words are model output
+# or bookkeeping, and a report that says "instead" is not the user moving the requirements.
+MACHINE_TURN_RE = re.compile(
+    r"\s*(?:<task-notification>|<agent-message\b|<cross-session-message\b|"
+    r"Another Claude session sent a message:|This session is being continued from a previous conversation)")
+# A notice the harness sets in front of the user's own words (a suggested task started or ended):
+# not what they typed, so it is set aside, and a turn holding nothing else is the harness's.
+LEADING_NOTICE_RE = re.compile(r"\s*<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def own_words(prompt):
+    """The prompt without the harness notices set in front of it."""
+    notice = LEADING_NOTICE_RE.match(prompt)
+    while notice:
+        prompt = prompt[notice.end():]
+        notice = LEADING_NOTICE_RE.match(prompt)
+    return prompt
 
 # How many further turns a correction keeps the output lint armed. Long enough to cover the
 # answer the correction was about, short enough that an unrelated later turn is not linted.
@@ -126,7 +145,15 @@ def main():
     data = cc.read_stdin_json()
     try:
         prompt = cc.normalize(data.get("prompt") or data.get("user_input"))
-        strong, weak, history = classify(prompt)
+        key = cc.session_key(data.get("session_id"))
+        typed = own_words(prompt)
+        if MACHINE_TURN_RE.match(typed) or (typed != prompt and not typed.strip()):
+            # What arrived can change what a repeated call returns, so the loop counters reset;
+            # the turn, correction and checkpoint counts are the user's and stay as they were.
+            cc.update_state(key, cc.bump_generation)
+            cc.quiet()
+            return
+        strong, weak, history = classify(typed)
 
         def apply(state):
             cc.bump_generation(state)
@@ -149,7 +176,6 @@ def main():
                         int(state.get("lint_until_turn") or 0), turns + LINT_WINDOW)
             return turns, int(state.get("streak") or 0), int(state.get("edits") or 0)
 
-        key = cc.session_key(data.get("session_id"))
         _, outcome = cc.update_state(key, apply)
         if outcome is None:
             cc.quiet()

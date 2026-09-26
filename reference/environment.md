@@ -158,7 +158,7 @@ through a `node_modules` junction. `hygiene_common.unlink_directory_links` remov
 directory reparse point under a tree (junctions, directory symlinks) without entering it, read
 from attributes any Python 3 reports; `chip_handoff.py` runs it
 before each of its removals, and by hand it is
-`python hooks/hygiene_common.py unlink-links <tree> && git worktree remove <tree>`, which the
+`python3 hooks/hygiene_common.py unlink-links <tree> && git worktree remove <tree>`, which the
 audit prints for stale trees. The command refuses a main checkout and exits 1 when a link will
 not go.
 

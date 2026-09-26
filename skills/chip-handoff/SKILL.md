@@ -29,8 +29,8 @@ worktree and branch with it.
 `open` remains for a chip you are setting up by hand:
 
 ```bash
-python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>"
-python "C:\Users\in\.claude\hooks\chip_handoff.py" open --title "<заголовок>" --operational
+python3 ~/.claude/hooks/chip_handoff.py open --title "<заголовок>"
+python3 ~/.claude/hooks/chip_handoff.py open --title "<заголовок>" --operational
 ```
 
 It prints the worktree to pass as `cwd` and the block to append to `prompt`. Session ids are
@@ -88,8 +88,8 @@ When a chip is waiting:
 2. Then close it:
 
    ```bash
-   python "C:\Users\in\.claude\hooks\chip_handoff.py" close --chip <id> --accept
-   python "C:\Users\in\.claude\hooks\chip_handoff.py" close --chip <id> --rework "<что доделать>"
+   python3 ~/.claude/hooks/chip_handoff.py close --chip <id> --accept
+   python3 ~/.claude/hooks/chip_handoff.py close --chip <id> --rework "<что доделать>"
    ```
 
    Closing is not optional bookkeeping: until a chip is closed its parent is reminded again on
