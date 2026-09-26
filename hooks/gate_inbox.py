@@ -30,10 +30,9 @@ import sys
 import time
 import uuid
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import code_work_gate_common as cwg  # noqa: E402
+import code_work_gate_common as cwg
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 LEDGER_TAIL = 12
 DIGEST_LIMIT = 10
 # A verdict expired this soon after a review was stated is the pattern that cost a session a

@@ -70,7 +70,9 @@ The user selects Sol for native Codex work and keeps Luna where it was chosen: t
 role and the `low` and `research` profiles run on `gpt-6-luna`. The root baseline is `gpt-6-sol`
 with `medium` effort. Discovery uses the configured `explorer` role, deterministic checks use
 `test_runner` at `low`, bounded implementation uses `implementer` at `medium`, and independent
-review uses `reviewer`/`adversarial-reviewer` at `high`. Higher effort is justified by a concrete
+review uses `reviewer`/`adversarial-reviewer` at `high`. The gate's XHIGH review round is the one
+lane on `gpt-6-astra`, at `ultra` (the user's choice of 2026-09-26; it ran on 0.156.1 with this
+account that day). Higher effort is justified by a concrete
 unresolved question after collecting evidence; return to the sufficient lower effort afterward.
 Do not silently fall back to another model when Sol is unavailable.
 
@@ -116,8 +118,9 @@ Give Codex a self-contained task:
 
 Source: OpenAI's model guidance for GPT-6 Astra,
 https://developers.openai.com/api/docs/guides/latest-model. It names five behaviours in which
-Astra differs from GPT-5.6 Sol. Codex lanes run on `gpt-6-sol`, and packets still follow these
-answers: they cost nothing there and keep a packet valid if a lane runs on Astra.
+Astra differs from GPT-5.6 Sol. Codex lanes run on `gpt-6-sol` except the XHIGH review round,
+which runs on Astra, so every packet follows these answers: they cost nothing on Sol and are
+what an XHIGH round needs.
 
 - **It stops to ask more often.** Where more input could change the result it asks instead of
   assuming, and in a non-interactive `codex exec` run that ends the turn without the result.

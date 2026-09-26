@@ -11,8 +11,10 @@ requirement.
 | Deterministic lookup, evidence collection, one named command | `haiku` (pass explicitly) | low |
 | Repository exploration | `Explore` profile: Sonnet, `maxTurns: 50` | medium |
 | Bounded simplify pass | `simplify-reviewer` for STANDARD, the three `simplify-*-reviewer` lenses for HIGH: Sonnet, `maxTurns: 40` | medium |
+| XHIGH simplify pass | the three `simplify-*-reviewer-xhigh` lenses: `claude-opus-5-5`, `maxTurns: 80` | max |
 | Routine implementation, focused QA, web research | `general-purpose` with `model: "sonnet"` passed explicitly | medium/high |
 | Architecture, security, root cause, adversarial review | `adversarial-reviewer` profile: Fable, `maxTurns: 60`; or Opus/Fable by explicit choice | high |
+| XHIGH adversarial review | `adversarial-reviewer-xhigh` profile: Fable, `maxTurns: 100` | max |
 | Orchestration, integration, final decision, user answer | primary agent | session default |
 
 Built-in `Explore` and `Plan` inherit the main session's model (capped at Opus); the custom
@@ -34,7 +36,8 @@ exists or that the most expensive tier is required for every review.
 
 - Start with the primary agent. Do not create a lane merely to route to another model.
 - Agent definitions carry the default model, effort and turn budget. Use them unless the task
-  packet names a concrete reason to override; `effort: max` is never a default for a lane.
+  packet names a concrete reason to override; `effort: max` is never a default for a lane
+  outside the XHIGH profiles, which the user set to max on 2026-09-26 for the work XHIGH covers.
 - Mechanical work inside a hard task can use a small tier; a security decision inside a simple
   task still needs strong reasoning. Route the lane, not the parent task's label.
 - The parent checks every result and owns integration. Never delegate validation of a
@@ -66,7 +69,9 @@ Parameters:
   not carry over. The guide starts at `high` and notes that `medium` roughly matches Fable 5 at
   lower cost. At `xhigh` and `max` the model may draft a long deliverable in its thinking before
   writing it, which lengthens the turn, so the guide keeps such requests at `high` unless a gain
-  is measured. Move a lane only on a measured difference; the reviewer stays at `high`.
+  is measured. Move a lane only on a measured difference; the reviewer stays at `high` below
+  XHIGH, and `adversarial-reviewer-xhigh` runs at `max` by the user's choice of 2026-09-26, not
+  on a measured gain.
 - Thinking is always on: Alt+T, `alwaysThinkingEnabled` and `MAX_THINKING_TOKENS=0` do not turn
   it off. `ultrathink` in a prompt asks for deeper reasoning on that one turn without changing
   effort.

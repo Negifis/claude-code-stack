@@ -1,9 +1,10 @@
 """
 Continuity — PreToolUse loop guard.
 
-Counts identical calls inside one generation. A generation ends at every user turn and
-every file edit, so the counter only ever sees repeats that changed nothing: same tool,
-same arguments, same file mtime, no edit and no new instruction in between.
+Counts identical calls by one caller — the main thread, or one subagent by its `agent_id` —
+inside one generation. A generation ends at every user turn and every file edit, so the
+counter only ever sees repeats that changed nothing: same caller, same tool, same arguments,
+same file mtime, no edit and no new instruction in between.
 
 What happens on the third such call depends on what the tool reads:
 
@@ -18,10 +19,8 @@ Anything unexpected fails open.
 import hashlib
 import json
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import continuity_common as cc  # noqa: E402
+import continuity_common as cc
 
 cc.configure_utf8_streams()
 
@@ -80,6 +79,13 @@ def main():
             cc.quiet()
             return
         mark = fingerprint(tool, payload)
+        # Subagents run under their parent's session id, and parallel lanes are routinely handed
+        # the same packet: keyed by the session alone, three lanes reading one file once each
+        # would add up to a loop. Only `agent_id` tells two lanes of one type apart; the main
+        # thread, a `--agent` session's included, has none and keeps the bare mark.
+        agent = data.get("agent_id")
+        if agent:
+            mark = "{}:{}".format(agent, mark)
 
         def apply(state):
             count = int(state["calls"].get(mark) or 0) + 1

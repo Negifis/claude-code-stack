@@ -15,8 +15,8 @@ code that fits the repository. Not fewer lines for their own sake, and not a cer
   work that got harder to reason about.
 - The user asks to simplify or refactor.
 - `development-verification` requires it: a STANDARD persistent candidate needs one foreground
-  `simplify-reviewer` result, a HIGH one a foreground result from each of the three lenses. LOW
-  work never requires it.
+  `simplify-reviewer` result, a HIGH one a foreground result from each of the three lenses, an
+  XHIGH one from each lens's `-xhigh` profile. LOW work never requires it.
 
 Skip it for routine LOW work, small obvious fixes, generated output and docs churn.
 Never run it on operational work: a scratchpad or one-shot script that already executed, or a

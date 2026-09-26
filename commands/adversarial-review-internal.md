@@ -38,6 +38,10 @@ notification carries; a background verdict is filed at the launch, so a lasting 
 launch expires it. The reviewer's own read-only commands (`git show`, grep) do not: the marker
 records a command run inside a read-only lane only for what its snapshot measured.
 
+For an XHIGH candidate the agent is `adversarial-reviewer-xhigh`: the same prompt at max effort.
+The gate holds an XHIGH receipt to a verdict from that profile, including a round `SendMessage`
+resumed on it; the plain `adversarial-reviewer` does not close one.
+
 The task packet must contain:
 
 - review round number (1 to 3);

@@ -21,12 +21,10 @@ import os
 import re
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import code_work_gate_common as cwg  # noqa: E402
+import code_work_gate_common as cwg
 
 cwg.configure_utf8_streams()
 
@@ -115,7 +113,7 @@ AGENT_CONFIG_LIMIT = 8192
 # branch at once and lands on whichever command was running. Inside a repository they are that
 # copy, not the session's work; the sources they are copied from are watched in the homes above.
 # Attribution only, like the skip list: an edit made through Edit/Write is still gated by path.
-SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", re.IGNORECASE)
+SYNCED_AGENT_TREE_RE = re.compile(r"/\.(?:agents|codex|claude)/skills/", cwg.PLACE_IGNORECASE)
 # Whether a shell command could have rewritten a file the snapshot did not see decides whether
 # an unresolved mutation expires the review verdict. The rule is an allowlist of commands proven
 # read-only, judged per pipeline segment: anything unknown, any redirect other than a discarded
@@ -200,14 +198,14 @@ STATE_ONLY_SCRIPTS = {
 
 def hook_script_re(names):
     """A pattern for the hooks' scripts of these names, spelled by any path."""
-    return re.compile(r"(?:^|/)hooks/(?:{})\.py$".format("|".join(names)), re.IGNORECASE)
+    return re.compile(r"(?:^|/)hooks/(?:{})\.py$".format("|".join(names)), cwg.PLACE_IGNORECASE)
 
 
 # The memory bridge the `nlm-memory` shim runs, called under an interpreter when an argument carries
 # characters the shim's cmd.exe would parse (report c2a8dfe0). It lives under `~/.codex`, so unlike
 # the hooks' scripts it still names that home.
 BRIDGE_SCRIPT = "nlm_sync"
-BRIDGE_SCRIPT_RE = re.compile(r"(?:^|/)notebooklm-sync/bin/nlm_sync\.py$", re.IGNORECASE)
+BRIDGE_SCRIPT_RE = re.compile(r"(?:^|/)notebooklm-sync/bin/nlm_sync\.py$", cwg.PLACE_IGNORECASE)
 STATE_ONLY_SCRIPT_RE = hook_script_re(sorted(set(STATE_ONLY_SCRIPTS) - {BRIDGE_SCRIPT}))
 # A quoted shell word, the same alternatives `SHELL_WORD_RE` starts with.
 QUOTED_TEXT = r"\"[^\"]*\"|'[^']*'"
@@ -227,8 +225,10 @@ GIT_GLOBAL_OPTIONS_RE = re.compile(
 # accessor in PowerShell, a bracket expression or grouping in either shell.
 EXECUTING_ARGUMENT_RE = re.compile(r"[(\[]|::")
 # Only a discarded stream or a merged stderr is not a file the command may have written into.
+# `nul` is the null device only on Windows; elsewhere `> nul` writes a file of that name.
 HARMLESS_REDIRECT_RE = re.compile(
-    r"(?:&|[12])?>>?\s*(?:/dev/null|\$null|nul)(?=$|[\s;&|)])|2>&1|1>&2|>&2", re.IGNORECASE
+    r"(?:&|[12])?>>?\s*(?:/dev/null|\$null" + (r"|nul" if os.name == "nt" else "")
+    + r")(?=$|[\s;&|)])|2>&1|1>&2|>&2", re.IGNORECASE
 )
 SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\r\n]")
 # Each shell's own continuation marker, and what survives it. In bash a backslash escapes the
@@ -346,7 +346,10 @@ RETURN_COMMANDS = frozenset(("popd", "pop-location"))
 DIRECTORY_OPTIONS = frozenset(("-l", "-p", "-e", "-@", "--", "-path", "-literalpath"))
 SHELL_WORD_RE = re.compile(QUOTED_TEXT + r"|\S+")
 LITERAL_DIRECTORY_RE = re.compile(r"^[^$`*?\[\]{}()%!<>|;&\r\n]+$")
-MSYS_DRIVE_RE = re.compile(r"^/([a-zA-Z])(?=/|$)")
+# Git Bash's `/c/…` spelling of a drive. Only Windows has one: on Linux `/c` is an ordinary
+# directory, so there the pattern matches nothing; it keeps a group because `re.sub` rejects the
+# callers' `\1` template against a pattern without one, match or not.
+MSYS_DRIVE_RE = re.compile(r"^/([a-zA-Z])(?=/|$)" if os.name == "nt" else r"(?!)(.)")
 VARIABLE_REFERENCE_RE = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
 # Commands that can give a shell variable a new value: after one, no earlier value is trusted.
 VARIABLE_WRITERS = frozenset((
@@ -397,8 +400,9 @@ def literal_directory(arguments, current, shell="Bash", variables=None):
     drive = MSYS_DRIVE_RE.match(target)
     if drive:
         target = drive.group(1) + ":/" + target[2:].lstrip("/")
-    elif target.startswith(("/", "\\")):
-        # A root the shell maps on its own (`/tmp` in Git Bash), or a network share: not followed.
+    elif os.name == "nt" and target.startswith(("/", "\\")):
+        # A root Git Bash maps on its own (`/tmp`), or a network share: not followed. On POSIX
+        # a leading slash is simply an absolute path.
         return None
     if re.match(r"^[a-zA-Z]:(?![\\/])", target):
         return None
@@ -517,7 +521,7 @@ CANDIDATE_IDLE_LIMIT = 8 * 3600
 # are the agent types the harness reports (code.claude.com/docs/en/hooks, "Common input fields": a hook
 # inside a subagent gets `agent_id` and `agent_type`); a renamed profile silently falls back to the
 # ordinary rules, which is the conservative side.
-READ_ONLY_LANES = frozenset(("adversarial-reviewer", "explore", "plan"))
+READ_ONLY_LANES = frozenset(("adversarial-reviewer", cwg.XHIGH_REVIEWER, "explore", "plan"))
 
 
 def read_only_lane(data):
@@ -626,10 +630,10 @@ def bookkeeping_segment(segment, known, shell="Bash"):
         # Only an interpreter can run a hook script; anything else needs no parse of the segment.
         interpreter = unquoted_word(word)[0].replace("\\", "/").rsplit("/", 1)[-1]
         span = bookkeeping_script(text, bridge=True) if INTERPRETER_RE.match(interpreter) else None
-        script = unquoted_word(text[span[0]:span[1]])[0].replace("\\", "/") if span else ""
+        script = unquoted_word(text[span[0]:span[1]])[0].replace(os.sep, "/") if span else ""
         runs = False
         if script:
-            allowed = STATE_ONLY_SCRIPTS[os.path.splitext(script.rsplit("/", 1)[-1])[0].lower()]
+            allowed = STATE_ONLY_SCRIPTS[cwg.fold_case(os.path.splitext(script.rsplit("/", 1)[-1])[0])]
             after = SHELL_WORD_RE.match(text[span[1]:].lstrip())
             runs = allowed is None or (after is not None and unquoted_word(after.group(0))[0].lower() in allowed)
     arguments = blank_quoted(text[first.end():], shell) if runs else None
@@ -1197,7 +1201,7 @@ def scan_config_tree(directory, files):
                 if entry.is_dir(follow_symlinks=False):
                     # Dot-prefixed and named-vendor trees alike: see AGENT_CONFIG_SKIP.
                     if not (entry.name.startswith(".")
-                            or entry.name.lower() in AGENT_CONFIG_SKIP):
+                            or cwg.fold_case(entry.name) in AGENT_CONFIG_SKIP):
                         stack.append(entry.path)
                     continue
                 normalized = cwg.normalize_path(entry.path)
@@ -2494,7 +2498,7 @@ def bookkeeping_script(segment, bridge=False):
             return None
         position += 1
     if position < len(words):
-        script = unquoted_word(words[position].group(0))[0].replace("\\", "/")
+        script = unquoted_word(words[position].group(0))[0].replace(os.sep, "/")
         if STATE_ONLY_SCRIPT_RE.search(script) or (bridge and BRIDGE_SCRIPT_RE.search(script)):
             return words[position].span()
     return None
@@ -2702,12 +2706,12 @@ def repository_of(directory, roots):
             continue
         folder = normalized
         while folder != root:
-            if os.path.islink(folder) or os.path.isjunction(folder) or os.path.lexists(folder + "/.git") or (
+            if cwg.link_or_junction(folder) or os.path.lexists(folder + "/.git") or (
                     os.path.isfile(folder + "/HEAD") and os.path.isdir(folder + "/objects")
                     and os.path.isdir(folder + "/refs")):
                 return None
             folder = folder.rsplit("/", 1)[0]
-        spelled = os.path.realpath(directory).replace("\\", "/").rstrip("/")
+        spelled = os.path.realpath(directory).replace(os.sep, "/").rstrip("/")
         return (root, spelled[len(root) + 1:]) if covers(root, cwg.normalize_path(spelled)) else None
     return None
 
@@ -2731,8 +2735,8 @@ def staged_divergences_by_dir(by_dir, deadline=None):
     path's last stage included. Only a path staged away from HEAD needs its disk blob, which
     `hash-object` computes as `add` would store it, with the same line-ending and filter rules, so
     staging the reviewed bytes never diverges. Output is read NUL-separated, so a name git would
-    quote (non-ASCII, a tab) keys like any other, and a name is keyed by Python's own lower-casing,
-    the same one the marker uses.
+    quote (non-ASCII, a tab) keys like any other, and a name is keyed in the marker's own case
+    (`cwg.fold_case`): lowered on Windows, as it stands where `A.py` and `a.py` are two files.
     """
 
     def ask(where, arguments, cap, text=True):
@@ -2791,7 +2795,7 @@ def repository_divergences(toplevel, folders, by_dir, ask, deadline):
             parts = head.split()
             if len(parts) == 3 and path:
                 folder, _, name = path.rpartition("/")
-                found[(folder, name.lower())] = (parts[oid_field], path)
+                found[(folder, cwg.fold_case(name))] = (parts[oid_field], path)
         return found
 
     staged = entries(index, 1)
@@ -2801,7 +2805,7 @@ def repository_divergences(toplevel, folders, by_dir, ask, deadline):
     for directory, folder in folders.items():
         found[directory] = []
         for name in sorted(by_dir[directory]):
-            key = (folder, name.lower())
+            key = (folder, cwg.fold_case(name))
             on_disk = os.path.isfile(os.path.join(directory, name))
             entry = staged.get(key)
             if entry is None:

@@ -149,17 +149,20 @@ def record_outage(text, now=None):
 
 ASSIGNMENT_RE = re.compile(r"(?:^|[;&|\s])([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)")
 VARIABLE_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
-# Where the lean review command keeps its captures; the fallback looks here when the redirect
-# names a variable the hook cannot resolve from the command text.
-CAPTURE_GLOB = "C:/tmp/codex-*.err"
+# Where the lean review command keeps its captures: `2>/c/tmp/codex-<id>.err` lands in C:/tmp
+# under Git Bash, and on Linux, where `/c` is no drive, the lane keeps them in /tmp. The fallback
+# globs this absolute path when the redirect names a variable the hook cannot resolve from the
+# command text.
+CAPTURE_GLOB = ("C:/tmp" if os.name == "nt" else "/tmp") + "/codex-*.err"
 # A capture written before the launch belongs to an earlier launch. Used only when the launch
 # time is unknown to the caller.
 CAPTURE_HORIZON = 30 * 60.0
 
 
 def windows_path(raw):
-    """Git Bash spells C:\\tmp as /c/tmp; the hook runs under the Windows Python."""
-    drive = re.match(r"^/([a-zA-Z])/(.*)$", raw)
+    """Git Bash spells C:\\tmp as /c/tmp; the hook runs under the Windows Python. Only Windows
+    has drives: on Linux `/c/tmp` is an ordinary absolute path and stays as written."""
+    drive = re.match(r"^/([a-zA-Z])/(.*)$", raw) if os.name == "nt" else None
     return "{}:/{}".format(drive.group(1).upper(), drive.group(2)) if drive else raw
 
 

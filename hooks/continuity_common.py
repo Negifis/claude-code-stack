@@ -105,8 +105,12 @@ def read_stdin_json():
 
 
 def normalize_path(path):
-    """Forward-slash, lowercased form used for every path comparison here."""
-    return str(path).replace("\\", "/").lower() if path else ""
+    """Form used for every path comparison here: forward slashes and lower case on Windows, whose
+    file system ignores case and slash direction; the path as it stands elsewhere, where
+    `/home/in/Repo` and `/home/in/repo` are two projects."""
+    if not path:
+        return ""
+    return str(path).replace("\\", "/").lower() if os.name == "nt" else str(path)
 
 
 def session_key(raw):

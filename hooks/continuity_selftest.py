@@ -11,16 +11,26 @@ Run it after changing any hook or any pattern:
 Exit code 0 = everything passed. Session state and temporary checkpoints are cleaned up on
 the way out; nothing outside the temp dir and the test's own checkpoint file is touched.
 """
+import atexit
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import continuity_common as cc  # noqa: E402
+import continuity_common as cc
+
+if os.name != "nt":
+    # Session state lives straight in the temp directory, and scenario 11 must be able to refuse
+    # writes there: a POSIX rename replaces a read-only file, and /tmp itself cannot be locked. A
+    # private TMPDIR, inherited by every hook this test starts, also keeps real sessions' state
+    # out of reach.
+    os.environ["TMPDIR"] = tempfile.mkdtemp(prefix="continuity-selftest-")
+    tempfile.tempdir = None
+    atexit.register(shutil.rmtree, os.environ["TMPDIR"], True)
 
 HOOKS = os.path.dirname(os.path.abspath(__file__))
 CWD = os.path.join(tempfile.gettempdir(), "continuity-selftest-project")
@@ -196,6 +206,38 @@ def scenario_loop_guard():
                       "tool_input": {"command": "npm test", "timeout": seconds}})
     check("4 loop guard", not denied(answer) and not context_of(answer),
           "a different timeout is a different call")
+
+
+# 4b. Subagents share their parent's session id: lanes handed one packet each read the same file
+#     once, and only a caller repeating itself is a loop.
+def scenario_loop_guard_per_agent():
+    def read(sid, agent=None):
+        payload = {"session_id": sid, "cwd": CWD, "tool_name": "Read",
+                   "tool_input": {"file_path": os.path.join(CWD, "sample.txt")}}
+        if agent:
+            # One agent type for every lane: the id, not the type, tells two lanes apart.
+            payload.update(agent_id=agent, agent_type="simplify-reviewer")
+        return run("continuity_loop_guard.py", payload)
+
+    sid = forget("selftest-4d")
+    lanes = [read(sid, agent) for agent in ("a1", "a2", "a3")]
+    check("4b loop guard per agent", not any(denied(answer) for answer in lanes),
+          "three lanes reading one file once each are all allowed")
+
+    sid = forget("selftest-4e")
+    first, second, third = (read(sid, "a1") for _ in range(3))
+    check("4b loop guard per agent", not denied(first) and not denied(second) and denied(third),
+          "one lane repeating the read is denied on the third")
+
+    sid = forget("selftest-4f")
+    read(sid)
+    read(sid)
+    from_lane = read(sid, "a1")
+    from_main = read(sid)
+    check("4b loop guard per agent", not denied(from_lane),
+          "the main thread's reads do not count against a lane")
+    check("4b loop guard per agent", denied(from_main),
+          "the main thread's own third read is still denied")
 
 
 # 5. Compaction recovery: the checkpoint comes back and points at NEXT ACTION.
@@ -400,6 +442,18 @@ def scenario_project_checkpoint():
         drop_checkpoint()
 
 
+# 9c. A project is its directory: on Windows `Repo` and `repo`, or `a\b` and `a/b`, are one
+#     directory; elsewhere they are two projects, and neither may take the other's checkpoint.
+def scenario_project_identity():
+    windows = os.name == "nt"
+    check("9c project identity",
+          (cc.project_key("/home/in/Repo") == cc.project_key("/home/in/repo")) is windows,
+          "a directory named in another case is {} project".format("the same" if windows else "another"))
+    check("9c project identity",
+          (cc.project_key("/home/in/a\\b") == cc.project_key("/home/in/a/b")) is windows,
+          "a backslash separates only on Windows")
+
+
 # 10. Concurrency: hooks on one event run in parallel and must not overwrite each other.
 def scenario_concurrency():
     sid = forget("selftest-10")
@@ -423,13 +477,18 @@ def scenario_concurrency():
 def scenario_resilience():
     sid = armed("selftest-11a")
     path = cc.state_path(cc.session_key(sid))
-    os.chmod(path, stat.S_IREAD)
+    # A read-only file stops a write on Windows; a POSIX rename replaces it regardless, so there
+    # the directory is what has to refuse the write — for an unprivileged user: root ignores the
+    # mode, and the write would land.
+    locked = path if os.name == "nt" else os.path.dirname(path)
+    mode = os.stat(locked).st_mode
+    os.chmod(locked, stat.S_IREAD | (0 if os.name == "nt" else stat.S_IEXEC))
     try:
         check("11 resilience",
               not blocked(stop(sid, "Раньше я предлагал очередь, сейчас всё проще.")),
               "a state write that cannot land does not block the stop")
     finally:
-        os.chmod(path, stat.S_IWRITE)
+        os.chmod(locked, mode)
 
     sid = forget("selftest-11b")
     lock = cc.state_path(cc.session_key(sid)) + ".lock"
@@ -525,9 +584,11 @@ def scenario_no_locking_backend():
 def main():
     for scenario in (scenario_entity_replacement, scenario_direction_change,
                      scenario_repeated_failure, scenario_loop_guard,
+                     scenario_loop_guard_per_agent,
                      scenario_compaction_recovery, scenario_subagent_contract,
                      scenario_clean_output, scenario_false_positives,
                      scenario_checkpoint_trust, scenario_project_checkpoint,
+                     scenario_project_identity,
                      scenario_concurrency, scenario_resilience,
                      scenario_checkpoint_cli, scenario_checkpoint_nudge,
                      scenario_no_locking_backend):

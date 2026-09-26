@@ -9,13 +9,17 @@ Every helper fails soft: callers treat a None/False result as "no state" and sta
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
 
 SHELL_MUTATION_PATH = "<shell-mutation>"
 SHELL_TOOLS = ("Bash", "PowerShell")
-RISK_ORDER = {"LOW": 0, "STANDARD": 1, "HIGH": 2}
+# XHIGH is never a path floor: nearly-research algorithms, complex cryptography, fragile chains of
+# logic and critical security are judged, not read from a file name, so a receipt declares the
+# level and the Stop hook holds that receipt to the XHIGH lanes.
+RISK_ORDER = {"LOW": 0, "STANDARD": 1, "HIGH": 2, "XHIGH": 3}
 # What a candidate produced, which decides which completion contract applies. PERSISTENT work
 # leaves an artifact that later runs read and re-execute, so its cost of being wrong recurs and
 # code-quality review pays for itself. OPERATIONAL work acts on a live system through commands
@@ -23,6 +27,14 @@ RISK_ORDER = {"LOW": 0, "STANDARD": 1, "HIGH": 2}
 # before the command runs, not after the effect is already irreversible.
 WORK_PERSISTENT = "PERSISTENT"
 WORK_OPERATIONAL = "OPERATIONAL"
+# Windows names a file without regard to case, so there every path the gate compares is lowered.
+# Elsewhere case is part of the name: `SKILL.md` and `skill.md` are two files, and a lowered path
+# opens neither, so a candidate's fingerprint would read a changed file as missing. There a path
+# keeps its case, and a pattern naming a place — a temp root, a configuration home, the hooks'
+# own scripts — matches it exactly. A file's kind (a test, a secret, a Makefile) is read in any
+# case everywhere.
+CASE_FOLDED_PATHS = os.name == "nt"
+PLACE_IGNORECASE = re.IGNORECASE if CASE_FOLDED_PATHS else 0
 TEST_PATH_RE = re.compile(
     r"(^|/)(tests?|specs?|fixtures?)(/|$)|"
     r"(^|[._-])(test|spec)([._-]|$)",
@@ -75,8 +87,9 @@ TEMP_ROOT = (
 )
 # The harness's scratch tree, session scratchpad a level down. Nothing snapshots a temp tree, so
 # a helper graded lasting here makes every write-capable command a barrier (report 7bad3973).
-# Exactly `claude`: the mirror at C:/tmp/claude-code-stack is source and stays gated.
-AGENT_SCRATCH = TEMP_ROOT + r"claude/"
+# Exactly `claude` (on Linux `claude-<uid>`): the mirror at C:/tmp/claude-code-stack is source
+# and stays gated.
+AGENT_SCRATCH = TEMP_ROOT + r"claude(?:-\d+)?/"
 # The agent's own bookkeeping, scoped to the home configuration. A repository that commits
 # .claude/plans or .claude/state is publishing files people read later, so those stay gated.
 #
@@ -96,7 +109,7 @@ EPHEMERAL_PATH_RE = re.compile(
     + TEMP_ROOT + r"(?:[^/]+/)*scratchpad(?:/|$)|"
     + AGENT_SCRATCH + r"|"
     + HOME_BOOKKEEPING,
-    re.IGNORECASE,
+    PLACE_IGNORECASE,
 )
 
 
@@ -132,14 +145,35 @@ def valid_ts(value):
     return isinstance(value, (int, float)) and value > 0
 
 
+def fold_case(text):
+    """A path or file name in the case the gate compares it in: lowered where the file system
+    ignores case (Windows), as it stands elsewhere."""
+    return text.lower() if CASE_FOLDED_PATHS else text
+
+
 def normalize_path(path):
-    """Forward-slash, lowercased form used for every gate path comparison."""
-    return str(path).replace("\\", "/").lower() if path else ""
+    """Forward-slash form used for every gate path comparison, lowercased where the file system
+    ignores case (Windows). Only the platform's own separator turns into a slash: on POSIX a
+    backslash is part of a name, and `x\\y.py` is one file."""
+    return fold_case(str(path).replace(os.sep, "/")) if path else ""
 
 
 def basename(path):
     """Last segment of an already normalized path."""
     return path.rsplit("/", 1)[-1]
+
+
+def link_or_junction(path):
+    """Whether `path` itself is a symbolic link or a junction, as `os.path.islink(path) or
+    os.path.isjunction(path)` answers from Python 3.12 on, read from the reparse tag Windows reports
+    to every Python since 3.8. Below 3.12 `isjunction` does not exist, and a hook that raises fails
+    open, dropping what it was recording; the tag and its constant exist on Windows alone."""
+    try:
+        info = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISLNK(info.st_mode) or (
+        os.name == "nt" and info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT)
 
 
 def is_ephemeral(path):
@@ -345,6 +379,13 @@ SIMPLIFY_LENSES = (
     "simplify-quality-reviewer",
     "simplify-efficiency-reviewer",
 )
+# XHIGH runs each lens and the native reviewer from a profile of its own, pinned to the strongest
+# model at maximum effort, so the lane name the transcript shows is the evidence of the level.
+XHIGH_LENSES = tuple(lens + "-xhigh" for lens in SIMPLIFY_LENSES)
+XHIGH_REVIEWER = "adversarial-reviewer-xhigh"
+# The Codex turn an XHIGH verdict must come from, as its rollout log records that turn.
+XHIGH_CODEX_MODEL = "gpt-6-astra"
+XHIGH_CODEX_EFFORT = "ultra"
 
 
 def receipt_requirements(floor):
@@ -403,7 +444,9 @@ def is_gated(path):
     norm = normalize_path(path)
     if is_ephemeral(norm):
         return False
-    base = basename(norm)
+    # A file's kind is read from its name without regard to case on every platform: `Makefile`
+    # and `AGENTS.md` are gated wherever the path itself keeps its case.
+    base = basename(norm).lower()
     if base in SPECIAL_NAMES or is_config_basename(base):
         return True
     _, ext = os.path.splitext(base)

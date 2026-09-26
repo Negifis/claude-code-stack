@@ -18,10 +18,8 @@ that is not valid UTF-8 is never authoritative.
 Cannot block; anything unexpected degrades to a silent pass-through.
 """
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import continuity_common as cc  # noqa: E402
+import continuity_common as cc
 
 cc.configure_utf8_streams()
 

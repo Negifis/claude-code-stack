@@ -16,11 +16,10 @@ import subprocess
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import hygiene_common as hc  # noqa: E402
-from chip_handoff import safe_key  # noqa: E402
+import hygiene_common as hc
+from chip_handoff import safe_key
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
 SCRIPT = os.path.join(HERE, "chip_handoff.py")
 FAILURES = []
@@ -1265,7 +1264,6 @@ def test_an_uncountable_candidate_stops_the_report(root):
     chip_id, worktree = open_chip(repo)
     commit_work(worktree, name="child.txt", message="child work")
     # The commit the chip was cut at is gone from the object store.
-    record = record_of(chip_id)
     with open(os.path.join(chips_dir(), chip_id + ".json"), encoding="utf-8") as handle:
         card = json.load(handle)
     card["base_sha"] = "0" * 40

@@ -8,9 +8,10 @@ the candidate produced — a lasting artifact, or an effect on a live system:
 * development-verification was actually invoked;
 * an operational candidate ends with a receipt naming its pre-execution check and its effect;
 * a STANDARD candidate has one foreground simplify-reviewer result, a HIGH candidate one from
-  each of the three simplify lenses;
+  each of the three simplify lenses, an XHIGH candidate one from each lens's XHIGH profile;
 * HIGH completion has an adversarial APPROVED result — from either review engine — newer than
-  the final edit;
+  the final edit, and XHIGH completion has one from an XHIGH lane: the native XHIGH reviewer, or
+  a Codex turn its rollout log shows on the XHIGH model and effort;
 * post-ESCALATE publication has a bounded closure-validation result.
 
 It never re-runs review itself. A candidate can be blocked at most three times; after that the
@@ -24,12 +25,10 @@ import json
 import math
 import os
 import re
-import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import code_work_gate_common as cwg  # noqa: E402
+import code_work_gate_common as cwg
 
 cwg.configure_utf8_streams()
 
@@ -100,7 +99,10 @@ RISK_ORDER = cwg.RISK_ORDER
 # shows, so they are the whole of the evidence.
 SIMPLIFY_LANE = cwg.SIMPLIFY_LANE
 SIMPLIFY_LENSES = cwg.SIMPLIFY_LENSES
-SIMPLIFY_REVIEWERS = {SIMPLIFY_LANE, *SIMPLIFY_LENSES}
+XHIGH_LENSES = cwg.XHIGH_LENSES
+SIMPLIFY_REVIEWERS = {SIMPLIFY_LANE, *SIMPLIFY_LENSES, *XHIGH_LENSES}
+# The HIGH lens an XHIGH lens run proves when its call overrode the profile's model.
+XHIGH_BASE = dict(zip(XHIGH_LENSES, SIMPLIFY_LENSES))
 TERMINAL_RE = re.compile(
     r"^\[gate\]\s*(verified|operational|no-change|pr-ready|draft-blocked|anomaly-reported)"
     r"\s*:\s*(\S.*)$",
@@ -111,7 +113,7 @@ TERMINAL_RE = re.compile(
 # candidate opened: the Stop hook has a twenty-second window of its own.
 RESTORE_BUDGET = 4.0
 ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
-VERIFIED_REASON_RE = re.compile(r"^(LOW|STANDARD|HIGH)\s*;\s*\S", re.IGNORECASE)
+VERIFIED_REASON_RE = re.compile(r"^({})\s*;\s*\S".format("|".join(RISK_ORDER)), re.IGNORECASE)
 OPERATIONAL_RECEIPTS = {"operational", "no-change"}
 VERDICT_LINE_RE = re.compile(
     r"^VERDICT:\s*(APPROVED|REVISE|ESCALATE)$", re.IGNORECASE
@@ -144,12 +146,17 @@ _CODEX_RUNS = {"since": None, "files": [], "budget": CODEX_SCAN_BUDGET}
 _CODEX_SAID = {}
 # What each session was given inside the same window, from the same scan.
 _CODEX_GIVEN = {}
+# (model, effort) of the turn each record of `_CODEX_SAID` was said in, aligned with that list.
+_CODEX_TURNS = {}
 # The session being judged, for the ledger lines written from inside the transcript scan — and
 # whether they are written at all: the inbox runs the same scan for inspection only.
 _SESSION = {"key": "", "effects": True}
 
 
 def review_note(**fields):
+    # Only an XHIGH verdict carries its level into the ledger; every other line stays as it was.
+    if not fields.get("tier"):
+        fields.pop("tier", None)
     if _SESSION["effects"]:
         cwg.log_event("review", session=_SESSION["key"], **fields)
 REQUIRED_EXTERNAL_TOKEN = "CODE_WORK_GATE_REQUIRED"
@@ -228,7 +235,7 @@ def codex_run_files(since):
     native reviewer rather than accepting an unproven one.
 
     `since` is a floor on how far back to look, not the binding: which call a session vouches
-    for is decided per record in `session_said`. The current caller opens the window at the
+    for is decided per record in `session_said_place`. The current caller opens the window at the
     session's own start, so the horizon is what normally governs here.
     """
     if _CODEX_RUNS.get("since") == since:
@@ -360,7 +367,7 @@ def session_records(path, mtime_ns, size, started, finished):
         return _CODEX_SAID[key]
     role = reviewer_role()
     briefed_at = None
-    said, given = [], []
+    said, given, turn = [], [], None
     try:
         with open(path, "rb") as raw:
             for line in read_span(raw, 0, min(size, CODEX_HEAD_BYTES)):
@@ -370,13 +377,18 @@ def session_records(path, mtime_ns, size, started, finished):
             # One byte back so the record starting exactly at that offset is not mistaken for
             # the partial line `read_span` discards.
             for line in read_span(raw, max(0, seek_time(raw, size, started) - 1), size):
+                if '"turn_context"' in line:
+                    # Output belongs to the turn opened last before it in the log's own order:
+                    # records written in one millisecond share a stamp, so time cannot tell.
+                    turn = turn_of(line)
+                    continue
                 record = json_record(line)
                 stamp = parse_ts(record.get("timestamp"))
                 if stamp > finished + CODEX_RUN_SLACK:
                     break
                 spoken = logged_output(record)
                 if spoken:
-                    said.append((stamp, spoken))
+                    said.append((stamp, spoken, turn))
                     continue
                 heard = logged_input(record)
                 if heard:
@@ -390,10 +402,42 @@ def session_records(path, mtime_ns, size, started, finished):
     # Only what the session said after it was briefed counts, and normalizing is deferred until
     # then: an errand's output is discarded whole, which on these logs is the common case.
     _CODEX_GIVEN[key] = given
-    _CODEX_SAID[key] = [] if briefed_at is None else [
-        (at, normalized(text), text) for at, text in said if at >= briefed_at
-    ]
+    kept = [] if briefed_at is None else [record for record in said if record[0] >= briefed_at]
+    _CODEX_TURNS[key] = [opened for _, _, opened in kept]
+    _CODEX_SAID[key] = [(at, normalized(text), text) for at, text, _ in kept]
     return _CODEX_SAID[key]
+
+
+def turn_of(line):
+    """(model, effort) of one rollout `turn_context` record, or None.
+
+    The CLI writes this record itself when a turn starts, naming the model and the reasoning
+    effort that turn runs on; the launch command only asks for them.
+    """
+    try:
+        record = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "turn_context":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    return str(payload.get("model") or ""), str(payload.get("effort") or "")
+
+
+def codex_tier(path, mtime_ns, size, started, finished, place):
+    """XHIGH when the record at `place` in `session_records` was said in a turn on the XHIGH
+    model and effort: the `turn_context` the log opened last before it inside the call's window.
+
+    SECURITY: the level comes from the rollout log, like the verdict itself, never from the
+    command that launched Codex — that text is the agent's own and can name any model. A record
+    with no turn opened before it in the window has no level.
+    """
+    session_records(path, mtime_ns, size, started, finished)
+    turns = _CODEX_TURNS.get(codex_cache_key(path, mtime_ns, size, started, finished), ())
+    turn = turns[place] if 0 <= place < len(turns) else None
+    return "XHIGH" if turn == (cwg.XHIGH_CODEX_MODEL, cwg.XHIGH_CODEX_EFFORT) else None
 
 
 def read_span(raw, start, end):
@@ -459,22 +503,26 @@ def seek_time(raw, size, target):
     return low
 
 
-def session_said(path, mtime_ns, size, started, finished, excerpt):
-    """Whether this session's own output, written while the call was open, carried this text.
+def session_said_place(path, mtime_ns, size, started, finished, excerpt):
+    """Where this session's own output, written while the call was open, last carried this text:
+    the record's place in `session_records`, or None when it never did.
 
     Each record is judged by its own timestamp rather than the file's: a resumed session's log
     still holds every earlier review, and the file is touched again the moment it resumes.
     Tolerance is on the upper bound only, because the CLI finishes writing after the command
     returns while a record predating the call belongs to an earlier review, however narrowly.
     """
-    return any(
-        started <= stamp <= finished + CODEX_RUN_SLACK and excerpt in spoken
-        for stamp, spoken, _ in session_records(path, mtime_ns, size, started, finished)
-    )
+    found = None
+    for place, (stamp, spoken, _) in enumerate(
+            session_records(path, mtime_ns, size, started, finished)):
+        if started <= stamp <= finished + CODEX_RUN_SLACK and excerpt in spoken:
+            found = place
+    return found
 
 
 def codex_produced(text, started, finished, since):
-    """Whether a Codex run overlapping this call logged the very output the call returned.
+    """(bound, tier): whether a Codex run overlapping this call logged the very output the call
+    returned, and the level of the turn that said it (`codex_tier`).
 
     SECURITY: a run overlapping in time says only that some Codex process was busy nearby — a
     rescue, another session, a detached run — which any command printing a verdict could borrow.
@@ -488,7 +536,7 @@ def codex_produced(text, started, finished, since):
     # same way — and "VERDICT: APPROVED" alone is every approval ever written. A review that
     # states nothing loses the lane its evidence, which is the safe direction.
     if len(whole) < CODEX_MIN_BINDING:
-        return False
+        return False, None
     excerpt = whole[-CODEX_EXCERPT:]
     candidates = []
     for path, _ in codex_run_files(since):
@@ -506,10 +554,11 @@ def codex_produced(text, started, finished, since):
     # Closest to the call first, so the shared read budget is spent on the likely session
     # rather than on whatever happens to be newest in the store.
     candidates.sort()
-    return any(
-        session_said(path, mtime_ns, size, started, finished, excerpt)
-        for _, path, mtime_ns, size in candidates
-    )
+    for _, path, mtime_ns, size in candidates:
+        place = session_said_place(path, mtime_ns, size, started, finished, excerpt)
+        if place is not None:
+            return True, codex_tier(path, mtime_ns, size, started, finished, place)
+    return False, None
 
 
 # A packet shorter than this is not distinctive enough to name a session.
@@ -623,14 +672,15 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
     itself, from records stamped inside the launch-to-notification window. When the launch fed a
     packet on stdin, the session that was given that packet is the one; otherwise exactly one
     briefed session may have spoken there — two are ambiguous, and an ambiguous verdict binds
-    to nothing, which is the safe direction. Returns `(verdict, why_none)`.
+    to nothing, which is the safe direction. Returns `(verdict, why_none, tier)`, the tier being
+    that of the turn which stated the verdict (`codex_tier`).
     """
     fed, packet, why = packet_of_launch(command, call_id, started)
     if fed and not packet:
         # The usual cause: the packet was written by the same shell command that launched
         # Codex, so nothing existed when the marker hook looked before the command ran.
         return None, ("packet fed on stdin but nothing to bind by at launch ({}); write the "
-                      "packet in its own call before launching").format(why)
+                      "packet in its own call before launching").format(why), None
     verdicts, given = {}, []
     for path, _ in codex_run_files(since):
         try:
@@ -639,38 +689,47 @@ def rollout_verdict(started, finished, since, command="", call_id=""):
             continue
         if stat.st_mtime < started:
             continue
-        for stamp, _, spoken in session_records(
+        for place, (stamp, _, spoken) in enumerate(session_records(
             path, stat.st_mtime_ns, stat.st_size, started, finished
-        ):
+        )):
             if not started <= stamp <= finished + CODEX_RUN_SLACK:
                 continue
             control = reviewer_control(spoken)
             if control[0] in ("ordinary", "closure"):
                 # The session's last stated verdict inside the window is its answer.
-                verdicts[path] = control
+                verdicts[path] = (control, place, stat.st_mtime_ns, stat.st_size)
         if packet and session_given(path, stat.st_mtime_ns, stat.st_size, started, finished, packet):
             given.append(path)
+
+    def answer(path):
+        control, place, mtime_ns, size = verdicts[path]
+        return control, "", codex_tier(path, mtime_ns, size, started, finished, place)
+
     if packet:
         # Exactly one session may have been given this packet, whether or not it answered:
         # two chats reviewing with the same words are told apart by nothing, and bind nothing.
         if len(given) != 1:
-            return None, ("no session in the window was given this launch's packet" if not given
-                          else "{} sessions were given this launch's packet".format(len(given)))
-        control = verdicts.get(given[0])
-        return control, "" if control else "the session given the packet stated no verdict in the window"
+            unbound = ("no session in the window was given this launch's packet" if not given
+                       else "{} sessions were given this launch's packet".format(len(given)))
+            return None, unbound, None
+        if given[0] not in verdicts:
+            return None, "the session given the packet stated no verdict in the window", None
+        return answer(given[0])
     if len(verdicts) != 1:
-        return None, ("no briefed session stated a verdict in the window" if not verdicts
-                      else "{} briefed sessions stated verdicts in the window".format(len(verdicts)))
-    return next(iter(verdicts.values())), ""
+        unbound = ("no briefed session stated a verdict in the window" if not verdicts
+                   else "{} briefed sessions stated verdicts in the window".format(len(verdicts)))
+        return None, unbound, None
+    return answer(next(iter(verdicts)))
 
 
-def record_control(evidence, stamp, control, malformed=False):
+def record_control(evidence, stamp, control, malformed=False, tier=None):
     """File one reviewer result under the verdict it carries.
 
     `malformed` says whether a result that states no usable verdict is still review activity: it
     is, for the dedicated reviewer subagent that has no other purpose, and for a Codex call that
     declared itself the review lane but could not be attributed. A plain CLI errand is neither,
-    and recording it would let an unrelated run reopen a closed gate.
+    and recording it would let an unrelated run reopen a closed gate. `tier` is "XHIGH" for a
+    verdict from an XHIGH lane, which is also filed where an XHIGH receipt looks for it.
     """
     control_kind, control_value = control
     if control_kind == "ordinary":
@@ -679,7 +738,15 @@ def record_control(evidence, stamp, control, malformed=False):
         evidence["closure_reviews"].append((stamp, control_value))
     elif not malformed:
         return
+    if tier == "XHIGH" and control_kind in ("ordinary", "closure"):
+        evidence["xhigh_verdicts"].append((stamp, control_value))
     evidence["review_events"].append((stamp, control_kind, control_value))
+
+
+def lane_tier(subtype, payload):
+    """The level a native review lane runs at: its profile's, unless the call passed a model, which
+    overrides the profile's pin and so cannot show that the XHIGH model ran."""
+    return "XHIGH" if subtype == cwg.XHIGH_REVIEWER and not payload.get("model") else None
 
 
 def review_lane(task_id, calls_named, rounds, open_rounds, launched):
@@ -733,10 +800,11 @@ def judge_background_agents(evidence, launches, notices_by_task):
         )
         if first is not None:
             stamp, _, control = notices[first]
-            record_control(evidence, launch["started"], control)
+            tier = launch.get("tier")
+            record_control(evidence, launch["started"], control, tier=tier)
             resumed = {"agent": launch["agent"]} if launch.get("agent") else {}
             review_note(at=launch["started"], notified=stamp, engine="native-background",
-                        verdict=control[1], task=task_id, **resumed)
+                        verdict=control[1], task=task_id, tier=tier, **resumed)
             notices = notices[first + 1:]
             reason = "the lane went on after stating its verdict"
         else:
@@ -773,6 +841,8 @@ def transcript_evidence(path, since, skill_since=None):
         "review_events": [],
         # (place in review_events, why) for each review result filed as unbound.
         "unbound_reasons": [],
+        # (when, verdict) for each ordinary or closure verdict an XHIGH lane stated.
+        "xhigh_verdicts": [],
         "external_calls": [],
         "external_results": [],
         "background": {},
@@ -872,11 +942,11 @@ def transcript_evidence(path, since, skill_since=None):
                             # wrote between the launch and this notification; its output file
                             # is for the parent to read, not evidence.
                             if status == "completed":
-                                control, unbound_why = rollout_verdict(
+                                control, unbound_why, tier = rollout_verdict(
                                     call["started"], stamp, skill_since,
                                     call.get("command", ""), call["call_id"])
                             else:
-                                control, unbound_why = None, "the task ended " + status
+                                control, unbound_why, tier = None, "the task ended " + status, None
                             bound = control is not None
                             # The verdict covers the candidate as it was when the review was
                             # launched — nothing edited after the launch was in the packet —
@@ -889,12 +959,12 @@ def transcript_evidence(path, since, skill_since=None):
                             )
                             evidence["background_judged"].append(call["call_id"])
                             if bound:
-                                record_control(evidence, call["started"], control)
+                                record_control(evidence, call["started"], control, tier=tier)
                                 # `at` is where the verdict is filed, which is what expiry is
                                 # judged against; the notification only reports it (a269a6fc).
                                 review_note(at=call["started"], notified=stamp,
                                             engine="codex-background", verdict=control[1],
-                                            task=task_id)
+                                            task=task_id, tier=tier)
                             else:
                                 evidence["review_failures"].append(stamp)
                                 evidence["unbound_reasons"].append((len(evidence["review_events"]), unbound_why))
@@ -974,6 +1044,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 calls[call_id] = {
                                     "kind": "resume", "agent": target, "started": stamp,
                                     "foreground": False,
+                                    # A resumed round runs at the level its reviewer was launched at.
+                                    "tier": reviewer.get("tier") if reviewer else None,
                                     "label": reviewer.get("label", "") if reviewer
                                     else str(payload.get("summary") or target)[:80],
                                     # A round only counts inside the window, like any other review call.
@@ -1022,6 +1094,10 @@ def transcript_evidence(path, since, skill_since=None):
                         subtype = str(payload.get("subagent_type") or "").lower()
                         if not call_id:
                             continue
+                        # A model passed with the call overrides the profile's pin, so an XHIGH
+                        # lens run that way proves only its HIGH lens (and a reviewer, `lane_tier`).
+                        if payload.get("model") and subtype in XHIGH_BASE:
+                            subtype = XHIGH_BASE[subtype]
                         # Claude Code 2.1.198+ defaults subagents to background. Require an
                         # explicit false so an upgrade cannot turn a verdict-bearing call into
                         # an async launch that looks complete in the transcript. The opposite
@@ -1031,6 +1107,7 @@ def transcript_evidence(path, since, skill_since=None):
                         agent_call = {
                             "kind": "agent",
                             "subtype": subtype,
+                            "tier": lane_tier(subtype, payload),
                             "foreground": foreground,
                             "started": stamp,
                             "label": str(payload.get("description") or subtype)[:80],
@@ -1124,9 +1201,9 @@ def transcript_evidence(path, since, skill_since=None):
                         # an unavailable reviewer rather than a satisfied requirement.
                         control = reviewer_control(text)
                         stated = control[0] in ("ordinary", "closure")
-                        bound = stated and codex_produced(
+                        bound, tier = codex_produced(
                             text, call["started"], stamp, skill_since
-                        )
+                        ) if stated else (False, None)
                         judged = bound and not failed
                         evidence["external_results"].append(
                             (
@@ -1137,9 +1214,9 @@ def transcript_evidence(path, since, skill_since=None):
                             )
                         )
                         if judged:
-                            record_control(evidence, stamp, control)
+                            record_control(evidence, stamp, control, tier=tier)
                             review_note(at=stamp,
-                                          engine="codex", verdict=control[1])
+                                          engine="codex", verdict=control[1], tier=tier)
                         elif bound or (stated and call["marked"]):
                             # An unattributable verdict is never filed as one, but dropping it
                             # would leave an earlier approval as the last word — so a call that
@@ -1171,10 +1248,11 @@ def transcript_evidence(path, since, skill_since=None):
                         )
                         continue
                     control = reviewer_control(text)
-                    record_control(evidence, stamp, control, malformed=True)
+                    tier = call.get("tier")
+                    record_control(evidence, stamp, control, malformed=True, tier=tier)
                     if control[0] in ("ordinary", "closure"):
                         review_note(at=stamp,
-                                      engine="native", verdict=control[1])
+                                      engine="native", verdict=control[1], tier=tier)
         judge_background_agents(evidence, dict(background_agents, **resume_rounds), agent_notices)
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
@@ -1559,12 +1637,13 @@ def find_restoration_blocker(entry):
     if kept != "":
         return silent if kept is None else kept
     if durable:
-        # The marker's paths are lower-cased; `check-ignore` matches them against the patterns
-        # case-insensitively only while the repository ignores case, so any other setting
-        # leaves the answer unknown.
-        ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
-        if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
-            return "the repository does not ignore case, so its ignore rules cannot be checked"
+        # Where the marker's paths are lower-cased (Windows), `check-ignore` matches them against
+        # the patterns case-insensitively only while the repository ignores case, so any other
+        # setting leaves the answer unknown. Elsewhere the paths keep their case.
+        if cwg.CASE_FOLDED_PATHS:
+            ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
+            if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
+                return "the repository does not ignore case, so its ignore rules cannot be checked"
         # `-q` takes one path: with several git exits 128, which read as "ignored" kept every
         # candidate of more than one file open (report f82c87c7).
         ignored = call(["check-ignore", "--stdin", "-z"], 1.5, stdin="".join(path + "\0" for path in durable))
@@ -1894,23 +1973,31 @@ def round_verdicts(reviews):
 
 
 def simplify_missing(risk, state):
-    """The simplify lanes this risk still needs a current foreground result from."""
+    """The simplify lanes this risk still needs a current foreground result from.
+
+    A lens's XHIGH run is the same concern on a stronger model, so it stands in for that lens at
+    HIGH and in the STANDARD trio; a HIGH lens never stands in for an XHIGH one.
+    """
+    def current(lane):
+        return state.get(lane) == "current"
+
+    if risk == "XHIGH":
+        return [lens for lens in XHIGH_LENSES if not current(lens)]
+    uncovered = [lens for lens, stronger in zip(SIMPLIFY_LENSES, XHIGH_LENSES)
+                 if not (current(lens) or current(stronger))]
     if risk == "HIGH":
-        return [lens for lens in SIMPLIFY_LENSES if state.get(lens) != "current"]
+        return uncovered
     if risk == "STANDARD":
-        covered = state.get(SIMPLIFY_LANE) == "current" or all(
-            state.get(lens) == "current" for lens in SIMPLIFY_LENSES
-        )
-        return [] if covered else [SIMPLIFY_LANE]
+        return [] if current(SIMPLIFY_LANE) or not uncovered else [SIMPLIFY_LANE]
     return []
 
 
 def simplify_block(risk, missing, state):
     lenses = ", ".join(SIMPLIFY_LENSES)
-    needed = (
-        "one result from each of {}".format(lenses) if risk == "HIGH"
-        else "one {} result or the complete trio ({})".format(SIMPLIFY_LANE, lenses)
-    )
+    needed = {
+        "XHIGH": "one result from each of {}".format(", ".join(XHIGH_LENSES)),
+        "HIGH": "one result from each of {} (or its XHIGH run)".format(lenses),
+    }.get(risk, "one {} result or the complete trio ({})".format(SIMPLIFY_LANE, lenses))
     failed = [lane for lane in missing if state.get(lane) in ("failed", "exhausted")]
     return (
         "simplify lenses have no foreground result: a {} candidate needs {} for this candidate "
@@ -1926,7 +2013,6 @@ def evaluate_receipt(receipt, entry, evidence):
     kind, _, risk = receipt
     first_ts = float(entry.get("first_ts") or 0.0)
     last_ts = float(entry.get("last_ts") or first_ts)
-    paths = marker_paths(entry)
 
     # Session-scoped on purpose. The call proves the protocol was read, and re-reading it for
     # each candidate adds nothing: the text is already in context, so a per-candidate rule only
@@ -1957,7 +2043,9 @@ def evaluate_receipt(receipt, entry, evidence):
         written = entry.get("last_write_ts")
         durable_ts = float(written) if cwg.valid_ts(written) else last_ts
 
-    current = lambda stamp: content_covers(entry, stamp, durable_ts)  # noqa: E731
+    def current(stamp):
+        return content_covers(entry, stamp, durable_ts)
+
     review_start = active_review_start(evidence, lambda stamp: not current(stamp))
     # Sorted by the moment each verdict is filed at: a background lane's verdict is filed at
     # its launch once its notification is read, after every result that returned in between.
@@ -2108,10 +2196,12 @@ def evaluate_receipt(receipt, entry, evidence):
             return False, "ESCALATE requires autonomous closure, not verified"
         if ordinary_verdicts and ordinary_verdict != "APPROVED":
             return False, "an invoked review has no terminal APPROVED verdict"
-        if risk == "HIGH" and not (
+        if risk in STALE_REASONS and not (
             ordinary_verdict == "APPROVED" and current(ordinary_ts)
         ):
-            return False, "HIGH candidate lacks a current APPROVED verdict"
+            return False, STALE_REASONS[risk]
+        if risk == "XHIGH" and (ordinary_ts, "APPROVED") not in evidence["xhigh_verdicts"]:
+            return False, XHIGH_LANE_REASON
         return True, "verified"
 
     if ordinary_verdict != "ESCALATE":
@@ -2231,6 +2321,14 @@ def closed_content_of(entry, mark, kind):
 
 
 HIGH_STALE_REASON = "HIGH candidate lacks a current APPROVED verdict"
+STALE_REASONS = {
+    "HIGH": HIGH_STALE_REASON,
+    "XHIGH": "XHIGH candidate lacks a current APPROVED verdict",
+}
+XHIGH_LANE_REASON = (
+    "XHIGH candidate's current APPROVED verdict did not come from an XHIGH lane ({} in the "
+    "native lane, or a Codex turn on {} at {} effort)"
+).format(cwg.XHIGH_REVIEWER, cwg.XHIGH_CODEX_MODEL, cwg.XHIGH_CODEX_EFFORT)
 ROUND_REASONS = (
     "an invoked review has no terminal APPROVED verdict",
     "ordinary review exceeded",
@@ -2256,7 +2354,9 @@ def block_detail(reason, entry, evidence):
     import code_work_gate_mark as mark
     notes = []
     rounds = reason.startswith(ROUND_REASONS) or ESCALATE_REQUIRED in reason
-    if reason == HIGH_STALE_REASON or rounds or reason.startswith("simplify"):
+    stale = reason in STALE_REASONS.values()
+    below_xhigh = reason == XHIGH_LANE_REASON
+    if stale or below_xhigh or rounds or reason.startswith("simplify"):
         first_ts = entry.get("first_ts")
         if cwg.valid_ts(first_ts):
             note = "evidence for this candidate counts from {}".format(mark.clock(first_ts))
@@ -2267,8 +2367,10 @@ def block_detail(reason, entry, evidence):
                     "rounds from before belong to that one"
                 ).format(mark.clock(displaced["opened"]), mark.displacement_cause(displaced))
             notes.append(note)
-    if reason == HIGH_STALE_REASON:
+    if stale:
         notes.append(approval_barriers(entry, evidence, mark.clock))
+    elif below_xhigh:
+        notes.append(xhigh_lane_note(evidence, mark.clock))
     elif rounds:
         notes.append(rounds_read(evidence, mark.clock))
     elif "cannot close a candidate that changed a lasting artifact" in reason:
@@ -2277,13 +2379,26 @@ def block_detail(reason, entry, evidence):
     return detail if len(detail) <= DETAIL_LIMIT else detail[:DETAIL_LIMIT - 1] + "…"
 
 
+def last_approved(evidence):
+    """When the latest ordinary APPROVED was filed, or None when none was read."""
+    return max((stamp for stamp, verdict in evidence.get("ordinary_reviews") or []
+                if verdict == "APPROVED"), default=None)
+
+
+def xhigh_lane_note(evidence, clock):
+    """Which approval an XHIGH receipt met, and what the XHIGH lanes themselves stated."""
+    approved = last_approved(evidence)
+    stated = ", ".join("{} at {}".format(verdict, clock(stamp))
+                       for stamp, verdict in sorted(evidence.get("xhigh_verdicts") or []))
+    return "the APPROVED filed at {} came from a lane below XHIGH; XHIGH lanes stated {}".format(
+        clock(approved) if approved is not None else "?", stated or "nothing")
+
+
 def approval_barriers(entry, evidence, clock):
     """What stands between the last APPROVED and the candidate as it is now."""
-    approvals = [stamp for stamp, verdict in evidence.get("ordinary_reviews") or []
-                 if verdict == "APPROVED"]
-    if not approvals:
+    approved = last_approved(evidence)
+    if approved is None:
         return "no APPROVED verdict was read for this candidate" + unbound_note(evidence, clock)
-    approved = max(approvals)
     marks = [mark for mark in entry.get("content_marks") or []
              if isinstance(mark, dict) and cwg.valid_ts(mark.get("ts")) and float(mark["ts"]) > approved]
     notes = [describe_mark(mark, clock) for mark in marks if unknown_mark(mark)]
@@ -2382,9 +2497,13 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "background; run `codex_lane.py check` first and skip straight to the native lane "
             "on a recorded outage) or the native reviewer (/adversarial-review-internal, in "
             "the foreground or launched in the background and judged at its notification). "
+            "An XHIGH candidate needs the same from the XHIGH profiles: {xlenses}, and an "
+            "APPROVED from {xreviewer} or from a Codex round on {xmodel} at {xeffort} effort. "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
-        ).format(lane=SIMPLIFY_LANE, lenses=", ".join(SIMPLIFY_LENSES))
+        ).format(lane=SIMPLIFY_LANE, lenses=", ".join(SIMPLIFY_LENSES),
+                 xlenses=", ".join(XHIGH_LENSES), xreviewer=cwg.XHIGH_REVIEWER,
+                 xmodel=cwg.XHIGH_CODEX_MODEL, xeffort=cwg.XHIGH_CODEX_EFFORT)
     inbox = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate_inbox.py")
     return (
         "[Code Work Gate] Cannot finalize this candidate: {reason}.\n{detail}{contract}\n"
