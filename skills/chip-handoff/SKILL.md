@@ -126,5 +126,8 @@ block and this skill are what carry it.
   A conflicted merge is aborted and reported with the conflicting paths.
 - It does not archive anything. `archive_session` always asks the user, and a chip sent back
   for rework must keep its session.
-- It does not clean up worktrees. `tools/worktree-audit.mjs` and the `WorktreeRemove` snapshot
-  own that, and both already protect unmerged work.
+- It does not clean up worktrees beyond its own merge tree and a refused chip's clean tree, and
+  it unlinks a tree's junctions and directory symlinks before removing either: on Windows git
+  follows a junction and deletes its target. `tools/worktree-audit.mjs` owns the rest and parks
+  unmerged work on `wip/` branches; the `WorktreeRemove` snapshot is dormant (see
+  `reference/environment.md`).

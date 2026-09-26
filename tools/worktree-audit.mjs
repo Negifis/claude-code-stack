@@ -264,7 +264,12 @@ if (unsaved.length) {
   }
 }
 if (stale.length) {
-  console.log(`\nStale and clean — safe to remove with \`git worktree remove\`:`);
+  // Git for Windows walks into a junction inside a tree it removes and deletes what the junction
+  // points at: on 2026-09-19 a plain `git worktree remove` emptied a live session's tree through
+  // a node_modules junction. The links go first, as links; the removal runs only if they all did.
+  const unlink = join(homedir(), '.claude', 'hooks', 'hygiene_common.py');
+  console.log('\nStale and clean — never a plain `git worktree remove`: drop the directory links first,');
+  console.log(`  python "${unlink}" unlink-links <path> && git worktree remove <path>`);
   for (const w of stale) console.log(`  ${w.path}  [${w.branch}]  ${w.ageDays}d`);
 }
 if (gone.length) {

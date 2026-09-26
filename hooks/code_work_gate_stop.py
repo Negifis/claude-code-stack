@@ -66,6 +66,12 @@ MOVED_ACK_RE = re.compile(
 AGENT_BG_RE = re.compile(
     r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"
 )
+# The Workflow tool's answer: every script runs in the background until its task notification, and
+# the summary line names it. Read only as the result of a Workflow call, so no other text can
+# declare work in flight.
+WORKFLOW_BG_RE = re.compile(
+    r"^\s*Workflow launched in background\. Task ID: ([A-Za-z0-9_-]+)[ \t]*(?:\r?\nSummary: ([^\r\n]*))?"
+)
 # The id a foreground agent result names for continuing that agent with SendMessage.
 AGENT_TRAILER_RE = re.compile(r"(?:^|\n)agentId: ([A-Za-z0-9_-]+) \(use SendMessage")
 # What SendMessage returns when it resumed a finished agent; a message to a running one says
@@ -77,7 +83,7 @@ RESUMED_AGENT_RE = re.compile(r"\"resumedAgentId\"\s*:\s*\"([A-Za-z0-9_-]+)\"")
 PRE_CANDIDATE_TOKENS = (
     '"Skill"', '"SlashCommand"', '"TaskStop"', '"Agent"', '"Task"',
     "in background with ID", "moved to the background", "Async agent launched",
-    "use SendMessage",
+    "use SendMessage", '"SendMessage"', "resumedAgentId", '"Workflow"', "Workflow launched in background",
 )
 NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 NOTIFICATION_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
@@ -150,7 +156,7 @@ REQUIRED_EXTERNAL_TOKEN = "CODE_WORK_GATE_REQUIRED"
 # Declared intent, never proof, and it governs one case only: whether a result that cannot be
 # attributed is heard as failed review activity. A verdict itself is heard because a briefed
 # Codex session produced it, marker or not, so this cannot buy acceptance.
-REVIEW_INTENT_TOKEN = "CODE_WORK_GATE_REVIEW"
+REVIEW_INTENT_TOKEN = cwg.REVIEW_INTENT_TOKEN
 
 
 def emit(payload):
@@ -765,6 +771,8 @@ def transcript_evidence(path, since, skill_since=None):
         "closure_reviews": [],
         "review_failures": [],
         "review_events": [],
+        # (place in review_events, why) for each review result filed as unbound.
+        "unbound_reasons": [],
         "external_calls": [],
         "external_results": [],
         "background": {},
@@ -889,6 +897,7 @@ def transcript_evidence(path, since, skill_since=None):
                                             task=task_id)
                             else:
                                 evidence["review_failures"].append(stamp)
+                                evidence["unbound_reasons"].append((len(evidence["review_events"]), unbound_why))
                                 record_control(evidence, stamp, ("unbound", None), malformed=True)
                                 review_note(at=stamp, engine="codex-background",
                                               verdict=None, task=task_id, status=status,
@@ -949,6 +958,8 @@ def transcript_evidence(path, since, skill_since=None):
                                     )
                                     evidence["background_judged"].append(call["call_id"])
                                     evidence["review_failures"].append(stamp)
+                                    evidence["unbound_reasons"].append(
+                                        (len(evidence["review_events"]), "the review task was stopped"))
                                     record_control(evidence, stamp, ("unbound", None),
                                                    malformed=True)
                                     review_note(at=stamp, engine="codex-background",
@@ -957,14 +968,26 @@ def transcript_evidence(path, since, skill_since=None):
                                                   reason="the review task was stopped")
                             continue
                         if tool_name == "SendMessage":
-                            # A round only counts inside the window, like any other review call.
                             target = str(payload.get("to") or "")
-                            if call_id and target in review_agents and not before_candidate:
+                            if call_id:
+                                reviewer = review_agents.get(target)
                                 calls[call_id] = {
                                     "kind": "resume", "agent": target, "started": stamp,
                                     "foreground": False,
-                                    "label": review_agents[target].get("label", ""),
+                                    "label": reviewer.get("label", "") if reviewer
+                                    else str(payload.get("summary") or target)[:80],
+                                    # A round only counts inside the window, like any other review call.
+                                    "round": reviewer is not None and not before_candidate,
                                 }
+                            continue
+                        if tool_name == "Workflow" and call_id:
+                            # Running work whenever it started, like a detached command: a
+                            # workflow's own lanes write files until its notification (report
+                            # 874ab23b), so a stop meanwhile waits rather than asking for a receipt.
+                            # Unlike a shell or agent acknowledgement, a workflow's is never read
+                            # without its call: text alone must not buy waiting stops.
+                            calls[call_id] = {"kind": "workflow", "started": stamp, "foreground": False,
+                                              "label": str(payload.get("name") or "")}
                             continue
                         if before_candidate and tool_name not in ("Agent", "Task"):
                             continue
@@ -1027,19 +1050,32 @@ def transcript_evidence(path, since, skill_since=None):
                         continue
                     call = calls.get(block.get("tool_use_id"))
                     text = result_text(block)
-                    if call is not None and call["kind"] == "resume":
-                        # Only a resumed agent starts a round; a message queued to a lane still
-                        # running is part of that lane's own flight.
-                        if not block.get("is_error") and resumed_agent(text) == call["agent"]:
-                            round_id = block.get("tool_use_id")
-                            resume_rounds[round_id] = call
-                            open_rounds[call["agent"]] = round_id
-                            latest_rounds[call["agent"]] = round_id
-                            evidence["background"][call["agent"]] = {
-                                "started": call["started"], "kind": "agent",
-                                "label": call["label"], "review": True,
+                    if call is not None and call["kind"] == "workflow":
+                        launched = WORKFLOW_BG_RE.match(text)
+                        if launched:
+                            evidence["background"][launched.group(1)] = {
+                                "started": call["started"], "kind": "workflow",
+                                "label": (call["label"] or launched.group(2) or "")[:80], "review": False,
                             }
-                            evidence["background_done"].pop(call["agent"], None)
+                        continue
+                    if call is not None and call["kind"] == "resume":
+                        # Only a resumed agent is back in flight; a message queued to one still
+                        # running is part of its own flight. Any agent this session resumed runs
+                        # until its notification, reviewer or not (report ac2ee4da), and a
+                        # reviewer's resumption inside the window is a round of its own.
+                        agent = None if block.get("is_error") else resumed_agent(text)
+                        if agent:
+                            is_round = call["round"] and agent == call["agent"]
+                            if is_round:
+                                round_id = block.get("tool_use_id")
+                                resume_rounds[round_id] = call
+                                open_rounds[agent] = round_id
+                                latest_rounds[agent] = round_id
+                            evidence["background"][agent] = {
+                                "started": call["started"], "kind": "agent",
+                                "label": call["label"], "review": is_round,
+                            }
+                            evidence["background_done"].pop(agent, None)
                         continue
                     # Background bookkeeping spans the whole transcript: a server started before
                     # the candidate opened is still this session's running work, so the harness's
@@ -1111,6 +1147,9 @@ def transcript_evidence(path, since, skill_since=None):
                             # reopens that approval. The declaration is needed only here: a
                             # result the session log vouches for has proved what it is.
                             evidence["review_failures"].append(stamp)
+                            evidence["unbound_reasons"].append((len(evidence["review_events"]), (
+                                "the review call failed after stating its verdict" if bound
+                                else "no Codex run's log shows the verdict the call printed")))
                             record_control(evidence, stamp, ("unbound", None), malformed=True)
                         continue
                     if call["kind"] == "simplify":
@@ -1452,12 +1491,16 @@ def restoration_blocker(entry):
     """Why the repository does not show the candidate undone, or "" when it does.
 
     Nothing is missing only when the marker remembers the commit and the refs the cycle opened
-    on and names every lasting path it touched, HEAD is that commit again, every ref points
-    where it did (no commit on a side branch, no tag, no stash, no push that moved a
-    remote-tracking ref), the repository ignores case so the lower-cased paths can be checked
-    against its ignore patterns, none of them is gitignored (git could not see a change to it),
-    and `git status` for the whole tree is clean — a tree that was dirty before the candidate
-    opened cannot close this way, which is the conservative side. A lasting path outside the
+    on and names every lasting path it touched, HEAD is that commit again, every ref but the
+    branches points where it did (tags, the stash, notes), no commit made here since the opening
+    survives on a branch or a remote-tracking ref
+    (`kept_commit`; branches other sessions move and fetches are not the candidate's), the
+    repository ignores case so the lower-cased paths can be
+    checked against its ignore patterns, none of them is gitignored (git could not see a change
+    to it), and `git status` shows none of those paths. Files the candidate never touched — test
+    output, another session's work — do not keep it open (report fb6a9be6), but once the
+    candidate ran a command the snapshots could not resolve, its paths are not the whole of what
+    it may have changed and the whole tree has to be clean. A lasting path outside the
     repository is not something git can vouch for. Every git call shares one small budget and
     any failure keeps the candidate open.
     """
@@ -1466,6 +1509,7 @@ def restoration_blocker(entry):
         return find_restoration_blocker(entry)
     key = json.dumps([entry.get(field) for field in (
         "identity", "head_at_start", "refs_at_start", "path_overflow", "paths", "last_path",
+        "unattributed_durable", "first_ts", "opened_at",
     )], sort_keys=True, default=str)
     if key not in memo:
         memo[key] = find_restoration_blocker(entry)
@@ -1490,11 +1534,11 @@ def find_restoration_blocker(entry):
     deadline = time.monotonic() + RESTORE_BUDGET
     silent = "git did not answer inside the hook's budget"
 
-    def call(arguments, cap):
+    def call(arguments, cap, stdin=None):
         remaining = deadline - time.monotonic()
         if remaining < 0.25:
             return None
-        return cwg.git_run(root, arguments, timeout=min(cap, remaining))
+        return cwg.git_run(root, arguments, timeout=min(cap, remaining), stdin=stdin)
 
     head = call(["rev-parse", "HEAD"], 1.5)
     if not head or head[0] != 0:
@@ -1504,8 +1548,16 @@ def find_restoration_blocker(entry):
     listing = call(["for-each-ref", "--format=%(refname) %(objectname)"], 1.5)
     if not listing or listing[0] != 0:
         return silent
-    if hashlib.sha256(listing[1].encode("utf-8", "replace")).hexdigest() != refs:
-        return "a ref moved since the candidate opened (a commit, tag, stash or push)"
+    # A marker opened before branches were left out holds the digest of every local ref, and one
+    # opened before remote-tracking refs were, of every ref.
+    views = (cwg.pinned_refs, cwg.local_refs, lambda text: text)
+    if not any(hashlib.sha256(view(listing[1]).encode("utf-8", "replace")).hexdigest() == refs
+               for view in views):
+        return "a ref other than a branch moved since the candidate opened (a tag, the stash, a note)"
+    # A marker written before `opened_at` existed has only the later `first_ts`.
+    kept = kept_commit(call, start, float(entry.get("opened_at") or entry.get("first_ts") or 0.0))
+    if kept != "":
+        return silent if kept is None else kept
     if durable:
         # The marker's paths are lower-cased; `check-ignore` matches them against the patterns
         # case-insensitively only while the repository ignores case, so any other setting
@@ -1513,16 +1565,114 @@ def find_restoration_blocker(entry):
         ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
         if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
             return "the repository does not ignore case, so its ignore rules cannot be checked"
-        ignored = call(["check-ignore", "-q", "--"] + durable, 1.5)
-        # Exit 0: at least one path is ignored; 1: none; anything else, or a hang: unknown.
+        # `-q` takes one path: with several git exits 128, which read as "ignored" kept every
+        # candidate of more than one file open (report f82c87c7).
+        ignored = call(["check-ignore", "--stdin", "-z"], 1.5, stdin="".join(path + "\0" for path in durable))
+        # Exit 0: the paths it prints are ignored; 1: none is; anything else, or a hang: unknown.
         if not ignored:
             return silent
+        if ignored[0] == 0:
+            named = [name for name in ignored[1].split("\0") if name]
+            return "a lasting path is gitignored, so git cannot vouch for it ({})".format(
+                cwg.basename(cwg.normalize_path(named[0])) if named else "?")
         if ignored[0] != 1:
-            return "a lasting path is gitignored, so git cannot vouch for it"
-    status = call(["status", "--porcelain", "--untracked-files=all"], 2.5)
+            return "git could not tell whether a lasting path is gitignored"
+    status = call(["status", "--porcelain", "-z", "--untracked-files=all"], 2.5)
     if not status or status[0] != 0:
         return silent
-    return "" if status[1].strip() == "" else "the working tree is not clean"
+    dirty = porcelain_paths(root, status[1])
+    if not dirty:
+        return ""
+    if cwg.SHELL_MUTATION_PATH in marker_paths(entry) or entry.get("unattributed_durable"):
+        return "the working tree is not clean, and the candidate ran a command the gate could not resolve"
+    touched = sorted(dirty & set(durable))
+    if touched:
+        return "a path the candidate changed still differs from HEAD ({})".format(cwg.basename(touched[0]))
+    return ""
+
+
+REFLOG_TIME_RE = re.compile(r"@\{(\d+)\}")
+# Reflog subjects of the operations that create a commit here. A checkout, a reset, a rebase's
+# start or abort and a fast-forward only move HEAD onto a commit that already exists, fetched ones
+# included, and counting those blocked an aborted rebase probe (G12 review, F5).
+MADE_HERE_RE = re.compile(
+    r"^(?:commit(?: \((?:amend|initial|merge)\))?|cherry-pick|revert|am"
+    r"|rebase(?: -i)? \((?:pick|continue|reword|squash|fixup|edit)\)"
+    r"|(?:merge|pull)\b[^:]*: Merge made)"
+)
+# Past this many commits made since the opening the check gives up and keeps the candidate open.
+PUSH_CHECK_CAP = 50
+
+
+def kept_commit(call, start, since):
+    """Why a commit made here while the candidate was open outlives the undo, "" when none does,
+    or None when git could not tell.
+
+    HEAD back on its opening commit does not undo a commit left on another branch, or pushed and
+    then reset away or left on a deleted branch: a local branch or a remote-tracking ref still
+    holds it (G12 review, F1). The worktree's own HEAD reflog records each commit made
+    here — a commit, a merge, a cherry-pick, a rebase's picks — and nothing another worktree of
+    the repository does, so those made after `since` (when the command that opened the candidate
+    started) must be on no local branch and no remote-tracking ref; a tag holding one has moved
+    the digest checked before this. Branches other sessions move and fetched commits are never
+    made here, which is why the digest leaves both out (report 2b8bbfb1). A repository whose
+    HEAD reflog is off or expired shows nothing, and then nothing is checked.
+    """
+    reflog = call(["reflog", "show", "--date=unix", "--format=%H %gd %gs", "HEAD"], 1.5)
+    if not reflog or reflog[0] != 0:
+        return None
+    made = []
+    for line in reflog[1].splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        commit, selector, subject = parts
+        stamp = REFLOG_TIME_RE.search(selector)
+        if (stamp and int(stamp.group(1)) + 1 >= since and MADE_HERE_RE.match(subject)
+                and commit != start and commit not in made):
+            made.append(commit)
+    if len(made) > PUSH_CHECK_CAP:
+        return "more than {} commits were made since the candidate opened to check where they went".format(
+            PUSH_CHECK_CAP)
+    if not made:
+        return ""
+    # The reflog window reaches a second back, and a commit the opening already stood on is none
+    # of the candidate's work, however recent: every branch holding the start holds it too.
+    fresh = call(["rev-list"] + made + ["--not", start], 1.5)
+    if not fresh or fresh[0] != 0:
+        return None
+    listed = set(fresh[1].split())
+    made = [commit for commit in made if commit in listed]
+    if not made:
+        return ""
+    holders = call(["for-each-ref", "--format=%(refname)"] + ["--contains=" + commit for commit in made]
+                   + ["refs/heads/", "refs/remotes/"], 1.5)
+    if not holders or holders[0] != 0:
+        return None
+    names = holders[1].split()
+    local = [name for name in names if not name.startswith("refs/remotes/")]
+    if local:
+        return "a commit made here while the candidate was open is on {}".format(local[0])
+    # A remote's `HEAD` only points at one of its branches, which names the push better.
+    names = [name for name in names if not name.endswith("/HEAD")] or names
+    return "a commit made while the candidate was open was pushed ({})".format(names[0]) if names else ""
+
+
+def porcelain_paths(root, output):
+    """The normalized absolute paths `git status --porcelain -z` lists, a rename's source included."""
+    entries = output.split("\0")
+    paths, index = set(), 0
+    while index < len(entries):
+        item = entries[index]
+        index += 1
+        if len(item) < 4:
+            continue
+        paths.add(cwg.normalize_path(root + "/" + item[3:]))
+        # Either status column can report a rename or a copy, whose source is the next field.
+        if ("R" in item[:2] or "C" in item[:2]) and index < len(entries):
+            paths.add(cwg.normalize_path(root + "/" + entries[index]))
+            index += 1
+    return paths
 
 
 def candidate_floor(entry):
@@ -1625,7 +1775,10 @@ def unmeasured_change(entry, now):
 
     A marker hook cancelled at its timeout records nothing, so an edit made then left no mark: the
     last approval still read as current, and the delta round the session honestly ran after the fix
-    read as review continued after a terminal APPROVED (report 8db8b3d2). The marker keeps the size
+    read as review continued after a terminal APPROVED (report 8db8b3d2). A command that moves HEAD
+    over committed files leaves no mark either unless it is a clean integration of upstream, which
+    the marker carries itself (report c4c78b99): the snapshots list only what differs from HEAD, and
+    a checkout of another branch must not open a candidate of its files. The marker keeps the size
     and modification time of its lasting paths and when they last matched (`content_stats_at`, the
     last measurement or stop that found them unchanged). When they differ now and the content does
     too, a mark is added and the freshness anchor moves to it, so a verdict from before the change is
@@ -1718,6 +1871,28 @@ def active_review_start(evidence, stale):
     return start
 
 
+def round_verdicts(reviews):
+    """The ordinary reviews in filing order, an ESCALATE before round 3 read as that round's REVISE.
+
+    ESCALATE ends the review only as round 3's verdict. An earlier one — a packet that numbered its
+    rounds across the candidate this one replaced, a reviewer that escalated early — left no legal
+    move: every closure asked for a round-3 ESCALATE, and the next round read as review after a
+    terminal verdict (report 6d8e2c4c). It stays what it reports, a round with open blockers, and
+    the review goes on within its budget; a closure packet sent after it is review activity, as
+    before any round-3 ESCALATE (report 77226dfa). Rounds count from the last APPROVED, where a
+    new sequence starts.
+    """
+    read, rounds = [], 0
+    for stamp, verdict in sorted(reviews):
+        rounds += 1
+        if verdict == "ESCALATE" and rounds < MAX_REVIEW_ROUNDS:
+            verdict = "REVISE"
+        read.append((stamp, verdict))
+        if verdict == "APPROVED":
+            rounds = 0
+    return read
+
+
 def simplify_missing(risk, state):
     """The simplify lanes this risk still needs a current foreground result from."""
     if risk == "HIGH":
@@ -1772,19 +1947,22 @@ def evaluate_receipt(receipt, entry, evidence):
 
     # Every freshness rule below asks whether evidence still covers the candidate the reviewer
     # read. That is the last change to a lasting artifact: a rerun maintenance command or a
-    # rewritten throwaway script leaves the reviewed diff untouched. Markers written before this
-    # field existed fall back to the strict whole-cycle timestamp.
+    # rewritten throwaway script leaves the reviewed diff untouched. A candidate with no recorded
+    # lasting change — one whose change no snapshot can see, closed as `verified` — is judged by its
+    # last mark that could have written (`last_write_ts`), which bookkeeping and readers after the
+    # approval leave where it was (report cf223da5). A marker without it — opened before it existed,
+    # or holding only such marks — falls back to the strict whole-cycle timestamp.
     durable_ts = float(entry.get("last_durable_ts") or 0.0)
     if not cwg.valid_ts(durable_ts):
-        durable_ts = last_ts
+        written = entry.get("last_write_ts")
+        durable_ts = float(written) if cwg.valid_ts(written) else last_ts
 
     current = lambda stamp: content_covers(entry, stamp, durable_ts)  # noqa: E731
     review_start = active_review_start(evidence, lambda stamp: not current(stamp))
     # Sorted by the moment each verdict is filed at: a background lane's verdict is filed at
     # its launch once its notification is read, after every result that returned in between.
-    ordinary_reviews = sorted(
-        item for item in evidence["ordinary_reviews"] if item[0] > review_start
-    )
+    rounds = round_verdicts(evidence["ordinary_reviews"])
+    ordinary_reviews = [item for item in rounds if item[0] > review_start]
     ordinary_verdicts = [verdict for _, verdict in ordinary_reviews]
     # A closure validation exists only after the round-3 ESCALATE whose recovery it checks. A
     # closure packet sent before one — round 3 ended REVISE, the packet offered the wrong
@@ -1796,10 +1974,25 @@ def evaluate_receipt(receipt, entry, evidence):
     escalated_at = max(
         (stamp for stamp, verdict in ordinary_reviews if verdict == "ESCALATE"), default=None
     )
-    closure_reviews = sorted(
+    phase_reviews = sorted(
         item for item in evidence["closure_reviews"]
         if escalated_at is not None and item[0] > escalated_at
     )
+    # A READY that a later lasting change or barrier made stale retires with the passes before it,
+    # as a stale APPROVED retires its rounds: the block asks for a fresh closure validation, which
+    # read as validation after a terminal READY and left no legal receipt (report 27c9dcd0). Only a
+    # READY inside the pass budget retires, so a pass past the cap cannot reset the cap, and none
+    # after a READY that still covers the candidate: that one stays terminal.
+    retired, passes = None, 0
+    for stamp, verdict in phase_reviews:
+        passes += 1
+        if verdict != "READY":
+            continue
+        if current(stamp):
+            break
+        if passes <= MAX_CLOSURE_PASSES:
+            retired, passes = stamp, 0
+    closure_reviews = [item for item in phase_reviews if retired is None or item[0] > retired]
     closure_verdicts = [verdict for _, verdict in closure_reviews]
 
     if len(ordinary_verdicts) > MAX_REVIEW_ROUNDS:
@@ -1900,14 +2093,6 @@ def evaluate_receipt(receipt, entry, evidence):
     ):
         return False, "review activity continued after terminal READY"
 
-    expected_escalation = (
-        ["REVISE"] * (MAX_REVIEW_ROUNDS - 1) + ["ESCALATE"]
-    )
-    if ordinary_verdict == "ESCALATE" and ordinary_verdicts != expected_escalation:
-        return False, "ESCALATE requires exactly {}".format(
-            ", ".join(expected_escalation)
-        )
-
     if required_external_calls:
         if kind in ("verified", "pr-ready") and not required_external_success:
             return False, "required external Codex evidence is missing, stale, or failed"
@@ -1919,7 +2104,7 @@ def evaluate_receipt(receipt, entry, evidence):
     if kind == "verified":
         if closure_verdicts:
             return False, "verified cannot follow autonomous closure validation"
-        if any(verdict == "ESCALATE" for _, verdict in evidence["ordinary_reviews"]):
+        if any(verdict == "ESCALATE" for _, verdict in rounds):
             return False, "ESCALATE requires autonomous closure, not verified"
         if ordinary_verdicts and ordinary_verdict != "APPROVED":
             return False, "an invoked review has no terminal APPROVED verdict"
@@ -1938,13 +2123,11 @@ def evaluate_receipt(receipt, entry, evidence):
                 or required_external_unavailable
             )
         ):
-            return False, (
-                "{} requires round-3 ESCALATE or exhausted required evidence"
-            ).format(kind)
+            return False, "{} {}".format(kind, ESCALATE_REQUIRED)
 
     if kind == "pr-ready":
         if not (closure_verdict == "READY" and current(closure_ts)):
-            if evidence["closure_reviews"] and not closure_reviews:
+            if evidence["closure_reviews"] and not phase_reviews:
                 return False, (
                     "pr-ready lacks a CLOSURE_VALIDATION: READY after round-3 ESCALATE "
                     "(a closure packet sent before the ESCALATE is not a closure validation)"
@@ -1967,6 +2150,11 @@ def evaluate_receipt(receipt, entry, evidence):
     return True, "draft-blocked"
 
 
+# The receipts that close a candidate on evidence; `anomaly-reported`, `draft-blocked` and an
+# exhausted block budget end it UNVERIFIED, so its bytes are not recorded as closed.
+VOUCHING_RECEIPTS = frozenset(("verified", "operational", "no-change", "pr-ready"))
+
+
 def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     """Retire the candidate, then the block state, then sweep: the order a cancelled hook survives.
 
@@ -1979,7 +2167,22 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     """
     now = time.time()
     current = cwg.read_json(marker)
-    if current is None or current.get("last_ts") == candidate_ts:
+    try:
+        import code_work_gate_mark as mark
+    except Exception:
+        # Only the import is forgiven, and every way it can fail: the marker is edited in this
+        # very repository, so a half-written file raises SyntaxError rather than ImportError,
+        # and letting that escape would report a close that already happened as a hook failure,
+        # with no `close` line in the ledger. The sweep itself stays outside: a fault in it is a
+        # defect and must surface.
+        mark = None
+    whole = current is None or current.get("last_ts") == candidate_ts
+    try:
+        closed_content = closed_content_of(current, mark, receipt[0]) if whole else None
+    except Exception:
+        # The record is optional and the close is not: an unmeasurable candidate vouches for nothing.
+        closed_content = {}
+    if whole:
         retired = cwg.remove(marker) or cwg.write_json(marker, dict(current or {}, closed=True))
     else:
         current["first_ts"] = current.get("last_ts") or now
@@ -1992,6 +2195,8 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
         "closed_at": now,
         "receipt": "{}: {}".format(receipt[0], receipt[1]),
     })
+    if closed_content is not None:
+        state["closed_content"] = closed_content
     cwg.write_json(state_file, state)
 
     # The attribution registry outlives no candidate: what this session announced is only ever
@@ -2002,18 +2207,27 @@ def close_cycle(marker, state_file, state, candidate_ts, receipt, session_key_):
     # a capture is dropped only by its own day-long expiry, which this closing is an occasion to
     # apply — otherwise nothing sweeps a session that launches no further review.
     cwg.retire_claims(session_key_)
-    try:
-        import code_work_gate_mark as mark
-    except Exception:
-        # Only the import is forgiven, and every way it can fail: the marker is edited in this
-        # very repository, so a half-written file raises SyntaxError rather than ImportError,
-        # and letting that escape would report a close that already happened as a hook failure,
-        # with no `close` line in the ledger. The sweep itself stays outside: a fault in it is a
-        # defect and must surface.
-        mark = None
     if mark is not None:
         mark.forget_stale_captures(session_key_)
     return True
+
+
+def closed_content_of(entry, mark, kind):
+    """What the closing candidate's lasting files held, for the marker to recognise them later:
+    `{"paths", "fp"}`; None when the candidate had none, which leaves the previous record
+    standing; `{}` when a receipt of `kind` vouches for nothing (an UNVERIFIED close) or the files
+    cannot be measured (past the path cap, too large, too slow, the marker module unavailable),
+    which clears it, since such a candidate may have moved the earlier one's files and the old
+    record would then vouch for a combination nobody closed. After the receipt, committing,
+    rebasing or pushing the recorded bytes is no new work, and opening a candidate on it asked for
+    lanes on content already closed (report 9dbbfe70)."""
+    lasting = sorted(set(cwg.durable_paths(cwg.marker_paths(entry or {}))))
+    if not lasting:
+        return None
+    if kind not in VOUCHING_RECEIPTS or mark is None or (entry or {}).get("path_overflow"):
+        return {}
+    fingerprint = mark.content_fingerprint(lasting, deadline=time.monotonic() + CATCH_UP_BUDGET)
+    return {"paths": lasting, "fp": fingerprint} if fingerprint else {}
 
 
 HIGH_STALE_REASON = "HIGH candidate lacks a current APPROVED verdict"
@@ -2022,8 +2236,9 @@ ROUND_REASONS = (
     "ordinary review exceeded",
     "ordinary review continued after terminal",
     "review activity continued after terminal",
-    "ESCALATE requires exactly",
 )
+# The tail of the block a `pr-ready` or `draft-blocked` receipt gets without a round-3 ESCALATE.
+ESCALATE_REQUIRED = "requires round-3 ESCALATE or exhausted required evidence"
 DETAIL_LIMIT = 600
 
 
@@ -2033,24 +2248,28 @@ def block_detail(reason, entry, evidence):
     The ledger held all of it before, and sessions filed anomaly reports for want of it: when
     the evidence starts counting and which open candidate that moment replaced, what stands
     between an approval and now, which rounds were read, and what keeps a repository from
-    reading as restored (reports a269a6fc, 4b840373, 0e4aedc8, 32a3582f).
+    reading as restored (reports a269a6fc, 4b840373, 0e4aedc8, 32a3582f). A closure receipt refused
+    for want of a round-3 ESCALATE shows the rounds too, and why the latest review result gave no
+    verdict when the scan knows: a third round launched in a shape nothing could be bound from was
+    missing, and the block said nothing of it (report 926b670b).
     """
     import code_work_gate_mark as mark
     notes = []
-    if reason == HIGH_STALE_REASON or reason.startswith(ROUND_REASONS + ("simplify",)):
+    rounds = reason.startswith(ROUND_REASONS) or ESCALATE_REQUIRED in reason
+    if reason == HIGH_STALE_REASON or rounds or reason.startswith("simplify"):
         first_ts = entry.get("first_ts")
         if cwg.valid_ts(first_ts):
             note = "evidence for this candidate counts from {}".format(mark.clock(first_ts))
             displaced = entry.get("displaced")
             if isinstance(displaced, dict) and cwg.valid_ts(displaced.get("opened")):
                 note += (
-                    ", when it replaced the candidate open since {} ({}); lane results from "
-                    "before belong to that one"
+                    ", when it replaced the candidate open since {} ({}); lane results and review "
+                    "rounds from before belong to that one"
                 ).format(mark.clock(displaced["opened"]), mark.displacement_cause(displaced))
             notes.append(note)
     if reason == HIGH_STALE_REASON:
         notes.append(approval_barriers(entry, evidence, mark.clock))
-    elif reason.startswith(ROUND_REASONS):
+    elif rounds:
         notes.append(rounds_read(evidence, mark.clock))
     elif "cannot close a candidate that changed a lasting artifact" in reason:
         notes.append(restoration_blocker(entry))
@@ -2063,7 +2282,7 @@ def approval_barriers(entry, evidence, clock):
     approvals = [stamp for stamp, verdict in evidence.get("ordinary_reviews") or []
                  if verdict == "APPROVED"]
     if not approvals:
-        return "no APPROVED verdict was read for this candidate"
+        return "no APPROVED verdict was read for this candidate" + unbound_note(evidence, clock)
     approved = max(approvals)
     marks = [mark for mark in entry.get("content_marks") or []
              if isinstance(mark, dict) and cwg.valid_ts(mark.get("ts")) and float(mark["ts"]) > approved]
@@ -2077,7 +2296,9 @@ def approval_barriers(entry, evidence, clock):
         notes.append("the lasting content differs from what it approved{}".format(
             " (changed at {}{})".format(
                 clock(changed[-1]["ts"]),
-                ", a change no marker hook measured: one was cancelled or timed out" if unmeasured else "",
+                ", a change no marker hook measured: a hook cancelled or timed out, a checkout, reset,"
+                " merge or rebase that rewrote committed files and was no clean integration of upstream,"
+                " or a write from outside this session's tools" if unmeasured else "",
             ) if changed else ""))
     if not notes:
         notes.append("the last lasting change is at {}".format(clock(entry.get("last_durable_ts"))))
@@ -2109,12 +2330,29 @@ def rounds_read(evidence, clock):
     text = ("ordinary rounds read: " + ", ".join(
         "{} {}".format(clock(stamp), verdict) for stamp, verdict in rounds[-6:])
     ) if rounds else "no ordinary round was read"
+    early = [stamp for (stamp, verdict), (_, read) in zip(rounds, round_verdicts(rounds)) if verdict != read]
+    if early:
+        text += "; an ESCALATE before round 3 counts as that round's REVISE ({})".format(
+            ", ".join(clock(stamp) for stamp in early[-3:]))
     unusable = sorted(stamp for stamp, kind, _ in evidence.get("review_events") or []
                       if kind not in ("ordinary", "closure"))
     if unusable:
         text += "; review results without a usable verdict at " + ", ".join(
             clock(stamp) for stamp in unusable[-4:])
-    return text
+    return text + unbound_note(evidence, clock)
+
+
+def unbound_note(evidence, clock):
+    """Why the latest review result without a usable verdict gave none — the latest by time, then by
+    the order the scan filed it — when the scan recorded why for that very result (by its place in
+    `review_events`); nothing otherwise, so no other result's reason is pinned on it."""
+    unusable = [(stamp, place) for place, (stamp, kind, _) in enumerate(evidence.get("review_events") or [])
+                if kind not in ("ordinary", "closure")]
+    if not unusable:
+        return ""
+    stamp, place = max(unusable)
+    why = dict(evidence.get("unbound_reasons") or []).get(place)
+    return "; the result at {} could not be bound: {}".format(clock(stamp), why) if why else ""
 
 
 def reminder(reason, block_number, operational, session_id="", repeated=False, transcript="",
@@ -2170,7 +2408,7 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
 
 def waiting_note(running, waits):
     """What the parent sees when a stop is allowed only because background work is running."""
-    kinds = {"shell": "shell command", "agent": "background agent"}
+    kinds = {"shell": "shell command", "agent": "background agent", "workflow": "workflow"}
     named = ", ".join(
         "{} ({}{}{})".format(
             task["id"], kinds.get(task["kind"], task["kind"]),

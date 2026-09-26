@@ -746,7 +746,12 @@ def try_merge(record, base):
         git(tmp, "merge", "--abort")
         return "conflict", err, [f for f in conflicted.splitlines() if f]
     finally:
-        git(record["repo_root"], "worktree", "remove", "--force", tmp)
+        # A fresh checkout, but `--force` would still walk into any link in it; one that will
+        # not go leaves the tree for a look rather than risking its target.
+        if not hc.unlink_directory_links(tmp)[1]:
+            git(record["repo_root"], "worktree", "remove", "--force", tmp)
+        else:
+            print("could not unlink every link in {}, left for a look".format(tmp), file=sys.stderr)
 
 
 def cmd_finish(args):
@@ -1229,6 +1234,12 @@ def discard_chip(record):
     """
     repo_root, worktree = record.get("repo_root"), record.get("worktree")
     if worktree and repo_root:
+        # Git removes a clean tree's ignored files along with it and, on Windows, walks into a
+        # junction among them (hygiene_common.unlink_directory_links). The links go first, and
+        # only out of a tree git is about to remove: one holding work keeps them.
+        ok, status, _ = git(worktree, "status", "--porcelain", timeout=15)
+        if not ok or status.strip() or hc.unlink_directory_links(worktree)[1]:
+            return False
         ok, _, _ = git(repo_root, "worktree", "remove", worktree, timeout=15)
         if not ok:
             return False

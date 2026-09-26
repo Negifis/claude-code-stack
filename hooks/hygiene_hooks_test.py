@@ -87,9 +87,10 @@ def test_snapshot_saves_uncommitted(root):
     with open(os.path.join(wt, "brand-new.txt"), "w", encoding="utf-8") as handle:
         handle.write("untracked work\n")
 
+    # `worktree_path` is the field Claude Code sends; `cwd` is the session's own directory.
     code, out, err = run_hook("worktree_snapshot.py", {
-        "session_id": "test-1", "hook_event_name": "WorktreeRemove",
-        "name": "dirty", "path": wt, "branch": "feature-x",
+        "session_id": "test-1", "hook_event_name": "WorktreeRemove", "cwd": repo,
+        "name": "dirty", "worktree_path": wt, "branch": "feature-x",
     })
     check("snapshot hook exits 0", code == 0, err)
     check("snapshot reports the branch", "wip/dirty-" in out, out)
@@ -273,6 +274,127 @@ def test_snapshot_survives_bad_input(root):
     check("malformed payload exits 0", proc.returncode == 0, proc.stderr)
 
 
+def test_snapshot_never_takes_cwd_for_the_tree(root):
+    """`cwd` is the session's directory — for a subagent's worktree, the parent's checkout — so a
+    payload naming no tree parks nothing from it."""
+    repo = make_repo(root, "repo-cwd")
+    with open(os.path.join(repo, "parent-work.txt"), "w", encoding="utf-8") as handle:
+        handle.write("the parent's own edit\n")
+    code, _, err = run_hook("worktree_snapshot.py", {
+        "session_id": "test-cwd", "hook_event_name": "WorktreeRemove", "cwd": repo,
+    })
+    check("a payload without a tree exits 0", code == 0, err)
+    check("and parks nothing from the session's directory", not wip_branches(repo, "wip/*"),
+          wip_branches(repo, "wip/*"))
+
+
+def make_junction(target, link):
+    """A directory junction on Windows, a directory symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(target, link)
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_links_go_before_the_tree(root):
+    """Git for Windows walks into a junction when it removes a tree and deletes what it points at
+    (2026-09-19). Every junction and directory link goes first, as a link, and nothing behind one
+    is touched: not a shared `node_modules`, not one nested deeper, not a dangling one."""
+    repo = make_repo(root, "repo-links")
+    wt = os.path.join(root, "wt-links")
+    git(repo, "worktree", "add", "-q", "-b", "feature-links", wt)
+    shared = os.path.join(root, "links-shared")
+    nested = os.path.join(root, "links-nested")
+    gone = os.path.join(root, "links-gone")
+    for directory in (os.path.join(shared, "pkg"), nested, gone):
+        os.makedirs(directory)
+    for directory in (os.path.join(shared, "pkg"), nested):
+        with open(os.path.join(directory, "kept.txt"), "w", encoding="utf-8") as handle:
+            handle.write("must survive\n")
+    make_junction(shared, os.path.join(wt, "node_modules"))
+    os.makedirs(os.path.join(wt, "sub", "deeper"))
+    make_junction(nested, os.path.join(wt, "sub", "deeper", "link"))
+    make_junction(gone, os.path.join(wt, "dangling"))
+    os.rmdir(gone)
+
+    removed, failed = hc.unlink_directory_links(wt)
+    check("every link goes", len(removed) == 3 and not failed, (removed, failed))
+    check("what they led to stays",
+          os.path.isfile(os.path.join(shared, "pkg", "kept.txt"))
+          and os.path.isfile(os.path.join(nested, "kept.txt")))
+    check("the tree's own files stay", os.path.isfile(os.path.join(wt, "kept.txt")))
+    git(repo, "worktree", "remove", "--force", wt)
+    check("the tree then goes", not os.path.exists(wt))
+    check("and the targets outlive it",
+          os.path.isfile(os.path.join(shared, "pkg", "kept.txt"))
+          and os.path.isfile(os.path.join(nested, "kept.txt")))
+
+    linked_root = os.path.join(root, "links-root")
+    make_junction(shared, linked_root)
+    removed, failed = hc.unlink_directory_links(linked_root)
+    check("a root that is itself a link is refused, not entered",
+          failed == [linked_root] and not removed
+          and os.path.isfile(os.path.join(shared, "pkg", "kept.txt")), (removed, failed))
+
+
+def test_unlink_command_spares_a_main_checkout(root):
+    """By hand the command runs only in a linked worktree: a main checkout's links are its own."""
+    repo = make_repo(root, "repo-unlink-main")
+    shared = os.path.join(root, "unlink-shared")
+    os.makedirs(shared)
+    make_junction(shared, os.path.join(repo, "node_modules"))
+    command = [PYTHON, os.path.join(HERE, "hygiene_common.py"), "unlink-links"]
+    proc = subprocess.run(command + [repo], capture_output=True, text=True, timeout=60)
+    check("a main checkout is refused", proc.returncode == 1
+          and "not a linked worktree" in proc.stderr, proc.stderr)
+    check("and keeps its junction", os.path.isdir(os.path.join(repo, "node_modules")))
+    wt = os.path.join(root, "wt-unlink")
+    git(repo, "worktree", "add", "-q", "-b", "feature-unlink", wt)
+    make_junction(shared, os.path.join(wt, "node_modules"))
+    proc = subprocess.run(command + [wt], capture_output=True, text=True, timeout=60)
+    check("a linked worktree loses its links", proc.returncode == 0
+          and "unlinked" in proc.stdout and not os.path.exists(os.path.join(wt, "node_modules")),
+          proc.stdout + proc.stderr)
+    check("the shared directory stays", os.path.isdir(shared))
+    git(repo, "worktree", "remove", "--force", wt)
+
+
+def older_python():
+    """An interpreter on PATH older than 3.12, which has no `is_junction`, or None."""
+    for name in ("python", "python3", "py"):
+        found = shutil.which(name)
+        if not found:
+            continue
+        proc = subprocess.run([found, "-c", "import sys; print(sys.version_info < (3, 12))"],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0 and proc.stdout.strip() == "True":
+            return found
+    return None
+
+
+def test_unlink_command_under_an_older_python(root):
+    """The advice names a bare `python`, which may be older than 3.12; the links must still go."""
+    older = older_python()
+    if not older:
+        print("skip - no interpreter older than 3.12 on PATH")
+        return
+    repo = make_repo(root, "repo-unlink-older")
+    shared = os.path.join(root, "unlink-older-shared")
+    os.makedirs(shared)
+    with open(os.path.join(shared, "kept.txt"), "w", encoding="utf-8") as handle:
+        handle.write("must survive\n")
+    wt = os.path.join(root, "wt-unlink-older")
+    git(repo, "worktree", "add", "-q", "-b", "feature-older", wt)
+    make_junction(shared, os.path.join(wt, "node_modules"))
+    proc = subprocess.run([older, os.path.join(HERE, "hygiene_common.py"), "unlink-links", wt],
+                          capture_output=True, text=True, timeout=60)
+    check("an older interpreter still unlinks the junction", proc.returncode == 0
+          and not os.path.exists(os.path.join(wt, "node_modules")), proc.stdout + proc.stderr)
+    git(repo, "worktree", "remove", "--force", wt)
+    check("and the target outlives the removal", os.path.isfile(os.path.join(shared, "kept.txt")))
+
+
 def test_guard_warns_on_shared_tree(root):
     repo = make_repo(root, "repo-guard")
     first = run_hook("session_guard.py", {
@@ -355,6 +477,10 @@ def main():
             test_snapshot_keeps_tracked_but_ignored_files,
             test_snapshot_reports_its_own_failure,
             test_snapshot_survives_bad_input,
+            test_snapshot_never_takes_cwd_for_the_tree,
+            test_links_go_before_the_tree,
+            test_unlink_command_spares_a_main_checkout,
+            test_unlink_command_under_an_older_python,
             test_guard_warns_on_shared_tree,
             test_guard_tracks_several_holders,
             test_guard_names_the_issue,

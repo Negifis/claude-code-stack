@@ -53,12 +53,15 @@ execution, where it belongs, satisfies that. A lasting change the gate cannot se
 through the shell into a file no snapshot watches — is still persistent work: close that
 candidate with `[gate] verified: <risk>; …` and what that risk requires.
 
-A lasting change that was undone — a rebase probe aborted, an edit reverted — leaves the
-repository on the commit the candidate opened on, with every ref where it was and the whole
-tree clean; the gate reads that from git and accepts `operational` or `no-change` for it, so do
-not manufacture a review for nothing. A commit on another branch, a stash, a push, a gitignored
-lasting file, a tree that was already dirty when the candidate opened, or a candidate past the
-marker's path cap keep it open; the block names which.
+A lasting change that was undone — a rebase probe aborted, a merge aborted, an edit reverted —
+leaves the repository on the commit the candidate opened on, with every ref but the branches
+where it was (tags, the stash, notes), no commit made here left on a branch, and every path the candidate touched back as HEAD
+has it; the gate reads that from git and accepts `operational` or `no-change` for it, so do not
+manufacture a review for nothing. A fetch, branches other sessions moved in a repository whose
+worktrees share one ref store, and files the candidate never touched do not count. A commit made
+here on another branch, a tag, a stash, a note, a commit pushed while the candidate was open (even one reset away since),
+a gitignored lasting file, a candidate past the marker's path cap, or a dirty tree after a command
+the gate could not resolve keep it open; the block names which.
 
 ## 3. Classify risk
 
@@ -99,8 +102,27 @@ so the receipt shape is never a surprise.
 - Run narrow checks first. After a remediation, rerun only checks whose covered code or inputs
   changed. Run a broad suite once on the final high-risk candidate, or again only when a later
   edit changed that suite's boundary. A no-edit review pass invalidates nothing.
-- Separate current-scope failures from pre-existing, flaky, skipped, unavailable, or unrelated
-  failures. State the exact limitation; do not expand the task to repair the baseline.
+- Every failure a check reports is handled, whatever the check — unit, integration, e2e, lint,
+  type check, build, format or any other — and whoever caused it: flaky and pre-existing
+  failures included. One the candidate caused, or one inside its scope, is fixed in the
+  candidate at its root (`root-cause-engineering`), never by fitting the test or the rule to
+  the code.
+- A pre-existing or out-of-scope failure is not ignored; it is handed off for a fix of its own:
+  to a `spawn_task` chip (`chip-handoff`) by default, or to a subagent working in its own
+  worktree when the fix is small, disjoint from the candidate and needed before this task ends.
+  Either way the fix stays a separate change, never mixed into the candidate's diff. One
+  handoff per root cause, carrying the exact command, the failing output and the evidence that
+  the failure is not the candidate's: the same check failing the same way on the base revision,
+  where only the failing cases need to run. The final answer names each failure and where it
+  went.
+- A disabled check is a hidden failure: a skip, xfail or focus marker, a suppression comment
+  (`eslint-disable`, `# noqa`, `# type: ignore`, `@ts-ignore`), a rule or path excluded in a
+  linter or type-checker configuration, a CI job allowed to fail, a bypassed hook
+  (`--no-verify`). Re-enable every one you meet: on code the candidate changes, in the
+  candidate, fixing what it hid; anywhere else, through the same handoff, which re-enables it
+  together with the fixes it needs. No kind of check is exempt, and none is ever disabled.
+- A check that cannot run here — no environment, service or credentials — is not a pass: name
+  it and what running it needs.
 - Keep tool output out of context: tail or grep a log, run a suite with a failures-only
   reporter, read a fragment rather than a file, and never paste a diff twice.
 - Work that outlasts a foreground call — a Codex review, a broad suite, a server — is
@@ -155,9 +177,11 @@ observable — the native lane as a foreground result or as the result its compl
 notification carries, the Codex lane as the rollout log bound at its notification — never as a
 summary you wrote. A background verdict is filed at the launch: a lasting edit after the launch
 expires it exactly as an edit after a foreground approval does, and so does a write-capable
-command the snapshots could not measure — the launch command included, when it starts outside
-any repository. Launch from the candidate's repository; a command that begins with
-`cd <repo> &&` counts as starting there. A later round may continue the same native reviewer
+command the snapshots could not measure. A command that is exactly the launch template of
+`/adversarial-review` — `REVIEW_ID=<literal>`, a `cd`, and a bare `codex exec` with the template's
+options, its packet on stdin and its stderr in `/c/tmp` — is not one, wherever it starts, so a
+candidate with no repository keeps its Codex verdict too; anything else in that command makes it
+one. A later round may continue the same native reviewer
 with `SendMessage`: its verdict is read from that round's completion notification and filed at
 the `SendMessage`. One ledger and one round budget span the lanes: switching engines continues
 the review, never restarts it. Add at most one specialist only for a named non-overlapping
@@ -167,21 +191,32 @@ Obtain the verdict as the last step. Editing a lasting artifact after an approva
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
 scope), and the rounds after it form a new sequence of at most three; reruns of a throwaway
 script or a maintenance command do not, and neither does an edit reverted byte for byte, nor
-does staging or committing the approved bytes — the gate measures content, not edit events (a
+does staging, committing, rebasing or pushing the approved bytes, before the receipt or after
+it — the gate measures content, not edit events (a
 file still in conflict when reviewed is the exception: `git add` is its resolution step, so
 resolve and stage before the review). A clean merge or rebase of this session's approved
-candidate needs nothing, and neither does merging upstream into a candidate: the marker sets
-aside every path a merge leaves exactly as `git merge-tree` computes it from the HEAD before the
-command and a commit reachable from a remote's default branch, and a verdict that covered the
-candidate's own files covers such a merge of them. The gate trusts the ref, not the author:
+candidate needs nothing, and neither does merging upstream into a candidate or rebasing it onto
+upstream: the marker sets aside every path a merge leaves exactly as `git merge-tree` computes it
+from the HEAD before the command and a commit reachable from a remote's default branch, and a
+verdict that covered the candidate's own files covers such a merge of them. A rebase counts when
+one command that names it (`rebase`, `pull`; an alias is not recognized) runs it start to finish
+over the candidate's committed files, all in that repository, and so does a merge committed by the
+same command; either way the merge must be free of conflicts anywhere in the tree. The gate trusts
+the ref, not the author:
 whatever the default branch reaches — your own push there, the branch a local-clone remote had
 checked out — reads as upstream, so never route unreviewed work through it. Merging any other
-branch — a feature branch, a chip's, your own push to one — brings work in and is recorded like
-any write. A path resolved by hand — a conflict edited, a modify/delete settled with `git rm` —
+branch, or rebasing onto one — a feature branch, a chip's, your own push to one — brings work in
+and counts like any write. A path resolved by hand — a conflict edited, a modify/delete settled with `git rm` —
 stays in the candidate: its resolution diff is a delta that gets the delta lane and a delta
 round, and a merge resolved by hand never closes as `operational`. An approval from another
 session, a chip's included, is a claim: bringing that work into your tree from its branch opens
 your own candidate.
+
+A shell command the gate's snapshots cannot measure expires a verdict unless its text proves it
+writes nothing lasting: reads, bookkeeping, a redirect or a quoted heredoc into a throwaway file,
+and `$(cat <file>)` pass; a script block (`Where-Object { … }`), any other substitution, or inline
+code (`node -e`, `python -c`) does not. After an approval, run such a command from inside the
+candidate's repository, where the snapshot measures what it did, or in a form without them.
 
 ```
 MAX_REVIEW_ROUNDS = 3
@@ -201,6 +236,10 @@ BLOCKING_THRESHOLD = HIGH
 - `VERDICT: APPROVED` ends the gate immediately. There is no post-approval review or simplify
   pass. Round 3 with open blockers ends in `VERDICT: ESCALATE`; never force approval and never
   emit a fourth ordinary round.
+- Rounds count per candidate. One the hook announces as replacing another (a branch switch
+  opens a new candidate) starts at round 1: number the packet from there. An ESCALATE before
+  round 3 is not terminal — the hook reads it as that round's REVISE, and the review continues
+  within its budget.
 
 `ESCALATE` is terminal only for the review loop; the parent continues immediately with the
 autonomous closure below. If a required reviewer is unavailable after the bounded wait policy
@@ -239,7 +278,11 @@ resulting edit and affected checks, then exactly one foreground `CLOSURE_VALIDAT
 the same reviewer with the frozen ledger, new evidence, recovery delta, exact candidate and
 affected checks — it checks only prior blockers, affected interfaces and direct regressions,
 never the whole scope. `CLOSURE_VALIDATION: READY` → terminal `PR_READY`, publish without
-validating again. `BLOCKED` at pass 1 must name a new concrete `REMEDIATE`/`REDESIGN` or go
+validating again — and close with the receipt before any deploy or smoke command: outside a
+repository every write-capable command after a verdict is a barrier. A READY that a later lasting
+edit or such a barrier made stale retires with the passes before it, as a stale APPROVED retires
+its rounds; the next closure validation starts a fresh budget (a pass past the cap retires
+nothing, and nothing retires through a READY that still covers the candidate). `BLOCKED` at pass 1 must name a new concrete `REMEDIATE`/`REDESIGN` or go
 straight to `DRAFT_BLOCKED`; `BLOCKED` at pass 2, or `REVIEW_UNAVAILABLE` blocking required
 evidence, is terminal `DRAFT_BLOCKED`. Do not restart broad review or repeat an approach.
 A closure packet sent before a round-3 `ESCALATE` is not a closure validation: the hook counts

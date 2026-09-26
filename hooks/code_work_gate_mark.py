@@ -89,6 +89,16 @@ AGENT_CONFIG_DIRS = (
 AGENT_CONFIG_FILES = (
     "settings.json", "settings.local.json", ".mcp.json", "claude.md", "agents.md",
 )
+SETTINGS_FILES = frozenset(("settings.json", "settings.local.json"))
+# Keys the Claude Code app writes into a settings file from its own interface — /config, /model,
+# /effort, the output-style picker — whenever the user changes them, outside any command. A
+# rewrite confined to them changes nothing that runs or grants authority, and charging it to the
+# command that happened to be running put an output-style switch into two sessions' candidates
+# at HIGH (reports aa7603a1, 551e104e).
+APP_SETTINGS_KEYS = frozenset((
+    "outputStyle", "model", "effortLevel", "alwaysThinkingEnabled", "theme", "verbose",
+    "editorMode", "language", "showThinkingSummaries",
+))
 # These trees are shared: a second session, an editor, or a background hook writing here while
 # a command runs is attributed to that command, the same way a dirty worktree is attributed to
 # the command that ran over it. The cost is a review round, never a missed one.
@@ -176,7 +186,7 @@ GLAB_READ_RE = re.compile(
 BOOKKEEPING_COMMANDS = {
     "nlm-memory": frozenset(("recall", "remember", "stats", "doctor", "status", "maintain")),
 }
-# The hooks' own scripts that write only `state/`, with the subcommands that do (None: all of them).
+# Scripts that write only their own state — the hooks' and the memory bridge — by subcommand (None: all).
 # `chip_handoff finish` merges in a scratch worktree under `state/chips` and moves only a branch no
 # checkout holds, and the skill runs it right after the approval (report 44855de6); `close` writes the
 # chip's card, `status` reads the cards; `open` cuts a worktree and stays write-capable.
@@ -184,6 +194,7 @@ STATE_ONLY_SCRIPTS = {
     "gate_inbox": None,
     "codex_lane": None,
     "chip_handoff": frozenset(("finish", "status", "close")),
+    "nlm_sync": BOOKKEEPING_COMMANDS["nlm-memory"],  # BRIDGE_SCRIPT
 }
 
 
@@ -192,7 +203,12 @@ def hook_script_re(names):
     return re.compile(r"(?:^|/)hooks/(?:{})\.py$".format("|".join(names)), re.IGNORECASE)
 
 
-STATE_ONLY_SCRIPT_RE = hook_script_re(STATE_ONLY_SCRIPTS)
+# The memory bridge the `nlm-memory` shim runs, called under an interpreter when an argument carries
+# characters the shim's cmd.exe would parse (report c2a8dfe0). It lives under `~/.codex`, so unlike
+# the hooks' scripts it still names that home.
+BRIDGE_SCRIPT = "nlm_sync"
+BRIDGE_SCRIPT_RE = re.compile(r"(?:^|/)notebooklm-sync/bin/nlm_sync\.py$", re.IGNORECASE)
+STATE_ONLY_SCRIPT_RE = hook_script_re(sorted(set(STATE_ONLY_SCRIPTS) - {BRIDGE_SCRIPT}))
 # A quoted shell word, the same alternatives `SHELL_WORD_RE` starts with.
 QUOTED_TEXT = r"\"[^\"]*\"|'[^']*'"
 QUOTED_TEXT_RE = re.compile(QUOTED_TEXT)
@@ -475,10 +491,10 @@ def directory_plan(command, cwd, shell="Bash"):
 
 # A verdict covers content, not edit events: the marker keeps a fingerprint of its lasting
 # paths at every durable change, so an edit that was reverted leaves the approved content — and
-# the approval — in place. The index listings cost git calls per directory, so a candidate
-# wider than INDEXED_FILES is measured on content alone rather than not at all; only a file or a
-# total too large to read leaves the fingerprint unknown, and freshness then falls back to the
-# timestamp rule.
+# the approval — in place. The index is read only for a candidate of up to INDEXED_FILES paths,
+# and a wider one is measured on content alone rather than not at all; only a file or a total too
+# large to read leaves the fingerprint unknown, and freshness then falls back to the timestamp
+# rule.
 FINGERPRINT_INDEXED_FILES = 64
 FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
 FINGERPRINT_MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -559,10 +575,20 @@ def command_label(command, shell="Bash"):
     return "(unrecognized)"
 
 
+QUOTING_MARKS_RE = re.compile(r"[\"'\\`]")
+
+
+def without_quote_marks(arguments):
+    """The arguments as the program receives their words, quote marks and escapes gone: a quoted
+    `"-delete"`, an escaped `\\-delete` or `"--output=f"` is still that option. Dropping characters
+    never takes the space in front of an option, so a guard only ever sees more."""
+    return QUOTING_MARKS_RE.sub("", arguments)
+
+
 def git_read_only(arguments):
     """Whether a git invocation only reads: a reading subcommand, a listing form, no output file."""
     arguments = GIT_GLOBAL_OPTIONS_RE.sub("", arguments.strip())
-    if MUTATING_ARGS["git"].search(arguments):
+    if MUTATING_ARGS["git"].search(without_quote_marks(arguments)):
         return False
     words = arguments.split()
     subcommand = words[0].lower() if words else ""
@@ -578,12 +604,12 @@ def bookkeeping_command(executable):
     return BOOKKEEPING_COMMANDS.get(re.sub(r"\.(?:exe|cmd|bat)$", "", name), frozenset())
 
 
-def bookkeeping_segment(segment, known):
+def bookkeeping_segment(segment, known, shell="Bash"):
     """Whether a segment runs one of a bookkeeping tool's own-state subcommands — the tool named or
     spelled as a path, or reached through a variable in `known` (name to those subcommands) — or a
     state-only hook script an interpreter runs. Its free text may carry brackets and parentheses,
     which execute only outside quotes, so `EXECUTING_ARGUMENT_RE` is asked about the text with the
-    quoted parts removed."""
+    quoted parts blanked; text whose quotes cannot be read is not proven."""
     text = segment.strip()
     first = SHELL_WORD_RE.match(text)
     if not first:
@@ -599,34 +625,227 @@ def bookkeeping_segment(segment, known):
     else:
         # Only an interpreter can run a hook script; anything else needs no parse of the segment.
         interpreter = unquoted_word(word)[0].replace("\\", "/").rsplit("/", 1)[-1]
-        span = bookkeeping_script(text) if INTERPRETER_RE.match(interpreter) else None
+        span = bookkeeping_script(text, bridge=True) if INTERPRETER_RE.match(interpreter) else None
         script = unquoted_word(text[span[0]:span[1]])[0].replace("\\", "/") if span else ""
         runs = False
-        if STATE_ONLY_SCRIPT_RE.search(script):
+        if script:
             allowed = STATE_ONLY_SCRIPTS[os.path.splitext(script.rsplit("/", 1)[-1])[0].lower()]
             after = SHELL_WORD_RE.match(text[span[1]:].lstrip())
             runs = allowed is None or (after is not None and unquoted_word(after.group(0))[0].lower() in allowed)
-    return runs and not EXECUTING_ARGUMENT_RE.search(QUOTED_TEXT_RE.sub(" ", text[first.end():]))
+    arguments = blank_quoted(text[first.end():], shell) if runs else None
+    return arguments is not None and not EXECUTING_ARGUMENT_RE.search(arguments)
+
+
+# A command whose every write lands in a throwaway file writes nothing lasting: an MR description
+# written into the session scratchpad through a quoted heredoc and read back with `$(cat …)`
+# expired the verdict it followed (report dc30d302). A heredoc's body is data the command reads on
+# stdin; a quoted delimiter keeps the shell out of it. `<<<` is a here-string, which has no body.
+HEREDOC_OPERATOR_RE = re.compile(
+    r"(?<!<)<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|(\\)?([A-Za-z_][\w.-]*))"
+)
+# `$(cat <one file>)` only reads; any other substitution may run anything, one nested in the
+# file's name included.
+READ_SUBSTITUTION_RE = re.compile(
+    r"\$\(\s*cat\s+(?:'[^']*'|\"(?:[^\"`$\\]|\$(?!\())*\"|"
+    r"(?:[^\s\"'`$()<>|;&\\]|\$\{?[A-Za-z_]\w*\}?)+)\s*\)"
+)
+OUTPUT_REDIRECT_RE = re.compile(r"(?:&|[0-9])?>>?")
+# The whole word a redirect writes to: quoted and bare parts run together (`"$S"/x` is one word).
+REDIRECT_TARGET_RE = re.compile(r"(?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s'\"<>|;&()\\])+")
+WORD_PART_RE = re.compile(r"'([^']*)'|\"([^\"]*)\"|([^'\"]+)")
+ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:)?/")
+# Variables the reading tools consult: one already exported keeps the export when a later segment
+# assigns it, so a throwaway path given to one of these names is no plain shell variable.
+TOOL_VARIABLE_RE = re.compile(
+    r"(?i)^(?:(?:GIT|RIPGREP|RG|GLAB|GH|LD|DYLD|PYTHON|NODE|NPM|BASH|MSYS|LESS|XDG|CODEX|OPENAI)|"
+    r"(?:PAGER|EDITOR|VISUAL|BROWSER|SHELL|ENV|IFS|PS4|SHELLOPTS|PROMPT_COMMAND|CDPATH|HOME|PATH|"
+    r"TMPDIR|TEMP|TMP)$)"
+)
+# A PowerShell variable given a literal, or the two encoding variables a Python call needs: nothing
+# runs (report c2a8dfe0). Any other `$env:` name could steer the programs after it.
+POWERSHELL_LITERAL_ASSIGNMENT_RE = re.compile(
+    r"(?i)^\$(?:(?!env:)[a-z_]\w*|env:(?:PYTHONUTF8|PYTHONIOENCODING))\s*=\s*"
+    r"(?:'(?:[^']|'')*'|\"[^\"`$]*\"|\d+)$"
+)
+
+
+def scan_quotes(text, shell="Bash", single_only=False, quote=None):
+    """`blank_quoted` over text that may open inside a quote: the text with its quoted spans blanked
+    and the quote still open at its end, or None when bash's `$'…'` would take backslash escapes
+    this reader does not follow."""
+    escape = "`" if shell == "PowerShell" else "\\"
+    out, index = list(text), 0
+    while index < len(text):
+        char = text[index]
+        blank = quote is not None and not (single_only and quote == '"')
+        if char == escape and quote != "'" and index + 1 < len(text):
+            if blank:
+                out[index] = out[index + 1] = " "
+            index += 2
+            continue
+        if quote is not None:
+            if blank:
+                out[index] = " "
+            if char == quote:
+                quote = None
+        elif char == "$" and shell != "PowerShell" and text[index + 1:index + 2] == "'":
+            return None
+        elif char in "'\"":
+            quote = char
+            if not (single_only and char == '"'):
+                out[index] = " "
+        index += 1
+    return "".join(out), quote
+
+
+def blank_quoted(text, shell="Bash", single_only=False):
+    """The text with its quoted spans, quotes included, turned into spaces of the same length — only
+    the single-quoted ones with `single_only`, where nothing expands; None when a quote never
+    closes or opens as bash's `$'…'`. The shell's escape character protects the next character
+    outside single quotes."""
+    scanned = scan_quotes(text, shell, single_only)
+    return None if scanned is None or scanned[1] is not None else scanned[0]
+
+
+def without_heredoc_bodies(text):
+    """The command with each heredoc's body cut out and its operator dropped, or None when that
+    cannot be read safely: a body that would still be expanded and could run code (an unquoted
+    delimiter with `$(` or a backtick in it), one that never ends, a line continued past an
+    operator or out of a body (a continuation moves where the body starts or where the shell
+    looks for its end), or an operator after a `#`, where the shell sees a comment and runs the
+    lines taken for a body. Read before continuations are joined, and with quotes carried from
+    line to line: a `<<` inside a quote is text."""
+    if "<<" not in text:
+        return text
+    lines, kept, index, quote = text.split("\n"), [], 0, None
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        scanned = scan_quotes(line, quote=quote)
+        if scanned is None:
+            return None
+        outside, quote = scanned
+        found = [match for match in HEREDOC_OPERATOR_RE.finditer(line)
+                 if outside[match.start():match.start() + 2] == "<<"]
+        if found and ("#" in outside[:found[-1].start()] or line.endswith("\\")):
+            return None
+        for match in found:
+            quoted = match.group(2) or match.group(3) or (match.group(5) if match.group(4) else None)
+            delimiter = quoted or match.group(5)
+            body = []
+            while index < len(lines) and (lines[index].lstrip("\t") if match.group(1) else lines[index]) != delimiter:
+                body.append(lines[index])
+                index += 1
+            if index >= len(lines) or any(entry.endswith("\\") for entry in body):
+                return None
+            index += 1
+            if not quoted and any(token in "\n".join(body) for token in ("$(", "`")):
+                return None
+        for match in reversed(found):
+            line = line[:match.start()] + " " + line[match.end():]
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def split_redirects(segment, shell="Bash"):
+    """The segment without its output redirects, and the words they write to; None when a `>` has
+    no word after it. A `>` inside quotes is text."""
+    outside = blank_quoted(segment, shell)
+    if outside is None:
+        return None
+    targets, spans = [], []
+    for operator in OUTPUT_REDIRECT_RE.finditer(outside):
+        if spans and operator.start() < spans[-1][1]:
+            continue
+        start = operator.end() + len(segment[operator.end():]) - len(segment[operator.end():].lstrip())
+        word = REDIRECT_TARGET_RE.match(segment, start)
+        if not word:
+            return None
+        targets.append(word.group(0))
+        spans.append((operator.start(), word.end()))
+    for start, end in reversed(spans):
+        segment = segment[:start] + " " + segment[end:]
+    return segment, targets
+
+
+def resolve_word(word, literals):
+    """The path a shell word spells — its quoted and bare parts joined, `$NAME` taken from
+    `literals` — or None when anything else in it would expand: a substitution, an escape, a
+    variable not in `literals`, a glob outside quotes."""
+    parts, covered = [], 0
+    for match in WORD_PART_RE.finditer(word):
+        if match.start() != covered:
+            return None
+        covered = match.end()
+        single, double, bare = match.groups()
+        if single is not None:
+            parts.append(single)
+            continue
+        text = bare if double is None else double
+        if any(token in text for token in ("`", "$(", "\\")) or (
+                double is None and any(token in text for token in "*?[")):
+            return None
+        unknown = []
+
+        def expand(reference):
+            name = reference.group(1) or reference.group(2)
+            if name not in literals:
+                unknown.append(name)
+                return ""
+            return literals[name]
+
+        resolved = VARIABLE_REFERENCE_RE.sub(expand, text)
+        if unknown or "$" in resolved:
+            return None
+        parts.append(resolved)
+    return "".join(parts) if covered == len(word) else None
+
+
+def throwaway_target(path):
+    """Whether writing to this path leaves nothing lasting: an absolute throwaway path with no `.` or
+    `..` step, a Git Bash `/c/…` spelling read as its drive. A relative path lands wherever the
+    shell stands, and a step back out of a throwaway directory reaches anything."""
+    path = MSYS_DRIVE_RE.sub(r"\1:", cwg.normalize_path(path))
+    return bool(ABSOLUTE_PATH_RE.match(path) and not {".", ".."} & set(path.split("/"))
+                and cwg.is_ephemeral(path))
+
+
+def bare_brace(outside):
+    """Whether text with its quotes blanked holds a brace group or an expansion: `${NAME}` is only
+    a variable."""
+    return "{" in outside and "{" in VARIABLE_REFERENCE_RE.sub(" ", outside)
 
 
 def read_only_pipeline(command, shell="Bash"):
     """Whether every segment of the command is proven not to write a lasting artifact, arguments
-    included: a command that only reads, or a bookkeeping tool that writes only its own state."""
+    included: a command that only reads, or a bookkeeping tool that writes only its own state. A
+    write into a throwaway file — spelled literally, or through a variable the same command gave a
+    throwaway path — writes nothing lasting, a heredoc's body is data, `$(cat <file>)` only reads,
+    and text inside quotes spells no shell syntax."""
+    # A heredoc's body is cut out before continuations are joined: a quoted body keeps its
+    # backslashes, and joining one would move where the reader finds its end.
+    if shell != "PowerShell":
+        command = without_heredoc_bodies(str(command or ""))
+        if command is None:
+            return False
     # Read as the shell reads it: a form broken across a continuation is one token, one redirect,
     # one command. Everything below then asks its question of the text that will actually run.
-    joined = join_continuations(command, shell)
-    if any(token in joined for token in ("$(", "<(", ">(", "`", "<<", "{")):
+    joined = READ_SUBSTITUTION_RE.sub(" _read_ ", join_continuations(command, shell))
+    # A substitution or a backtick expands unless single quotes hold it; the other forms are syntax
+    # only outside quotes.
+    code, outside = blank_quoted(joined, shell, single_only=True), blank_quoted(joined, shell)
+    if code is None or outside is None or "$(" in code or "`" in code:
+        return False
+    if any(token in outside for token in ("<(", ">(", "<<")) or bare_brace(outside):
         return False
     # A merged stderr (`2>&1`) is dropped before splitting, or its `&` would cut the pipeline.
     cleaned = HARMLESS_REDIRECT_RE.sub(" ", joined)
-    if ">" in cleaned:
-        return False
     # Quotes that never balance leave no separator readable: every segment then counts as part of
     # a pipeline, where an assignment reaches nothing after it.
     pairs = separated_segments(cleaned, shell) or [
         (segment, "|") for segment in shell_segments(cleaned, shell=shell)
     ]
-    known, before = {}, ""
+    known, literals, before = {}, {}, ""
     for segment, after in pairs:
         text = segment.strip()
         # A pipeline's segments and a background job run in subshells: an assignment made there
@@ -635,25 +854,42 @@ def read_only_pipeline(command, shell="Bash"):
         before = after
         if not text:
             continue
+        if shell == "PowerShell" and POWERSHELL_LITERAL_ASSIGNMENT_RE.match(text):
+            continue
+        split = split_redirects(text, shell)
+        if split is None:
+            return False
+        text, targets = split[0].strip(), split[1]
+        if not all(throwaway_target(resolve_word(target, literals)) for target in targets):
+            return False
+        if not text:
+            continue
         head, rest = command_head(text)
         # A segment that only gives a variable a bookkeeping tool's literal path runs nothing, and
-        # the variable then names that tool; any other assignment stays unproven below.
+        # the variable then names that tool; one that gives it a throwaway path lets a redirect
+        # through it be read. Any other assignment stays unproven below.
         # `NAME=value` assigns only in bash; PowerShell would run it as a command.
         if not detached and not head and shell != "PowerShell":
             assigned = assignments_of(text)
             if assigned and all(value is not None and bookkeeping_command(value) for _, value in assigned):
                 known.update((name, bookkeeping_command(value)) for name, value in assigned)
                 continue
+            if assigned and all(value is not None and cwg.is_ephemeral(value) and not TOOL_VARIABLE_RE.match(name)
+                                for name, value in assigned):
+                literals.update(assigned)
+                continue
         # An environment assignment can redirect a reading command to an external program
         # (`GIT_EXTERNAL_DIFF`, `RIPGREP_CONFIG_PATH`), so a prefixed segment is not proven.
         if ENV_ASSIGNMENT_RE.match(text.lstrip("({!").strip()):
             return False
-        if bookkeeping_segment(text, known):
+        if bookkeeping_segment(text, known, shell):
             continue
         # `printf -v` reads as a reading command and can still reassign a variable.
         if head in VARIABLE_WRITERS or ASSIGNMENT_ANYWHERE_RE.search(text) or "$((" in text:
             known.clear()
-        if EXECUTING_ARGUMENT_RE.search(rest):
+            literals.clear()
+        arguments = blank_quoted(rest, shell)
+        if arguments is None or EXECUTING_ARGUMENT_RE.search(arguments):
             return False
         if head == "git":
             if git_read_only(rest):
@@ -670,11 +906,117 @@ def read_only_pipeline(command, shell="Bash"):
         if head not in READ_ONLY_COMMANDS:
             return False
         guard = MUTATING_ARGS.get(head)
-        if guard and guard.search(rest):
+        if guard and guard.search(without_quote_marks(rest)):
             return False
         # `uniq input output` writes its second operand.
         if head == "uniq" and len([w for w in rest.split() if not w.startswith("-")]) > 1:
             return False
+    return True
+
+
+# The review lane's launch, as `commands/adversarial-review.md` spells it: a bare `codex` (a path
+# could name any program), optionally behind `timeout`.
+REVIEW_EXEC_RE = re.compile(
+    r"^(?:timeout\s+\d+[smhd]?\s+)?codex(?:\.exe)?\s+exec(?P<resume>\s+resume)?(?=\s|$)",
+    re.IGNORECASE,
+)
+# `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]` takes the session before or after the
+# options (report 27c9dcd0); it never starts with a dash, so no option passes for one.
+REVIEW_SESSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]*$")
+# The options its template passes, each with the value it takes; any other — `-o <file>` writes
+# one — is no pure launch.
+REVIEW_FLAGS = frozenset(("-", "--ignore-user-config", "--skip-git-repo-check",
+                          "--dangerously-bypass-approvals-and-sandbox"))
+REVIEW_VALUE_OPTIONS = {
+    "--disable": re.compile(r"^[a-z0-9_]+$"),
+    "-m": re.compile(r"^[\w.-]+$"),
+    "-c": re.compile(r"^[\w.]+=[\w.-]+$"),
+    "-s": re.compile(r"^read-only$"),
+    "--sandbox": re.compile(r"^read-only$"),
+}
+REVIEW_ID_RE = re.compile(r"^[\w.-]+$")
+
+
+def review_launch_only(command, shell="Bash"):
+    """Whether a shell command does nothing but launch the Codex review lane: `REVIEW_ID=<literal>`,
+    at most one `cd` to a literal path, and one `codex exec` fed its packet on stdin (the one
+    stdin redirect `codex_launch` binds) with the template's options and stderr in a throwaway
+    file, joined by `;`, `&&` or a newline, marked as a review.
+    Such a launch changes nothing a candidate holds — the lane is trusted to stay read-only exactly
+    as the native reviewer is — so it expires no verdict wherever it starts, its own included: a
+    candidate outside any repository had every Codex verdict expire at its own launch (report
+    a5767180). A pipe, a background `&`, a substitution, another program, another option or a
+    variable Codex itself reads makes it an ordinary command."""
+    command = str(command or "")
+    bound = codex_launch(command)["path"] if shell != "PowerShell" and cwg.REVIEW_INTENT_TOKEN in command else ""
+    if not bound:
+        return False
+    text = join_continuations(command, shell)
+    outside = blank_quoted(text, shell)
+    if outside is None:
+        return False
+    # A comment runs from its `#` to the end of its line, not of the command.
+    comment = COMMENT_START_RE.search(outside)
+    while comment:
+        start = outside.index("#", comment.start())
+        end = text.find("\n", start)
+        end = len(text) if end < 0 else end
+        text, outside = text[:start] + text[end:], outside[:start] + outside[end:]
+        comment = COMMENT_START_RE.search(outside, max(start - 1, 0))
+    # A substitution or a backtick expands inside double quotes too.
+    code = blank_quoted(text, shell, single_only=True)
+    if (code is None or "$(" in code or "`" in code
+            or any(token in outside for token in ("<(", ">(", "<<", "|"))
+            or "&" in outside.replace("&&", "") or bare_brace(outside)):
+        return False
+    literals, launch, moved = {}, None, False
+    for segment in split_unquoted(text, shell=shell):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if launch is not None:
+            return False
+        assigned = assignments_of(segment)
+        if assigned:
+            if not all(name == "REVIEW_ID" and value and REVIEW_ID_RE.match(value) for name, value in assigned):
+                return False
+            literals.update(assigned)
+            continue
+        words = [word.group(0) for word in SHELL_WORD_RE.finditer(segment)]
+        if words[0] == "cd":
+            if moved or len(words) != 2 or resolve_word(words[1], literals) is None:
+                return False
+            moved = True
+            continue
+        launch = segment
+    split = split_redirects(launch or "", shell)
+    if not split or not split[1] or not all(throwaway_target(resolve_word(target, literals)) for target in split[1]):
+        return False
+    # The packet this launch reads is the one the Stop hook binds its verdict to: `codex_launch`
+    # reads the raw text, where an assignment inside a comment would name another file.
+    fed = STDIN_REDIRECT_RE.search(split[0])
+    packet = resolve_word(fed.group(1), literals) if fed else None
+    if not packet or MSYS_DRIVE_RE.sub(r"\1:", cwg.normalize_path(packet)) != cwg.normalize_path(bound):
+        return False
+    rest = STDIN_REDIRECT_RE.sub(" ", split[0], count=1).strip()
+    head = REVIEW_EXEC_RE.match(rest)
+    if not head:
+        return False
+    words, index, session = rest[head.end():].split(), 0, None
+    while index < len(words):
+        if words[index] in REVIEW_FLAGS:
+            index += 1
+            continue
+        # A resumed round names its session once, or asks for the last one.
+        if head.group("resume") and session is None and (
+                words[index] == "--last" or REVIEW_SESSION_RE.match(words[index])):
+            session = words[index]
+            index += 1
+            continue
+        value = REVIEW_VALUE_OPTIONS.get(words[index])
+        if value is None or index + 1 >= len(words) or not value.match(words[index + 1]):
+            return False
+        index += 2
     return True
 
 
@@ -685,18 +1027,33 @@ def write_capable(data):
     their whole delta in `own_delta`; this one only decides whether an unresolved mutation may
     expire a review verdict. Only a pipeline of commands proven not to write a lasting artifact —
     readers, and bookkeeping tools that write only their own state — is outside it, plus a
-    validation command: reruns of the checks the skill asks for never edit source.
+    validation command: reruns of the checks the skill asks for never edit source. A write the
+    pipeline proves lands only in throwaway files is outside it too (report dc30d302), and so is
+    a command that only launches the review lane (`review_launch_only`).
     """
     if str(data.get("tool_name") or "") not in cwg.SHELL_TOOLS:
         return False
     command = str((data.get("tool_input") or {}).get("command") or "")
+    if review_launch_only(command, str(data.get("tool_name") or "")):
+        return False
     if shell_write(data):
-        return True
+        return not read_only_pipeline(command, str(data.get("tool_name") or ""))
     if not command.strip():
         return False
     if VALIDATION_SHELL_RE.match(command) and "$(" not in command:
         return False
     return not read_only_pipeline(command, str(data.get("tool_name") or ""))
+
+
+def only_own_state(data):
+    """Whether this shell command proves it writes nothing lasting: readers, bookkeeping tools that
+    write only their own state, writes that land only in throwaway files, and the review lane's
+    launch. Stricter than `not write_capable`, which also lets a validation command through: a
+    verdict survives a test run's unresolved mutation, but a test run can still write a lasting file
+    no snapshot sees, so it moves the clock an invisible change is judged by (`last_write_ts`)."""
+    tool = str(data.get("tool_name") or "")
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    return tool in cwg.SHELL_TOOLS and (review_launch_only(command, tool) or read_only_pipeline(command, tool))
 
 
 def shell_policy(data):
@@ -861,15 +1218,27 @@ def scan_config_tree(directory, files):
     return True
 
 
+def settings_digest(path):
+    """A digest of a settings file without the keys the app writes itself (`APP_SETTINGS_KEYS`),
+    or None when the file is absent or not a JSON object."""
+    data = cwg.read_json(path)
+    if data is None:
+        return None
+    kept = {key: value for key, value in data.items() if key not in APP_SETTINGS_KEYS}
+    return hashlib.sha256(json.dumps(kept, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def config_snapshot():
     """Size and mtime of the agent-configuration files a shell command could rewrite.
 
     Metadata rather than content, unlike the Git snapshot: that one hashes the handful of files
     Git already reports as changed, while this one looks at every file in the trees on every
     shell call. The question here is only whether this command wrote here, which is what size
-    and mtime answer.
+    and mtime answer. Settings files also keep the digest of everything but the app's own keys,
+    so a rewrite the app made from its interface can be told apart.
     """
     files = {}
+    settings = {}
     roots = []
     for root in agent_config_roots():
         if not os.path.isdir(root):
@@ -893,7 +1262,9 @@ def config_snapshot():
             except OSError:
                 continue
             files[cwg.normalize_path(path)] = file_metadata(stat)
-    return {"overflow": False, "roots": roots, "files": files}
+            if name in SETTINGS_FILES:
+                settings[cwg.normalize_path(path)] = settings_digest(path)
+    return {"overflow": False, "roots": roots, "files": files, "settings": settings}
 
 
 def shell_snapshot(cwd, marker=None, directories=(), origin=None):
@@ -956,6 +1327,8 @@ def budget_override(name, default):
 
 
 MERGE_JUDGE_BUDGET = budget_override("CWG_MERGE_JUDGE_BUDGET", 3.5)
+# Measuring a closed candidate's files after its receipt: past it, the command is simply recorded.
+SETTLE_BUDGET = 3.0
 
 
 # A subdirectory of a drive-root temp directory holds real clones (C:/tmp/<project>) and agents'
@@ -998,19 +1371,62 @@ def repository_root(path, cache):
 
 
 def candidate_trees(marker, own_root):
-    """The other repositories holding the marker's lasting paths, and its lasting paths in none."""
+    """The other repositories holding the marker's lasting paths, and its lasting paths in none.
+
+    A path whose folder is gone is walked up like any other, but the repository found counts only
+    if git there does not ignore it or HEAD still holds it. A removed worktree's file was handed to
+    the main checkout, which excludes `.claude/worktrees/` and so never held it, and that checkout's
+    snapshot then cost every command the extra-repository budget (report a378343e); a tracked file
+    deleted with its folder keeps its repository, its deletion staged or not (G24 review). An
+    ignored one HEAD does not hold is measured by its own token, which says whether it comes back.
+    Git is asked once per such repository, and no answer keeps it.
+    """
     watched = watched_trees()
-    cache, roots, loose = {}, [], []
-    for path in cwg.durable_paths(marker.get("paths") or []):
-        if any(covers(tree, path, AGENT_CONFIG_SKIP) for tree in watched):
-            continue
-        root = repository_root(path, cache)
+    cache, roots, loose, orphaned = {}, [], [], {}
+
+    def place(root, path):
         if not root:
             if len(loose) < MAX_LOOSE_FILES:
                 loose.append(path)
         elif root != own_root and root not in roots:
             roots.append(root)
+
+    for path in cwg.durable_paths(marker.get("paths") or []):
+        if any(covers(tree, path, AGENT_CONFIG_SKIP) for tree in watched):
+            continue
+        root = repository_root(path, cache)
+        if root and not os.path.isdir(os.path.dirname(path)):
+            orphaned.setdefault(root, []).append(path)
+        else:
+            place(root, path)
+    for root, paths in orphaned.items():
+        ignored = ignored_paths(root, paths)
+        held = held_in_head(root, ignored) if ignored else set()
+        for path in paths:
+            place("" if path in ignored and path not in held else root, path)
     return roots[:MAX_CANDIDATE_REPOSITORIES], loose
+
+
+def held_in_head(root, paths):
+    """The normalized `paths` HEAD holds in the repository at `root`, compared the marker's way;
+    all of them when git cannot tell. A staged deletion takes a path out of the index, and git then
+    calls a force-added file under an ignored folder ignored, though HEAD still holds it."""
+    answer = cwg.git_run(root, ["ls-tree", "-r", "-z", "--name-only", "HEAD"], timeout=2.0)
+    if not answer or answer[0] != 0:
+        return set(paths)
+    listed = {cwg.normalize_path(os.path.join(root, name)) for name in answer[1].split("\0") if name}
+    return {path for path in paths if path in listed}
+
+
+def ignored_paths(root, paths):
+    """The normalized `paths` git ignores in the repository at `root`; none when it cannot tell."""
+    answer = cwg.git_run(root, ["check-ignore", "--stdin", "-z"], timeout=1.5,
+                         stdin="".join(path + "\0" for path in paths))
+    # Exit 0: the paths it prints are ignored; 1: none is; anything else is no answer.
+    if not answer or answer[0] != 0:
+        return set()
+    return {cwg.normalize_path(name if os.path.isabs(name) else os.path.join(root, name))
+            for name in answer[1].split("\0") if name}
 
 
 def watched_trees():
@@ -1115,7 +1531,11 @@ def stored_snapshot(data):
 
 
 def changed_config_paths(before, after):
-    """Absolute configuration paths this command rewrote, or None when nothing is provable."""
+    """Absolute configuration paths this command rewrote, or None when nothing is provable.
+
+    A settings file whose digest without the app's own keys is the same on both sides was
+    rewritten from the app's interface, not by the command, and is left out.
+    """
     if (
         not before
         or not after
@@ -1124,7 +1544,11 @@ def changed_config_paths(before, after):
         or before.get("roots") != after.get("roots")
     ):
         return None
-    return rewritten(before, after)
+    earlier, later = before.get("settings") or {}, after.get("settings") or {}
+    return [
+        path for path in rewritten(before, after)
+        if earlier.get(path) is None or earlier.get(path) != later.get(path)
+    ]
 
 
 def rewritten(before, after):
@@ -1216,12 +1640,15 @@ def raw_diff_records(listing):
     return found
 
 
+def git_result_until(deadline, root, arguments, stdin=None):
+    """(exit code, stdout) of `git -C root …` when it finishes before `deadline`, else None."""
+    remaining = deadline - time.monotonic()
+    return cwg.git_run(root, arguments, timeout=remaining, stdin=stdin) if remaining > 0 else None
+
+
 def git_until(deadline, root, arguments, codes=(0,), stdin=None):
     """stdout of `git -C root …` when it exits with one of `codes` before `deadline`, else None."""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return None
-    result = cwg.git_run(root, arguments, timeout=remaining, stdin=stdin)
+    result = git_result_until(deadline, root, arguments, stdin)
     return result[1] if result and result[0] in codes else None
 
 
@@ -1305,31 +1732,65 @@ def merge_set_aside(before, after_git, changed, recorded, deadline):
     return set()
 
 
-def clean_merge_paths(root, before_head, partner, changed, deadline):
-    """Of `changed`, the paths the merge of `partner` into `before_head` left exactly as git computes it.
+def merge_tree(root, before_head, partner, deadline):
+    """The tree `git merge-tree` writes for merging `partner` into `before_head`, and whether that
+    merge had no conflict; (None, False) when git cannot say before `deadline`."""
+    result = git_result_until(deadline, root, ["merge-tree", "--write-tree", "--no-messages", before_head, partner])
+    # It exits 1 for a merge with conflicts and still writes the tree it would stage.
+    tree = result[1].split("\n", 1)[0].strip() if result and result[0] in (0, 1) else ""
+    return (tree, result[0] == 0) if OID_RE.fullmatch(tree) else (None, False)
 
-    A path qualifies when it differs between `before_head` and the tree `git merge-tree` writes for
-    the two, the index holds that tree's entry for it, and the file on disk hashes to its blob (or
-    the merge deleted it and it is gone). Only regular files qualify; a link or a submodule stays
-    recorded.
+
+def clean_merge_paths(root, before_head, partner, changed, deadline):
+    """Of `changed`, the paths the merge of `partner` into `before_head` left exactly as git
+    computes it (`paths_as_merged`)."""
+    tree = merge_tree(root, before_head, partner, deadline)[0]
+    return paths_as_merged(root, before_head, tree, changed, deadline) if tree else set()
+
+
+def paths_as_merged(root, before_head, tree, changed, deadline, untouched=False, gone=()):
+    """Of `changed`, the paths the index and the disk hold exactly as `tree`, a merge into `before_head`.
+
+    A path qualifies when it differs between `before_head` and `tree`, the index holds the tree's
+    entry for it, and the file on disk hashes to its blob (or the merge deleted it and it is gone).
+    With `untouched`, so does a path the merge left as `before_head` had it, when the index holds
+    it, unconflicted, as the tree does and the disk agrees: its bytes are the ones it had, however
+    often the command rewrote the file; and a path of `gone`, which the caller saw absent before,
+    when neither the tree nor the index holds it and nothing is on disk (a sparse checkout's
+    skip-worktree entry is held). Only regular files qualify; a link, a submodule and a path
+    neither tree tracks stay recorded.
     """
-    # `merge-tree` exits 1 for a merge with conflicts and still writes the tree it would stage.
-    written = git_until(deadline, root, ["merge-tree", "--write-tree", "--no-messages", before_head, partner],
-                        codes=(0, 1))
-    tree = (written or "").split("\n", 1)[0].strip()
-    if not OID_RE.fullmatch(tree):
-        return set()
     merged = git_until(deadline, root, ["diff-tree", "-r", "-z", "--no-renames", before_head, tree, "--"])
     staged = git_until(deadline, root, ["diff-index", "--cached", "-z", "--no-renames", tree, "--"])
     if merged is None or staged is None:
         return set()
-    merged, staged = raw_diff_records(merged), raw_diff_records(staged)
     prefix = root_prefix(root)
-    aside, present = set(), []
-    for path, (mode, oid) in merged.items():
+    # Where the index differs from the merged tree, a conflict stage included.
+    differs = {prefix + cwg.normalize_path(path) for path in raw_diff_records(staged)}
+    expected = {}
+    for path, (mode, oid) in raw_diff_records(merged).items():
         key = prefix + cwg.normalize_path(path)
-        if key not in changed or path in staged:
-            continue
+        if key in changed and key not in differs:
+            expected[key] = (path, mode, oid)
+    rest = {key for key in changed if key not in expected and key not in differs} if untouched else set()
+    indexed = set()
+    if rest:
+        listing = git_until(deadline, root, ["ls-files", "-s", "-z"])
+        if listing is None:
+            return set()
+        # The index names them in git's own spelling, and holds the merged tree's entry for each.
+        for entry in listing.split("\0"):
+            fields, _, path = entry.partition("\t")
+            fields = fields.split()
+            key = prefix + cwg.normalize_path(path)
+            if key in rest:
+                indexed.add(key)
+                if len(fields) == 3 and fields[2] == "0":
+                    expected[key] = (path, fields[0], fields[1])
+    # Outside `differs` and the index, the merged tree does not hold it either.
+    aside = {key for key in gone if key in rest and key not in indexed and not os.path.lexists(key)}
+    present = []
+    for key, (path, mode, oid) in expected.items():
         on_disk = os.path.join(root, *path.split("/"))
         if mode == MERGE_DELETED_MODE:
             if not os.path.lexists(on_disk):
@@ -1345,6 +1806,127 @@ def clean_merge_paths(root, before_head, partner, changed, deadline):
         if len(oids) == len(present):
             aside.update(key for (key, _, oid), got in zip(present, oids) if got == oid)
     return aside
+
+
+# INVARIANT: the snapshots list only what differs from HEAD, so a rebase or a merge committed by one
+# command over the candidate's committed files leaves no delta (report c4c78b99); only
+# `integration_set_aside` carries such a command, and every other HEAD move is left to the Stop
+# catch-up. These words trigger its measurement and judge nothing: an alias that rebases is not carried.
+INTEGRATION_WORD_RE = re.compile(r"\b(?:rebase|merge|pull)\b", re.IGNORECASE)
+# Seconds after the pre-command hook started (its timeout is 15) by which the baseline must be taken.
+INTEGRATION_BASELINE_DEADLINE = 8.0
+# `rebase (pick): …`, or under `git pull --rebase` its command line as the action.
+REBASE_STEP_RE = re.compile(r"(?P<action>[^\t:()]+?) \((?P<step>[a-z-]+)\)(?:: |$)")
+# How much of the end of the HEAD reflog a rebase's entries are looked for in.
+REFLOG_TAIL_BYTES = 256 * 1024
+
+
+def rebase_onto(root, before_head, head):
+    """The commit a rebase run from start to end inside one command replayed `before_head` onto,
+    read from the working tree's own HEAD reflog, or None.
+
+    Newest first, every entry back to the rebase's `(start)` must be one of its steps under one
+    action, the start must leave `before_head` and the newest entry reach `head`, and no rebase may
+    be in progress. A detached rebase writes no `(finish)`, so none is required. The start entry
+    checks out the commit the rebase replays onto, so its new value is that commit.
+    """
+    pointer = head_pointer(root)
+    if not pointer:
+        return None
+    git_dir = os.path.dirname(pointer)
+    if any(os.path.exists(os.path.join(git_dir, name)) for name in ("rebase-merge", "rebase-apply")):
+        return None
+    try:
+        with open(os.path.join(git_dir, "logs", "HEAD"), "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            cut = stream.seek(max(0, stream.tell() - REFLOG_TAIL_BYTES))
+            lines = stream.read().decode("utf-8", "replace").splitlines()[1 if cut else 0:]
+    except OSError:
+        return None
+    action, newest = None, None
+    for line in reversed(lines):
+        fields, _, message = line.partition("\t")
+        fields = fields.split()
+        step = REBASE_STEP_RE.match(message)
+        if len(fields) < 2 or not step or action not in (None, step.group("action")):
+            return None
+        action, newest = step.group("action"), newest or fields[1]
+        if step.group("step") == "start":
+            onto = fields[1]
+            return onto if fields[0] == before_head and newest == head and OID_RE.fullmatch(onto) else None
+    return None
+
+
+def integration_partner(root, before_head, deadline):
+    """`(HEAD, partner)` when a command moved HEAD off `before_head` by a merge commit on it (the
+    partner is its second parent) or a rebase of it (the commit replayed onto); else None."""
+    line = (git_until(deadline, root, ["rev-list", "--parents", "-n", "1", "HEAD"]) or "").split()
+    if not line or line[0] == before_head or merge_in_progress(root):
+        return None
+    partner = line[2] if len(line) == 3 and line[1] == before_head else rebase_onto(root, before_head, line[0])
+    return (line[0], partner) if partner else None
+
+
+def open_content(marker):
+    """The lasting paths of an open candidate below the path cap, sorted; empty otherwise."""
+    if not isinstance(marker, dict) or marker.get("closed"):
+        return []
+    paths = marker.get("content_paths") or []
+    return sorted(set(cwg.durable_paths(paths))) if len(paths) < MARKER_PATH_CAP else []
+
+
+def integration_baseline(command, marker, deadline):
+    """What `integration_set_aside` needs from before a command that names a rebase, a merge or a
+    pull: the open candidate's lasting paths, their stats and the fingerprint of their content."""
+    paths = open_content(marker) if INTEGRATION_WORD_RE.search(command) else []
+    # No git before the command: the judge needs every lasting file clean, where this is the full digest.
+    fingerprint = content_fingerprint(paths, deadline=deadline, staged=False) if paths else None
+    return {"paths": paths, "stats": content_stats(paths), "fp": fingerprint} if fingerprint else None
+
+
+def last_fingerprint(marks):
+    """The fingerprint the newest content mark holds, or None."""
+    return next((mark.get("fp") for mark in reversed(marks or []) if isinstance(mark, dict)), None)
+
+
+def integration_set_aside(before, after_git, marker, deadline):
+    """The candidate's lasting files, when the command carried them through a clean integration of
+    an upstream commit; else nothing.
+
+    The carry holds only what these establish together: the content the command started from is the
+    one the candidate last measured (the fingerprint, taken before it, equals the last mark's), and
+    every lasting file lies in the repository the command started in, clean before and after it, so
+    its bytes went from `before_head`'s to HEAD's. HEAD moved by a merge commit on `before_head` or a
+    rebase of it onto an upstream commit, the merge `git merge-tree` computes for the two has no
+    conflict, HEAD's whole tree is that merge — a hand resolution anywhere is not — and the index and
+    the disk hold it for each lasting file (`paths_as_merged`).
+    """
+    baseline, earlier = before.get("integration"), before.get("git") or {}
+    root, before_head = earlier.get("root"), before.get("head")
+    if (not isinstance(baseline, dict) or not root or not OID_RE.fullmatch(str(before_head or ""))
+            or not after_git or earlier.get("overflow") or after_git.get("overflow")
+            or open_content(marker) != baseline.get("paths")
+            or last_fingerprint(marker.get("content_marks")) != baseline.get("fp")):
+        return set()
+    paths = set(baseline["paths"])
+    moved = content_stats(baseline["paths"]) != baseline.get("stats")
+    if not moved:
+        return set()
+    prefix = root_prefix(root)
+    listed = {prefix + relative for relative in list(earlier.get("files") or {}) + list(after_git.get("files") or {})}
+    if any(not path.startswith(prefix) or path in listed for path in paths):
+        return set()
+    integrated = integration_partner(root, before_head, deadline)
+    if not integrated or not upstream_commit(root, integrated[1], deadline):
+        return set()
+    tree, clean = merge_tree(root, before_head, integrated[1], deadline)
+    head_tree = (git_until(deadline, root, ["rev-parse", integrated[0] + "^{tree}"]) or "").strip()
+    if not clean or head_tree != tree:
+        return set()
+    # A file the candidate deleted earlier is carried as it was once no tree or index holds it.
+    absent = {path for path in paths if baseline["stats"].get(path) is None and not os.path.lexists(path)}
+    aside = paths_as_merged(root, before_head, tree, paths, deadline, untouched=True, gone=absent)
+    return paths if aside == paths else set()
 
 
 def head_pointer(directory):
@@ -1469,6 +2051,7 @@ def cycle_start(marker, now, identity, incoming):
     legacy marker format."""
     fresh = {
         "first_ts": now,
+        "last_write_ts": None,
         "edits": 0,
         "paths": [],
         "minimum_risk_seen": None,
@@ -1482,6 +2065,7 @@ def cycle_start(marker, now, identity, incoming):
         "content_stats_at": None,
         "head_at_start": None,
         "refs_at_start": None,
+        "opened_at": None,
         "displaced": None,
     }
     existing = cwg.read_json(marker)
@@ -1503,6 +2087,7 @@ def cycle_start(marker, now, identity, incoming):
         carried = existing.get("last_durable_ts")
         return {
             "first_ts": float(existing["first_ts"]),
+            "last_write_ts": existing.get("last_write_ts"),
             "edits": int(existing.get("edits") or 0),
             "paths": list(existing.get("paths") or []),
             "minimum_risk_seen": existing.get("minimum_risk_seen"),
@@ -1523,6 +2108,7 @@ def cycle_start(marker, now, identity, incoming):
             "content_stats_at": existing.get("content_stats_at"),
             "head_at_start": existing.get("head_at_start"),
             "refs_at_start": existing.get("refs_at_start"),
+            "opened_at": existing.get("opened_at"),
             "displaced": existing.get("displaced"),
         }
     if os.path.exists(marker):
@@ -1531,6 +2117,25 @@ def cycle_start(marker, now, identity, incoming):
         except Exception:
             pass
     return fresh
+
+
+def settled_by_closure(data, marker, incoming, unresolved=False, unattributed_risk=None):
+    """Whether, with no candidate open, this command named only lasting files the session's last
+    closed candidate held and left every byte of them as that candidate closed on: committing,
+    rebasing or pushing work after its receipt is no new work (report 9dbbfe70). The Stop hook
+    records those files and their `content_fingerprint` when it closes the cycle. A command the
+    snapshots could not resolve, or a change nobody could be shown to own, may have touched
+    anything, so it never settles."""
+    if unresolved or unattributed_risk or not incoming:
+        return False
+    state = cwg.read_json(cwg.state_path(cwg.session_key(data.get("session_id")))) or {}
+    closed = state.get("closed_content") or {}
+    paths, fingerprint = closed.get("paths") or [], closed.get("fp")
+    if not fingerprint or not set(incoming) <= set(paths):
+        return False
+    existing = cwg.read_json(marker)
+    return (not existing or bool(existing.get("closed"))) and content_fingerprint(
+        paths, deadline=time.monotonic() + SETTLE_BUDGET) == fingerprint
 
 
 def covers(root, path, skipped=()):
@@ -1574,7 +2179,7 @@ def outside_snapshot(paths, roots, watched=(), vouched=()):
 def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
                  watched_roots=(), unattributed_risk=None, write_capable_command=True,
                  opening=None, content_changed=None, vouched=(), unseen=None, skipped=0,
-                 merged=(), no_snapshot=False):
+                 merged=(), no_snapshot=False, quiet=False):
     """Append diagnostic paths while preserving monotonic risk beyond the 128-path cap.
 
     `unattributed_risk` is the grade of a lasting change seen during this command that no
@@ -1600,10 +2205,13 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     were measured one by one around the command. `unseen` is the repository the command ended in
     when no snapshot covered it, `skipped` the number of repositories the time budget left out,
     and `no_snapshot` says the pre-command snapshot never arrived (its hook was cancelled or
-    failed); the content mark keeps all three, so a block can say what went unmeasured.
+    failed); the content mark keeps all three, so a block can say what went unmeasured. The
+    placeholder of a command proven not to write (`write_capable_command` false) joins only a
+    candidate that holds no lasting path yet: for one that does, it adds nothing to answer for and
+    would only give it a new block budget (report bb01bd52).
 
-    `merged` are the paths a clean upstream merge left as it computed them (`merge_set_aside`),
-    recorded nowhere. When some of them are the candidate's own lasting files, and the command
+    `merged` are the paths a clean upstream merge left as it computed them (`merge_set_aside`, and
+    for a rebase or a one-step merge `integration_set_aside`), recorded nowhere. When some of them are the candidate's own lasting files, and the command
     rewrote no other lasting byte and left nothing unresolved or unattributed, the mark with the new
     content names the content it replaced (`merge`): the verdicts that covered the candidate cover
     the merge of it, as a clean merge needs nothing.
@@ -1615,11 +2223,20 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         for normalized in (cwg.normalize_path(path) for path in candidate_paths)
         if normalized
     ]
+    if settled_by_closure(data, marker, incoming, unresolved, unattributed_risk):
+        cwg.log_event("settled", session=cwg.session_key(data.get("session_id")),
+                      paths=cwg.durable_paths(incoming)[:5])
+        return True
     cycle = cycle_start(marker, now, candidate_identity(data.get("cwd")), incoming)
     paths = cycle["paths"]
-    for normalized in incoming:
-        if normalized not in paths:
-            paths.append(normalized)
+    # A command proven not to write — a reader, a bookkeeping tool — adds nothing a candidate
+    # holding lasting files answers for, and a new path would hand that unchanged candidate a new
+    # block budget: the report the gate asks for after a block did exactly that (report bb01bd52).
+    adds = write_capable_command or incoming != [cwg.SHELL_MUTATION_PATH] or not cwg.durable_paths(paths)
+    if adds:
+        for normalized in incoming:
+            if normalized not in paths:
+                paths.append(normalized)
     if content_changed is None:
         rewrote = incoming
     else:
@@ -1664,9 +2281,8 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     # changed in them, the mark it leaves names the content it replaced, whatever else the command
     # named without rewriting (a `git add` of reviewed bytes beside the merge).
     carried = [path for path in cwg.durable_paths(merged) if path in content_paths]
-    carry_from = next(
-        (mark.get("fp") for mark in reversed(content_marks) if isinstance(mark, dict)), None
-    ) if carried and not cwg.durable_paths(rewrote) and not unattributed_risk and not unresolved else None
+    carry_from = last_fingerprint(content_marks) \
+        if carried and not cwg.durable_paths(rewrote) and not unattributed_risk and not unresolved else None
     # What the lasting paths looked like at the last measurement, and when, for the Stop hook to spot
     # a change no hook measured; replaced whenever this call measures.
     stats, stats_at = cycle.get("content_stats") or {}, cycle.get("content_stats_at")
@@ -1679,6 +2295,8 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         if opening is not None:
             cycle["head_at_start"] = opening.get("head")
             cycle["refs_at_start"] = opening.get("refs")
+            # Before the command ran: the commits it made itself are the candidate's too.
+            cycle["opened_at"] = opening.get("ts")
         else:
             cwd = str(data.get("cwd") or os.getcwd())
             cycle["head_at_start"] = head_commit(cwd)
@@ -1727,11 +2345,19 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
                       set_aside=len(merged), own_files=len(carried),
                       carried=bool(last.get("merge")) and last.get("ts") == now,
                       paths=sorted(merged)[:3])
+    # The last mark that could have written, apart from `last_ts`, which every mark moves and the idle
+    # limit reads: for a candidate whose lasting change no snapshot can see it is what an approval
+    # must postdate, and the bookkeeping CLAUDE.md asks for right after a verdict (`nlm-memory
+    # remember`, the gate inbox) expired that approval (report cf223da5). Only a command proven to
+    # write nothing lasting (`only_own_state`) that brought no lasting path leaves it.
+    quiet = quiet and not cwg.durable_paths(incoming) and not unattributed_risk
     return cwg.write_json(marker, {
         "first_ts": cycle["first_ts"],
         "last_ts": now,
+        "last_write_ts": cycle["last_write_ts"] if quiet else now,
         "last_durable_ts": last_durable_ts,
-        "last_path": str(candidate_paths[-1]),
+        # The legacy field is read as one of the paths, so it must not name what was left out.
+        "last_path": str(candidate_paths[-1] if adds else paths[-1]),
         "edits": cycle["edits"] + 1,
         "paths": paths[-MARKER_PATH_CAP:],
         "minimum_risk_seen": minimum_risk_seen,
@@ -1744,6 +2370,7 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "content_stats_at": stats_at,
         "head_at_start": cycle.get("head_at_start"),
         "refs_at_start": cycle.get("refs_at_start"),
+        "opened_at": cycle.get("opened_at"),
         "displaced": cycle.get("displaced"),
     })
 
@@ -1836,8 +2463,9 @@ INTERPRETER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pythonw|py)(?:\.exe)?
 INTERPRETER_VALUE_OPTIONS = frozenset(("-W", "-X", "--check-hash-based-pycs"))
 
 
-def bookkeeping_script(segment):
-    """The span of the bookkeeping script an interpreter starting this segment runs, or None."""
+def bookkeeping_script(segment, bridge=False):
+    """The span of the bookkeeping script an interpreter starting this segment runs, or None; the
+    memory bridge counts only when `bridge` is set, since it does name its home."""
     words = list(SHELL_WORD_RE.finditer(segment))
     position = 0
     while position < len(words) and ENV_ASSIGNMENT_RE.match(words[position].group(0)):
@@ -1867,7 +2495,7 @@ def bookkeeping_script(segment):
         position += 1
     if position < len(words):
         script = unquoted_word(words[position].group(0))[0].replace("\\", "/")
-        if STATE_ONLY_SCRIPT_RE.search(script):
+        if STATE_ONLY_SCRIPT_RE.search(script) or (bridge and BRIDGE_SCRIPT_RE.search(script)):
             return words[position].span()
     return None
 
@@ -1951,9 +2579,11 @@ def head_commit(cwd):
     return head if OID_RE.fullmatch(head) else None
 
 
-def content_fingerprint(paths, deadline=None):
+def content_fingerprint(paths, deadline=None, staged=True):
     """A digest of the lasting paths as they are now, or None when it cannot be known cheaply —
-    including, when a `deadline` (`time.monotonic()`) is given, not before it.
+    including, when a `deadline` (`time.monotonic()`) is given, not before it. Without `staged` the
+    index is not read and no git runs: the digest is the full one whenever no path has a staged
+    divergence, as for files that are clean.
 
     Every record is domain-separated and length-prefixed — kind, path, mode, bytes or link
     target — so no content can imitate another record. A path that no longer exists contributes
@@ -1963,9 +2593,9 @@ def content_fingerprint(paths, deadline=None):
     the index that nobody reviewed — while staging or committing the reviewed bytes changes
     nothing: `git add` and `git commit` after an approval are not edits.
 
-    The index is read only while the candidate is narrow enough for it to be cheap: those
-    listings cost git calls per directory, and a wider candidate is measured on its content
-    alone, carrying a marker of its own so such a measurement can never equal an indexed one.
+    The index is read only while the candidate is narrow enough (`FINGERPRINT_INDEXED_FILES`),
+    and a wider candidate is measured on its content alone, carrying a marker of its own so such a
+    measurement can never equal an indexed one.
     Refusing to measure a wide candidate at all is what made the promise above unkeepable for
     every large one (report eedcca07): a mass restore had left 128 paths in the marker, nothing
     was measured from then on, and the first durable event after the approval — the commit of
@@ -2006,15 +2636,15 @@ def content_fingerprint(paths, deadline=None):
             with open(path, "rb") as stream:
                 content = stream.read()
             add(b"F", path, os.stat(path).st_mode & 0o777, content)
-            if indexed:
+            if indexed and staged:
                 by_dir.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
         except OSError:
             return None
-    for directory, names in sorted(by_dir.items()):
-        divergences = staged_divergences(directory, names, deadline)
-        if divergences is None:
+    divergences = staged_divergences_by_dir(by_dir, deadline) if by_dir else {}
+    for directory in sorted(by_dir):
+        if divergences[directory] is None:
             return None
-        for name, oid in divergences:
+        for name, oid in divergences[directory]:
             add(b"S", os.path.join(directory, name), oid)
     return digest.hexdigest()
 
@@ -2036,10 +2666,6 @@ def content_stats(paths):
     return stats
 
 
-# Per hook run: whether each repository root has a commit yet.
-_HEAD_BORN = {}
-
-
 # The index entry `git add -N` leaves for a new file is the empty blob, in either object format.
 # It stages no bytes, so staging the reviewed file over it later changes nothing (report 265312d0).
 EMPTY_BLOBS = frozenset((
@@ -2048,21 +2674,66 @@ EMPTY_BLOBS = frozenset((
 ))
 
 
-def staged_divergences(directory, names, deadline=None):
-    """(name, staged oid) for the files whose index blob matches neither HEAD nor the disk, and
-    (name, "deleted") for a file on disk and in HEAD that the index no longer holds. With a
-    `deadline` (`time.monotonic()`), every git call gets only the time left, and too little left
-    is None, like any other question git could not answer.
+# Variables that move git's search for a repository away from the plain walk up the directory
+# tree: with any of them set, only git itself can say which repository a directory belongs to.
+DISCOVERY_ENVIRONMENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM")
 
-    The disk blob is what git itself would store for the file (`hash-object` applies the same
-    line-ending and filter rules as `add`), so staging the reviewed bytes never diverges. The
-    listings are read NUL-separated, so a name git would quote (non-ASCII, a tab) keys like any
-    other, and keyed by Python's own lower-casing, the same one the marker uses. Outside a
-    repository nothing is recorded; anything git could not answer — including whether this is a
-    repository at all — returns None, so the caller records an unknown fingerprint rather than a
-    false one.
+
+def staged_divergences(directory, names, deadline=None):
+    """What `staged_divergences_by_dir` answers for one directory."""
+    return staged_divergences_by_dir({directory: names}, deadline)[directory]
+
+
+def repository_of(directory, roots):
+    """(root, folder) for `directory` inside one of the normalized repository `roots` already found,
+    the folder spelled as the file system spells it, when git's own walk up from the directory would
+    reach that root; None when only git can say. That walk stops at the first folder holding a
+    `.git` entry or laid out as a bare repository, so either one on the way puts the directory in
+    another repository; a link or a junction on the way may lead git somewhere else entirely, and a
+    directory that is not there is no repository at all. The spelling matters because git lists
+    paths as the file system spells them and matches pathspecs case-sensitively; for the directory
+    git places itself, `--show-prefix` gives the same spelling.
     """
-    names = sorted(names)
+    if not os.path.isdir(directory):
+        return None
+    normalized = cwg.normalize_path(directory).rstrip("/")
+    for root in sorted(roots, key=len, reverse=True):
+        if not covers(root, normalized):
+            continue
+        folder = normalized
+        while folder != root:
+            if os.path.islink(folder) or os.path.isjunction(folder) or os.path.lexists(folder + "/.git") or (
+                    os.path.isfile(folder + "/HEAD") and os.path.isdir(folder + "/objects")
+                    and os.path.isdir(folder + "/refs")):
+                return None
+            folder = folder.rsplit("/", 1)[0]
+        spelled = os.path.realpath(directory).replace("\\", "/").rstrip("/")
+        return (root, spelled[len(root) + 1:]) if covers(root, cwg.normalize_path(spelled)) else None
+    return None
+
+
+def staged_divergences_by_dir(by_dir, deadline=None):
+    """{directory: divergences} for `{directory: names}`. A directory's divergences are (name,
+    staged oid) for the files whose index blob matches neither HEAD nor the disk and (name,
+    "deleted") for a file on disk and in HEAD that the index no longer holds; [] outside a
+    repository; None for anything git could not answer, including whether this is a repository at
+    all, so the caller records an unknown fingerprint rather than a false one. With a `deadline`
+    (`time.monotonic()`), every git call gets only the time left, and too little left is None.
+
+    Git runs per repository, not per directory. At about a quarter of a second a process on this
+    machine, four calls per directory took a 17-file candidate spread over nine folders past the
+    three-second budget of both hooks that measure a closed candidate, and committing the bytes a
+    receipt had just closed opened a new candidate (report 53529bba); a 59-file candidate took the
+    marker hook itself past its timeout (report 8376c8c1). `rev-parse` places the first directory of
+    a repository and `repository_of` the others, and one `ls-files` and one `ls-tree` list the index
+    and HEAD for all of the repository's folders at once: the listings the per-folder calls made,
+    so every name keeps the entry it had, a pair of names that differ only in case and an unmerged
+    path's last stage included. Only a path staged away from HEAD needs its disk blob, which
+    `hash-object` computes as `add` would store it, with the same line-ending and filter rules, so
+    staging the reviewed bytes never diverges. Output is read NUL-separated, so a name git would
+    quote (non-ASCII, a tab) keys like any other, and a name is keyed by Python's own lower-casing,
+    the same one the marker uses.
+    """
 
     def ask(where, arguments, cap, text=True):
         """git's stdout (`git_text`), or `(code, stdout)` with `text=False`, within the time left;
@@ -2072,66 +2743,86 @@ def staged_divergences(directory, names, deadline=None):
             return None
         return (cwg.git_text if text else cwg.git_run)(where, arguments, timeout=timeout)
 
-    # One answer per repository for "is this a repository" and "does HEAD exist": a candidate
-    # spread over many directories of one checkout asks git these twice, not twice per directory.
-    toplevel = ask(directory, ["rev-parse", "--show-toplevel"], 5, text=False)
-    if toplevel is None:
-        return None
-    if toplevel[0] != 0 or not toplevel[1].strip():
-        return []
-    root = toplevel[1].strip()
-    if not _HEAD_BORN.get(root):
-        # Only "born" is remembered: a repository gains its first commit, never loses it.
-        born = ask(root, ["rev-parse", "--verify", "-q", "HEAD"], 5, text=False)
-        if born is None:
-            return None
-        _HEAD_BORN[root] = born[0] == 0
-    staged = ask(directory, ["ls-files", "-s", "-z"], 10)
-    if staged is None:
-        return None
-    committed = ""
-    if _HEAD_BORN[root]:
-        committed = ask(directory, ["ls-tree", "-z", "HEAD"], 10)
-        if committed is None:
-            return None
-    present = [name for name in names if os.path.isfile(os.path.join(directory, name))]
-    if present and deadline is not None and deadline - time.monotonic() < 0.25:
-        return None
-    # `hash-object` takes paths on disk, not pathspecs; one missing path fails the whole call,
-    # and every file then counts as divergent, which can only cost a review round.
-    on_disk = ask(directory, ["hash-object", "--"] + present, 10) if present else ""
-    if on_disk is None and deadline is not None:
-        # Under a deadline a failed hash is more likely the clock than a missing path: unknown.
-        return None
-    disk_by_name = (
-        dict(zip(present, on_disk.split())) if on_disk is not None else {}
-    )
+    results, repositories = {}, {}
+    placeable = not any(os.environ.get(name) for name in DISCOVERY_ENVIRONMENT)
+    for directory in sorted(by_dir):
+        placed = repository_of(directory, repositories.keys()) if placeable else None
+        if placed is None:
+            located = ask(directory, ["rev-parse", "--show-toplevel", "--show-prefix"], 5, text=False)
+            if located is None:
+                results[directory] = None
+                continue
+            lines = located[1].split("\n") + [""]
+            if located[0] != 0 or not lines[0].strip():
+                results[directory] = []
+                continue
+            root = cwg.normalize_path(lines[0].strip()).rstrip("/")
+            repositories.setdefault(root, (lines[0].strip(), {}))
+            placed = root, lines[1].rstrip("/")
+        repositories[placed[0]][1][directory] = placed[1]
+    for toplevel, folders in repositories.values():
+        results.update(repository_divergences(toplevel, folders, by_dir, ask, deadline))
+    return results
+
+
+def repository_divergences(toplevel, folders, by_dir, ask, deadline):
+    """`staged_divergences_by_dir` for the directories of one repository; `folders` maps each to its
+    path from `toplevel` as git spells it, "" for the top folder."""
+    unknown = dict.fromkeys(folders)
+    # "./" is the top folder; any other folder's pathspec lists what lies below it.
+    specs = ["--"] + sorted({folder + "/" if folder else "./" for folder in folders.values()})
+    index = ask(toplevel, ["--literal-pathspecs", "ls-files", "-s", "-z"] + specs, 10)
+    tree = ask(toplevel, ["--literal-pathspecs", "ls-tree", "-z", "HEAD"] + specs, 10, text=False) \
+        if index is not None else None
+    if tree is not None and tree[0] != 0:
+        # Only a HEAD with no commit yet, which `rev-parse` confirms, holds nothing; any other
+        # failure to list it is unknown.
+        born = ask(toplevel, ["rev-parse", "--verify", "-q", "HEAD"], 5, text=False)
+        tree = (0, "") if born and born[0] != 0 else None
+    if tree is None:
+        return unknown
 
     def entries(listing, oid_field):
         # `ls-files -s -z`: "<mode> <oid> <stage>\t<path>"; `ls-tree -z`: "<mode> <type> <oid>\t<path>".
+        # The last entry of a name wins, an unmerged path's last stage among them.
         found = {}
         for record in listing.split("\0"):
             head, _, path = record.partition("\t")
             parts = head.split()
-            if len(parts) == 3 and path and "/" not in path:
-                found[path.lower()] = parts[oid_field]
+            if len(parts) == 3 and path:
+                folder, _, name = path.rpartition("/")
+                found[(folder, name.lower())] = (parts[oid_field], path)
         return found
 
-    staged_by_name = entries(staged, 1)
-    head_by_name = entries(committed, 2)
-    divergent = []
-    for name in names:
-        key = name.lower()
-        oid = staged_by_name.get(key)
-        if oid is None:
-            if key in head_by_name and name in present:
-                divergent.append((name, "deleted"))
-            continue
-        if oid in EMPTY_BLOBS and key not in head_by_name:
-            continue
-        if oid != head_by_name.get(key) and oid != disk_by_name.get(name, "unreadable"):
-            divergent.append((name, oid))
-    return divergent
+    staged = entries(index, 1)
+    committed = {key: oid for key, (oid, _) in entries(tree[1], 2).items()}
+
+    found, pending = {}, []
+    for directory, folder in folders.items():
+        found[directory] = []
+        for name in sorted(by_dir[directory]):
+            key = (folder, name.lower())
+            on_disk = os.path.isfile(os.path.join(directory, name))
+            entry = staged.get(key)
+            if entry is None:
+                if key in committed and on_disk:
+                    found[directory].append((name, "deleted"))
+            elif entry[0] != committed.get(key) and not (entry[0] in EMPTY_BLOBS and key not in committed):
+                found[directory].append((name, entry[0]))
+                if on_disk:
+                    pending.append((directory, name, entry))
+    settled = set()
+    if pending:
+        # `hash-object` takes paths on disk, not pathspecs; one missing path fails the whole call,
+        # and every file then counts as divergent, which can only cost a review round.
+        hashed = ask(toplevel, ["hash-object", "--"] + [entry[1] for _, _, entry in pending], 10)
+        if hashed is None and deadline is not None:
+            # Under a deadline a failed hash is more likely the clock than a missing path: unknown.
+            return unknown
+        settled = {(directory, name) for (directory, name, entry), blob in zip(pending, (hashed or "").split())
+                   if blob == entry[0]}
+    return {directory: [(name, oid) for name, oid in divergent if (directory, name) not in settled]
+            for directory, divergent in found.items()}
 
 
 def command_cause(data, reason):
@@ -2228,8 +2919,8 @@ def displacement_note(before, after):
     if displaced.get("opened") != before.get("first_ts"):
         return ""
     return (
-        " It replaced the candidate open since {} ({}); lane results from before this point "
-        "belong to that candidate, not to this one."
+        " It replaced the candidate open since {} ({}); lane results and review rounds from before "
+        "this point belong to that candidate, so this one's review starts at round 1."
     ).format(clock(displaced["opened"]), displacement_cause(displaced))
 
 
@@ -2298,9 +2989,8 @@ def main():
                 capture_packet(data, session)
                 if policy != SHELL_READ_ONLY:
                     started = time.time()
-                    start, entered = directory_plan(
-                        str((data.get("tool_input") or {}).get("command") or ""), cwd, tool
-                    )
+                    command = str((data.get("tool_input") or {}).get("command") or "")
+                    start, entered = directory_plan(command, cwd, tool)
                     # A command that begins by changing into a repository does its work there,
                     # not in the directory the hook was given: the Codex launch
                     # `REVIEW_ID=r; cd <repo> && codex exec …` run from C:/tmp expired its own
@@ -2314,11 +3004,12 @@ def main():
                     cwg.publish_claims(
                         session, shell_start_ts=started, cwd=ground, now=started
                     )
+                    open_marker = cwg.read_json(cwg.marker_path(session))
                     cwg.write_json(
                         shell_snapshot_path(data),
                         dict(
                             shell_snapshot(
-                                ground, cwg.read_json(cwg.marker_path(session)), entered,
+                                ground, open_marker, entered,
                                 origin=None if ground == cwd else cwd,
                             ),
                             ts=started,
@@ -2326,6 +3017,9 @@ def main():
                             refs=cwg.refs_digest(ground),
                             start=ground,
                             merging=merge_in_progress(repository_root(ground, root_cache)),
+                            integration=integration_baseline(
+                                command, open_marker, hook_started + INTEGRATION_BASELINE_DEADLINE
+                            ),
                         ),
                     )
             elif gated_edit:
@@ -2373,6 +3067,11 @@ def main():
                 )
                 repo_changes = [change for change in repo_changes
                                 if cwg.normalize_path(change[0]) not in merged]
+            # A rebase or a one-step merge onto upstream rewrites committed files and leaves no
+            # delta at all; the candidate's own files it rewrote are judged the same way (report
+            # c4c78b99).
+            merged |= integration_set_aside(before, after["git"], marker_before,
+                                            hook_started + MERGE_JUDGE_BUDGET)
             config_paths = changed_config_paths(before.get("config"), after["config"])
             # Of everything the snapshots disagree on, the paths whose bytes this command
             # rewrote. A watched home has no index to move a file through, so every change
@@ -2475,9 +3174,11 @@ def main():
                                  snapshot_roots=snapshot_roots,
                                  watched_roots=watched_roots, unattributed_risk=floor,
                                  write_capable_command=write_capable(data) and not lane,
+                                 quiet=only_own_state(data),
                                  content_changed=rewrote, vouched=vouched, unseen=unseen,
                                  skipped=skipped, merged=merged,
-                                 opening={"head": before.get("head"), "refs": before.get("refs")})
+                                 opening={"head": before.get("head"), "refs": before.get("refs"),
+                                          "ts": before.get("ts")})
                 elif not lane and (observed or not home_ground or policy == SHELL_UNKNOWN):
                     # An empty delta is not proof of no write: ignored files, and paths
                     # outside both the repository and the configuration homes, are invisible
@@ -2499,12 +3200,14 @@ def main():
                         watched_roots=watched_roots,
                         unattributed_risk=floor,
                         write_capable_command=write_capable(data),
+                        quiet=only_own_state(data),
                         vouched=vouched,
                         unseen=unseen,
                         skipped=skipped,
                         merged=merged,
                         no_snapshot=not before,
-                        opening={"head": before.get("head"), "refs": before.get("refs")},
+                        opening={"head": before.get("head"), "refs": before.get("refs"),
+                                 "ts": before.get("ts")},
                     )
         finally:
             # Closed on every path out of this block, and deliberately not before it: closing
