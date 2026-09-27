@@ -7929,6 +7929,301 @@ with tempfile.TemporaryDirectory(prefix="cwg_restoration_worktrees_") as base:
     check("a commit the opening command made itself is the candidate's",
           "is on refs/heads/during" in blocker, blocker)
 
+# A worktree made while the candidate was open, as a workflow's isolation worktree is, answers from the
+# commit it was made on; one made before, one gone and another repository vouch for nothing (report
+# a446d9d0). As there, the candidate works in a worktree under .claude/worktrees and the agents beside it.
+with tempfile.TemporaryDirectory(prefix="cwg_restoration_isolation_") as base:
+    repo = os.path.join(base, "main")
+    candidate_repo(repo, "main")
+    worktrees = os.path.join(repo, ".claude", "worktrees")
+    own = os.path.join(worktrees, "session")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "--quiet", "-b", "session", own],
+                   check=True, capture_output=True)
+    with open(os.path.join(repo, ".git", "info", "exclude"), "a", encoding="utf-8") as stream:
+        stream.write(".claude/worktrees/\n")
+
+    def isolation(name):
+        tree = os.path.join(worktrees, name)
+        subprocess.run(["git", "-C", repo, "worktree", "add", "--quiet", "-b", "worktree-" + name, tree],
+                       check=True, capture_output=True)
+        return tree, cwg.normalize_path(os.path.join(tree, "src", "seed.py"))
+
+    def probe(tree, text):
+        with open(os.path.join(tree, "src", "seed.py"), "w", encoding="utf-8") as stream:
+            stream.write(text + chr(10))
+
+    def isolation_blocker(opening, *paths, changed=None):
+        # The candidate's first lasting change, which the worktree has to predate: by default the
+        # moment of asking, after the scenario set its worktree up.
+        first_mark = {"ts": time.time() if changed is None else changed, "fp": "changed"}
+        return gate.restoration_blocker(dict(opening, paths=list(paths), content_marks=[first_mark]))
+
+    def opening_of(tree):
+        return {"identity": marker_hook.candidate_identity(tree), "head_at_start": marker_hook.head_commit(tree),
+                "refs_at_start": cwg.refs_digest(tree), "first_ts": time.time()}
+
+    # A commit that exists before the candidate opens, for a worktree to be moved onto.
+    subprocess.run(["git", "-C", repo, "checkout", "--quiet", "-b", "alternate"], check=True, capture_output=True)
+    probe(repo, "value = 'alternate'")
+    commit_paths(repo, "src/seed.py", "alternate")
+    subprocess.run(["git", "-C", repo, "checkout", "--quiet", "main"], check=True, capture_output=True)
+    older, older_seed = isolation("older")
+    time.sleep(gate.REFLOG_TIME_SLACK + 0.1)
+    opening = opening_of(own)
+    tree, seed_path = isolation("restored")
+    probe(tree, "value = 'probe'")
+    blocker = isolation_blocker(opening, seed_path)
+    check("a path still changed in a worktree made during the candidate keeps it open, named",
+          cwg.normalize_path(tree) in blocker and "still differs from HEAD (seed.py)" in blocker, blocker)
+    subprocess.run(["git", "-C", tree, "checkout", "--quiet", "--", "src/seed.py"], check=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree made during the candidate and restored keeps nothing open", blocker == "", blocker)
+    blocker = isolation_blocker(opening, older_seed)
+    check("a worktree made before the candidate opened keeps it open",
+          "which existed before the candidate opened (seed.py)" in blocker, blocker)
+    # Its age does not come from the reflog: expired and restarted by a reset that leaves HEAD in
+    # place, the reflog opens after the opening, and the worktree is still as old as it is.
+    subprocess.run(["git", "-C", older, "reflog", "expire", "--expire=now", "HEAD"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", older, "reset", "--quiet", "--hard", "HEAD"], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, older_seed)
+    check("a worktree made before the candidate opened keeps it open after its reflog restarts",
+          "which existed before the candidate opened (seed.py)" in blocker, blocker)
+
+    tree, seed_path = isolation("committed")
+    created = marker_hook.head_commit(tree)
+    probe(tree, "value = 'kept'")
+    commit_paths(tree, "src/seed.py", "kept")
+    subprocess.run(["git", "-C", tree, "checkout", "--quiet", "--detach", created], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a commit left on the branch of that worktree keeps it open, naming the branch",
+          "is on refs/heads/worktree-committed" in blocker, blocker)
+
+    tree, seed_path = isolation("removed")
+    subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", tree], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree removed since keeps it open", "no longer exists (seed.py)" in blocker, blocker)
+    # A worktree registered in that place after the candidate's first lasting change may stand where
+    # the one that change was made in stood, whose commit stays on that one's branch: added anew
+    # after a removal, or moved there.
+    tree, seed_path = isolation("reused")
+    elsewhere, _ = isolation("elsewhere")
+    probe(tree, "value = 'unreviewed'")
+    changed = time.time()
+    commit_paths(tree, "src/seed.py", "unreviewed")
+    subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", tree], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "worktree", "add", "--quiet", "-b", "worktree-reused-again", tree],
+                   check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path, changed=changed)
+    check("a worktree added where one stood at the candidate's first change keeps it open",
+          "took its place after the candidate's first lasting change" in blocker, blocker)
+    subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", tree], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "worktree", "move", elsewhere, tree], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path, changed=changed)
+    check("a worktree moved where one stood at the candidate's first change keeps it open",
+          "took its place after the candidate's first lasting change" in blocker, blocker)
+    marks = [{"ts": changed + index, "fp": str(index)} for index in range(marker_hook.CONTENT_MARKS_KEPT)]
+    blocker = gate.restoration_blocker(dict(opening, paths=[seed_path], content_marks=marks))
+    check("past the content marks the marker keeps, no worktree can be shown to predate the first change",
+          "keeps too few of the candidate's lasting changes" in blocker, blocker)
+
+    tree, seed_path = isolation("unresolved")
+    with open(os.path.join(tree, "notes.txt"), "w", encoding="utf-8") as stream:
+        stream.write("left behind" + chr(10))
+    blocker = isolation_blocker(opening, seed_path)
+    check("a file the candidate never named in that worktree does not keep it open", blocker == "", blocker)
+    blocker = isolation_blocker(opening, seed_path, cwg.SHELL_MUTATION_PATH)
+    check("after a command the gate could not resolve, that worktree has to be clean too",
+          cwg.normalize_path(tree) in blocker and "could not resolve" in blocker, blocker)
+
+    other = os.path.join(base, "other")
+    candidate_repo(other, "main")
+    blocker = isolation_blocker(opening, cwg.normalize_path(os.path.join(other, "src", "seed.py")))
+    check("a lasting path in another repository keeps it open", "is not a worktree of" in blocker, blocker)
+    blocker = isolation_blocker(opening, cwg.normalize_path(os.path.join(base, "loose.py")))
+    check("a lasting path outside any repository keeps it open",
+          "where git cannot vouch for it (loose.py)" in blocker, blocker)
+
+    # A clone put where a moved worktree stood is registered there, and answers from another repository.
+    tree, seed_path = isolation("replaced")
+    probe(tree, "value = 'unreviewed'")
+    commit_paths(tree, "src/seed.py", "unreviewed")
+    os.rename(tree, tree + "-moved")
+    subprocess.run(["git", "clone", "--quiet", "--branch", "worktree-replaced", repo, tree],
+                   check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a clone in the place of a moved worktree keeps it open", "is not a worktree of" in blocker, blocker)
+    # So does another worktree of the repository moved into that place: git answers there for it,
+    # while the commit made in the first one stays on that one's branch.
+    tree, seed_path = isolation("first")
+    second, _ = isolation("second")
+    probe(tree, "value = 'unreviewed'")
+    commit_paths(tree, "src/seed.py", "unreviewed")
+    os.rename(tree, tree + "-moved")
+    os.rename(second, tree)
+    blocker = isolation_blocker(opening, seed_path)
+    check("another worktree moved into the place of a registered one keeps it open",
+          "is not a worktree of" in blocker, blocker)
+
+    # git lists every path by its long name, so a Windows short (8.3) name matches nothing it prints,
+    # a tilde of the long name kept in it or not; where no file system makes short names, a name of
+    # that shape is an ordinary one.
+    tree, _ = isolation("short")
+    for alias in ("longso~1.py", "foo~ba~1.py", "a~b~c~~1.py", "xtargz~1.bac"):
+        blocker = isolation_blocker(opening, cwg.normalize_path(os.path.join(tree, "src", alias)))
+        if cwg.CASE_FOLDED_PATHS:
+            check("a lasting path spelled with the Windows short name {} keeps it open".format(alias),
+                  "spelled with a Windows short name" in blocker and blocker.endswith("({})".format(alias)),
+                  blocker)
+        else:
+            check("{} is an ordinary name where no file system makes short names".format(alias),
+                  blocker == "", blocker)
+    if os.name == "nt":
+        # And one the file system made itself, on a volume that makes them.
+        import ctypes
+        long_name = os.path.join(tree, "src", "foo~barLongSourceFileName.py")
+        with open(long_name, "w", encoding="utf-8") as stream:
+            stream.write("changed = True" + chr(10))
+        buffer = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(long_name, buffer, 1024)
+        if os.path.basename(buffer.value).lower() not in ("", "foo~barlongsourcefilename.py"):
+            blocker = isolation_blocker(opening, cwg.normalize_path(buffer.value))
+            check("a changed file named by the short name the file system made keeps it open",
+                  "spelled with a Windows short name" in blocker, blocker)
+        os.remove(long_name)
+
+    tree, seed_path = isolation("marked")
+    subprocess.run(["git", "-C", tree, "update-ref", "refs/worktree/keep", "HEAD"], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a ref only that worktree sees keeps it open, named", "(refs/worktree/keep)" in blocker, blocker)
+
+    # Older git writes no reflog entry for the branch step of `git worktree add -b`, so the HEAD reflog
+    # opens on the checkout's reset to the commit the worktree was made on. An expired reflog and a
+    # reset build the same shape.
+    tree, seed_path = isolation("reset-first")
+    subprocess.run(["git", "-C", tree, "reflog", "expire", "--expire=now", "HEAD"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", tree, "reset", "--quiet", "--hard", "HEAD"], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree whose HEAD reflog opens on that reset reads as restored", blocker == "", blocker)
+    # A reflog cut down by expiry that opens on a move of HEAD says nothing of where HEAD stood when
+    # the candidate opened: a worktree moved onto another commit would otherwise read as restored.
+    tree, seed_path = isolation("moved")
+    subprocess.run(["git", "-C", tree, "reflog", "expire", "--expire=now", "HEAD"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", tree, "reset", "--quiet", "--hard", "alternate"], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree whose HEAD reflog opens on a move of HEAD keeps it open",
+          "opens on a move of HEAD" in blocker, blocker)
+
+    # What `git worktree add --orphan` leaves, built with commands every git version has: a HEAD reflog
+    # that opens on the first commit made there.
+    tree, seed_path = isolation("orphan")
+    reflog = subprocess.run(["git", "-C", tree, "rev-parse", "--git-path", "logs/HEAD"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", tree, "checkout", "--quiet", "--orphan", "orphan"], check=True, capture_output=True)
+    os.remove(os.path.join(tree, reflog))
+    commit_paths(tree, "src/seed.py", "first")
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree that opens on a commit made there keeps it open",
+          "opens on a commit made there" in blocker, blocker)
+
+    # Each date and state the worktree is judged by decides a case of its own: HEAD moved off the
+    # commit it was made on with the reflog intact, a reflog whose first line predates the opening
+    # though the worktree does not, a marker with no opening time, and no HEAD reflog at all.
+    tree, seed_path = isolation("left")
+    subprocess.run(["git", "-C", tree, "reset", "--quiet", "--hard", "alternate"], check=True, capture_output=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree whose HEAD left the commit it was made on keeps it open",
+          "it was created on" in blocker, blocker)
+    tree, seed_path = isolation("backdated")
+    reflog = os.path.join(tree, subprocess.run(["git", "-C", tree, "rev-parse", "--git-path", "logs/HEAD"],
+                                               capture_output=True, text=True, check=True).stdout.strip())
+    with open(reflog, encoding="utf-8") as stream:
+        first_line, rest = stream.read().split(chr(10), 1)
+    stamp = gate.REFLOG_LINE_RE.fullmatch(first_line)
+    backdated = first_line[:stamp.start(3)] + str(int(opening["first_ts"]) - 60) + first_line[stamp.end(3):]
+    with open(reflog, "w", encoding="utf-8") as stream:
+        stream.write(backdated + chr(10) + rest)
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree whose HEAD reflog opens before the candidate did keeps it open",
+          "opens before the candidate did" in blocker, blocker)
+    tree, seed_path = isolation("undated")
+    blocker = isolation_blocker(dict(opening, first_ts=None), seed_path)
+    check("a marker with no opening time dates no worktree", "cannot be dated" in blocker, blocker)
+    tree, seed_path = isolation("unlogged")
+    os.remove(os.path.join(tree, subprocess.run(["git", "-C", tree, "rev-parse", "--git-path", "logs/HEAD"],
+                                                capture_output=True, text=True, check=True).stdout.strip()))
+    blocker = isolation_blocker(opening, seed_path)
+    check("a worktree with no HEAD reflog keeps it open", "has no HEAD reflog" in blocker, blocker)
+
+    # A worktree nested in the candidate's own tree shows there only as its folder, and git answers
+    # for its files in the worktree itself. With the folder no longer excluded, the candidate's status
+    # lists the nested worktree as that folder alone, where a changed file once read as restored.
+    with open(os.path.join(repo, ".git", "info", "exclude"), "w", encoding="utf-8") as stream:
+        stream.write("")
+    opening = opening_of(repo)
+    tree, seed_path = isolation("nested")
+    probe(tree, "value = 'nested'")
+    blocker = isolation_blocker(opening, seed_path)
+    check("a path changed in a worktree nested in the candidate's tree keeps it open, named",
+          cwg.normalize_path(tree) in blocker and "still differs from HEAD (seed.py)" in blocker, blocker)
+    subprocess.run(["git", "-C", tree, "checkout", "--quiet", "--", "src/seed.py"], check=True)
+    blocker = isolation_blocker(opening, seed_path)
+    check("that nested worktree restored keeps nothing open", blocker == "", blocker)
+
+    # `repository_root` stops below a drive root, so a repository there finds no holder for its own
+    # paths, and they must stay its own.
+    real_repository_root = marker_hook.repository_root
+    marker_hook.repository_root = lambda path, cache: ""
+    try:
+        probe(repo, "value = 'drive root'")
+        blocker = isolation_blocker(opening, cwg.normalize_path(os.path.join(repo, "src", "seed.py")))
+        check("a path under the candidate's root with no holder found stays the candidate's own",
+              "still differs from HEAD (seed.py)" in blocker, blocker)
+    finally:
+        marker_hook.repository_root = real_repository_root
+        subprocess.run(["git", "-C", repo, "checkout", "--quiet", "--", "src/seed.py"], check=True)
+
+# The report's flow through the hooks themselves: a command opens the candidate in its own worktree,
+# a workflow makes an isolation worktree beside it, the agent there swaps a file and puts it back,
+# and the candidate closes as `no-change` on what the marker hook recorded (report a446d9d0).
+with tempfile.TemporaryDirectory(prefix="cwg_restoration_flow_") as base:
+    repo = os.path.join(base, "main")
+    candidate_repo(repo, "main")
+    own = os.path.join(repo, ".claude", "worktrees", "session")
+    isolated = os.path.join(repo, ".claude", "worktrees", "wf-1")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "--quiet", "-b", "session", own],
+                   check=True, capture_output=True)
+    with open(os.path.join(repo, ".git", "info", "exclude"), "a", encoding="utf-8") as stream:
+        stream.write(".claude/worktrees/\n")
+    sid = session()
+    transcript = None
+    try:
+        mark_shell(sid, own, "python build.py")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "--quiet", "-b", "worktree-wf-1", isolated],
+                       check=True, capture_output=True)
+        seed_file = os.path.join(isolated, "src", "seed.py")
+
+        def swap():
+            with open(seed_file, "w", encoding="utf-8") as stream:
+                stream.write("value = 'old code'" + chr(10))
+
+        def put_back():
+            subprocess.run(["git", "-C", isolated, "checkout", "--quiet", "--", "src/seed.py"], check=True)
+
+        place = isolated.replace("\\", "/")
+        mark_shell(sid, own, "cd {} && cp old.py src/seed.py".format(place), action=swap)
+        mark_shell(sid, own, "cd {} && git checkout -- src/seed.py".format(place), action=put_back)
+        marker, _ = gate_paths(sid)
+        recorded = cwg.read_json(marker) or {}
+        check("the marker holds the file the agent swapped in the isolation worktree",
+              cwg.normalize_path(seed_file) in (recorded.get("paths") or []), recorded.get("paths"))
+        transcript = write_transcript([skill_use(120, "development-verification", "skill-dev")])
+        result = run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript, "last_assistant_message":
+                                 "[gate] no-change: the agent swapped a file in its worktree and put it back"})
+        check("a candidate whose only change was undone in a worktree made during it closes as no-change",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid, transcript)
+
 # A commit pushed while the candidate was open, then reset away or left on a deleted branch, has left
 # the repository though every local ref is back (G12 review, F1).
 with tempfile.TemporaryDirectory(prefix="cwg_restoration_push_") as base:

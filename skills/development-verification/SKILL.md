@@ -55,16 +55,24 @@ candidate with `[gate] verified: <risk>; …` and what that risk requires.
 
 A lasting change that was undone — a rebase probe aborted, a merge aborted, an edit reverted —
 leaves the repository on the commit the candidate opened on, with every ref but the branches
-where it was (tags, the stash, notes), no commit made here left on a branch, and every path the candidate touched back as HEAD
-has it; the gate reads that from git and accepts `operational` or `no-change` for it, so do not
-manufacture a review for nothing. A fetch, branches other sessions moved in a repository whose
-worktrees share one ref store, and files the candidate never touched do not count. A commit made
-here on another branch, a tag, a stash, a note, a commit pushed while the candidate was open (even one reset away since),
-a gitignored lasting file, a candidate past the marker's path cap, or a dirty tree after a command
-the gate could not resolve keep it open; the block names which. Git is the only witness of an undo:
-outside a repository, or for a lasting path in another checkout such as a workflow's or an agent's
-isolation worktree, the gate sees none, so that candidate closes on the persistent track, its review
-confirming what remains.
+where it was (tags, the stash, notes), no commit made here left on a branch, and every path the
+candidate touched back as HEAD has it; the gate reads that from git and accepts `operational` or
+`no-change` for it, so do not manufacture a review for nothing. A fetch, branches other sessions
+moved in a repository whose worktrees share one ref store, and files the candidate never touched
+do not count. A commit made here on another branch, a tag, a stash, a note, a commit pushed while
+the candidate was open (even one reset away since), a gitignored lasting file, a lasting path
+spelled with a Windows short name, a candidate past the marker's path cap, or a dirty tree after a
+command the gate could not resolve keep it open; the block names which. A worktree of the same
+repository created while the candidate was open and standing in its place before the candidate's
+first lasting change, such as a workflow's or an agent's isolation worktree, is read the same way
+from the commit it was created on: HEAD back on it, no commit made there left on a branch or
+pushed, no ref only it sees, and the candidate's paths there as HEAD has them, none in a folder
+deleted since. Git is the only witness of an undo: outside a repository, in another repository, or in
+a worktree that existed before the candidate opened, was removed or replaced since, or whose HEAD
+reflog no longer shows where it started, the gate sees none, so that candidate closes on the
+persistent track, its review confirming what remains. A worktree removed from inside the candidate's
+own tree leaves only a deleted folder there, which the candidate's status reads like any other, so
+check that nothing made in it survives on its branch before closing the undo.
 
 ## 3. Classify risk
 

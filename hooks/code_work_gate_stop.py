@@ -1695,39 +1695,46 @@ def anomaly_closure(receipt, state, key):
     return True, match.group(1)
 
 
-def restored_to_head(entry):
-    """Whether the repository shows nothing lasting changed since the candidate opened."""
-    return not restoration_blocker(entry)
-
-
 # One answer per marker within a Stop run, which `main` switches on: the preflight and the block
 # text ask the same question, and each asking costs git calls against the hook's own timeout.
 _RESTORATION = {"memo": None}
 
 
 def restoration_blocker(entry):
-    """Why the repository does not show the candidate undone, or "" when it does.
+    """Why the repository does not show the candidate undone, or "" when it does: always a string,
+    since a closing receipt passes on "" alone.
 
     Nothing is missing only when the marker remembers the commit and the refs the cycle opened
     on and names every lasting path it touched, HEAD is that commit again, every ref but the
     branches points where it did (tags, the stash, notes), no commit made here since the opening
-    survives on a branch or a remote-tracking ref
-    (`kept_commit`; branches other sessions move and fetches are not the candidate's), the
-    repository ignores case so the lower-cased paths can be
+    survives on a branch or a remote-tracking ref (`kept_commit`; branches other sessions move and
+    fetches are not the candidate's), the repository ignores case so the lower-cased paths can be
     checked against its ignore patterns, none of them is gitignored (git could not see a change
-    to it), and `git status` shows none of those paths. Files the candidate never touched — test
-    output, another session's work — do not keep it open (report fb6a9be6), but once the
-    candidate ran a command the snapshots could not resolve, its paths are not the whole of what
-    it may have changed and the whole tree has to be clean. A lasting path outside the
-    repository is not something git can vouch for. Every git call shares one small budget and
-    any failure keeps the candidate open.
+    to it), and `git status` shows none of those paths, none of them spelled with a Windows short
+    name git would never print. Files the candidate never touched — test output, another
+    session's work — do not keep it open (report fb6a9be6), but once the candidate ran a command
+    the snapshots could not resolve, its paths are not the whole of what it may have changed and
+    the whole tree has to be clean.
+
+    A lasting path in another worktree of the repository is read the same way there, from the
+    commit that worktree was created on (`worktree_blocker`, report a446d9d0), when the git
+    answering there shares the candidate's repository and registered that worktree in that place,
+    and the worktree was created while the candidate was open and has stood there since before the
+    candidate's first lasting change; a folder gone there keeps the candidate open, since it cannot
+    be told from a removed worktree. A path outside any repository, in another repository, or in a
+    worktree that existed before the candidate opened is not something git can vouch for. A path
+    belongs to the nearest working tree still on disk above it, so one in a worktree removed from
+    inside the candidate's own tree falls to the candidate's own status, which answers for files
+    only: a commit made in that worktree and kept on its branch goes unseen, and
+    development-verification §2 asks for that check by hand. Every git call shares one small
+    budget and any failure keeps the candidate open.
     """
     memo = _RESTORATION["memo"]
     if memo is None:
         return find_restoration_blocker(entry)
     key = json.dumps([entry.get(field) for field in (
         "identity", "head_at_start", "refs_at_start", "path_overflow", "paths", "last_path",
-        "unattributed_durable", "first_ts", "opened_at",
+        "unattributed_durable", "first_ts", "opened_at", "content_marks",
     )], sort_keys=True, default=str)
     if key not in memo:
         memo[key] = find_restoration_blocker(entry)
@@ -1740,24 +1747,65 @@ def find_restoration_blocker(entry):
     start, refs = entry.get("head_at_start"), entry.get("refs_at_start")
     if not root or not isinstance(start, str) or not start or not isinstance(refs, str) or not refs:
         return "the marker records no repository, commit and refs the candidate opened on"
-    # Past the path cap the marker no longer names every lasting path, so the ignore probe
-    # below could not cover them all.
+    # Past the path cap the marker no longer names every lasting path, so the ignore check in
+    # `status_blocker` could not cover them all.
     if entry.get("path_overflow"):
         return "the candidate passed the path cap, so the marker no longer names every lasting path"
-    durable = cwg.durable_paths(marker_paths(entry))
-    outside = [path for path in durable if not mark.covers(root, path)]
-    if outside:
+    # Each lasting path belongs to the working tree that holds it on disk, the nearest one still
+    # there above it. A repository nested in the candidate's own holds the paths below it, which
+    # the candidate's status shows only as its folder. A repository at a drive root is found by
+    # nobody (`repository_root` stops below it): the candidate's own keeps the paths in it, and
+    # any other's read as outside every repository.
+    own, others, cache = [], {}, {}
+    for path in cwg.durable_paths(marker_paths(entry)):
+        holder = mark.repository_root(path, cache)
+        nested = holder != root and mark.covers(root, holder)
+        if mark.covers(root, path) and not nested:
+            own.append(path)
+        else:
+            others.setdefault(holder, []).append(path)
+    for paths in others.values():
+        # SECURITY: in any working tree but the candidate's own, a nested one included, a folder that
+        # is gone may have been a worktree removed since, with nothing left to show what was made
+        # there. One removed from inside the candidate's own tree falls to `own` (see the docstring).
+        gone = [path for path in paths if not os.path.isdir(os.path.dirname(path))]
+        if gone:
+            return "a lasting path lies in a worktree or folder that no longer exists ({})".format(
+                cwg.basename(gone[0]))
+    if "" in others:
         return "a lasting path lies outside {}, where git cannot vouch for it ({})".format(
-            root, cwg.basename(outside[0]))
+            root, cwg.basename(others[""][0]))
     deadline = time.monotonic() + RESTORE_BUDGET
     silent = "git did not answer inside the hook's budget"
 
-    def call(arguments, cap, stdin=None):
-        remaining = deadline - time.monotonic()
-        if remaining < 0.25:
-            return None
-        return cwg.git_run(root, arguments, timeout=min(cap, remaining), stdin=stdin)
+    def git_in(tree):
+        def call(arguments, cap, stdin=None):
+            remaining = deadline - time.monotonic()
+            if remaining < 0.25:
+                return None
+            return cwg.git_run(tree, arguments, timeout=min(cap, remaining), stdin=stdin)
+        return call
 
+    call = git_in(root)
+    admins = {}
+    if others:
+        common = call(["rev-parse", "--git-common-dir"], 1.0)
+        if not common or common[0] != 0:
+            return silent
+        repository = resolved_path(os.path.join(root, common[1].strip()))
+        for holder, paths in others.items():
+            answer = git_in(holder)(["rev-parse", "--git-common-dir", "--git-dir"], 1.0)
+            lines = answer[1].splitlines() if answer and answer[0] == 0 else []
+            if len(lines) != 2:
+                return silent
+            shared, admin = (os.path.join(holder, line) for line in lines)
+            # The git answering here has to be a worktree of the candidate's repository, and the one
+            # git registered here: a clone, or another worktree moved into the place of a registered
+            # one, answers for work that may still sit where it came from.
+            if resolved_path(shared) != repository or registered_place(admin) != resolved_path(holder):
+                return "a lasting path lies in {}, which is not a worktree of {}'s repository ({})".format(
+                    holder, root, cwg.basename(paths[0]))
+            admins[holder] = admin
     head = call(["rev-parse", "HEAD"], 1.5)
     if not head or head[0] != 0:
         return silent
@@ -1773,44 +1821,168 @@ def find_restoration_blocker(entry):
                for view in views):
         return "a ref other than a branch moved since the candidate opened (a tag, the stash, a note)"
     # A marker written before `opened_at` existed has only the later `first_ts`.
-    kept = kept_commit(call, start, float(entry.get("opened_at") or entry.get("first_ts") or 0.0))
+    since = float(entry.get("opened_at") or entry.get("first_ts") or 0.0)
+    kept = kept_commit(call, start, since)
     if kept != "":
         return silent if kept is None else kept
-    if durable:
-        # Where the marker's paths are lower-cased (Windows), `check-ignore` matches them against
-        # the patterns case-insensitively only while the repository ignores case, so any other
-        # setting leaves the answer unknown. Elsewhere the paths keep their case.
+    unresolved = cwg.SHELL_MUTATION_PATH in marker_paths(entry) or bool(entry.get("unattributed_durable"))
+    # With no lasting path of its own and nothing unresolved, the candidate's status cannot keep it
+    # open, and its budget is better left to the worktrees that hold the paths. A candidate with no
+    # lasting path anywhere still asks for its status, as it always did, so a git that does not
+    # answer keeps it open.
+    if own or unresolved or not others:
+        blocker = status_blocker(call, root, own, unresolved)
+        if blocker != "":
+            return silent if blocker is None else blocker
+    first_change = first_lasting_change(entry)
+    for holder, paths in others.items():
+        blocker = worktree_blocker(git_in(holder), holder, admins[holder], paths, since, first_change,
+                                   unresolved)
+        if blocker != "":
+            return silent if blocker is None else blocker
+    return ""
+
+
+def first_lasting_change(entry):
+    """When the candidate first changed a lasting artifact, from its oldest content mark, or None when
+    the marker cannot tell: it keeps only the last `CONTENT_MARKS_KEPT` marks."""
+    import code_work_gate_mark as mark
+    marks = [item for item in (entry.get("content_marks") or []) if isinstance(item, dict)]
+    if not marks or len(marks) >= mark.CONTENT_MARKS_KEPT or not cwg.valid_ts(marks[0].get("ts")):
+        return None
+    return float(marks[0]["ts"])
+
+
+# A Windows short (8.3) name as the file system makes one: up to six characters of the long name,
+# a tilde among them kept (`FOO~BA~1.PY`), then `~` and a number, and up to three after a dot. A long
+# name of that shape reads as one too, which keeps a candidate open.
+SHORT_NAME_RE = re.compile(r"[^.]{0,6}~\d+(?:\.[^.]{1,3})?")
+
+
+def status_blocker(call, tree, paths, unresolved):
+    """Why git in the working tree `tree` does not show `paths` as HEAD has them, or "" when it does.
+
+    None when the ignore check or the status gave no answer, which the caller reports as the budget;
+    a path spelled with a Windows short name, a case setting that could not be read and an ignore
+    check that failed keep reasons of their own. `unresolved` asks for the whole tree to be clean.
+    """
+    if paths:
+        # Where the marker's paths are lower-cased (Windows), git prints every path by its long
+        # name, so one spelled below `tree` with a short name matches nothing git lists; and
+        # `check-ignore` matches them against the patterns case-insensitively only while the
+        # repository ignores case, so any other setting leaves the answer unknown. Elsewhere the
+        # paths keep their case.
         if cwg.CASE_FOLDED_PATHS:
+            short = [path for path in paths
+                     if any(SHORT_NAME_RE.fullmatch(part) for part in path[len(tree) + 1:].split("/"))]
+            if short:
+                return "a lasting path is spelled with a Windows short name, which git never prints ({})".format(
+                    cwg.basename(short[0]))
             ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
             if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
                 return "the repository does not ignore case, so its ignore rules cannot be checked"
         # `-q` takes one path: with several git exits 128, which read as "ignored" kept every
         # candidate of more than one file open (report f82c87c7).
-        ignored = call(["check-ignore", "--stdin", "-z"], 1.5, stdin="".join(path + "\0" for path in durable))
+        ignored = call(["check-ignore", "--stdin", "-z"], 1.5, stdin="".join(path + "\0" for path in paths))
         # Exit 0: the paths it prints are ignored; 1: none is; anything else, or a hang: unknown.
         if not ignored:
-            return silent
+            return None
         if ignored[0] == 0:
             named = [name for name in ignored[1].split("\0") if name]
             return "a lasting path is gitignored, so git cannot vouch for it ({})".format(
                 cwg.basename(cwg.normalize_path(named[0])) if named else "?")
         if ignored[0] != 1:
             return "git could not tell whether a lasting path is gitignored"
-    status = call(["status", "--porcelain", "-z", "--untracked-files=all"], 2.5)
+    # SAFETY: another session's worktree may be mid-commit; a status that refreshes the index takes
+    # its lock, and one killed at the budget can leave the lock behind.
+    status = call(["--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"], 2.5)
     if not status or status[0] != 0:
-        return silent
-    dirty = porcelain_paths(root, status[1])
-    if not dirty:
-        return ""
-    if cwg.SHELL_MUTATION_PATH in marker_paths(entry) or entry.get("unattributed_durable"):
+        return None
+    dirty = porcelain_paths(tree, status[1])
+    if dirty and unresolved:
         return "the working tree is not clean, and the candidate ran a command the gate could not resolve"
-    touched = sorted(dirty & set(durable))
+    touched = sorted(dirty & set(paths))
     if touched:
         return "a path the candidate changed still differs from HEAD ({})".format(cwg.basename(touched[0]))
     return ""
 
 
+def worktree_blocker(call, tree, admin, paths, since, first_change, unresolved):
+    """Why another worktree of the candidate's repository does not show `paths` undone, "" when it
+    does, or None when git could not tell. `admin` is its git directory, and `first_change` when the
+    candidate first changed a lasting artifact (`first_lasting_change`).
+
+    A worktree that existed before the candidate opened holds changes nobody can tell from the
+    candidate's, so it vouches for nothing. Its age is the time of the `commondir` file, which
+    `git worktree add` writes once and nothing rewrites, whatever expiry left of the reflog; the main
+    worktree has none and is as old as the repository. It also has to stand in its place since
+    before the candidate's first lasting change: git writes `gitdir` when it registers a worktree
+    somewhere (`add`, `move`, `repair`), and one registered here later may have replaced the worktree
+    that change was made in. A worktree created since starts from a known state: the commit the
+    first line of its HEAD reflog records, which `git worktree add` writes with no previous value (a
+    git that logs no branch step writes its checkout, HEAD staying where it was); a first line that
+    moves HEAD says nothing of where HEAD stood at the opening, and one older than the opening marks
+    a reflog carried over from before it. From there git answers what it
+    answers for the candidate's own tree: HEAD is that commit again, no commit made there survives
+    on a branch or a remote-tracking ref (`kept_commit`), no ref only that worktree sees was made
+    (the candidate's digest cannot see `refs/worktree/`, `refs/bisect/` or `refs/rewritten/` there),
+    and `status_blocker` passes.
+    """
+    name = cwg.basename(paths[0])
+    if not cwg.valid_ts(since):
+        return "the marker records no time the candidate opened, so the worktree {} cannot be dated".format(tree)
+    created = file_time(os.path.join(admin, "commondir"))
+    if created is None or created + REFLOG_TIME_SLACK < since:
+        return "a lasting path lies in the worktree {}, which existed before the candidate opened ({})".format(
+            tree, name)
+    if first_change is None:
+        return ("the marker keeps too few of the candidate's lasting changes to show that the worktree {} "
+                "stood in its place through them ({})").format(tree, name)
+    registered = file_time(os.path.join(admin, "gitdir"))
+    if registered is None or registered > first_change:
+        return ("the worktree {} took its place after the candidate's first lasting change, which a "
+                "worktree that stood there before may still hold ({})").format(tree, name)
+    first = first_reflog_entry(os.path.join(admin, "logs", "HEAD"))
+    if first is None:
+        return "the worktree {} has no HEAD reflog that shows when it was created ({})".format(tree, name)
+    previous, created_on, stamp, subject = first
+    if stamp + REFLOG_TIME_SLACK < since:
+        return ("the HEAD reflog of the worktree {} opens before the candidate did, so its first commit "
+                "is no starting point ({})").format(tree, name)
+    if previous.strip("0") and previous != created_on:
+        return ("the HEAD reflog of the worktree {} opens on a move of HEAD, so git cannot show where it "
+                "stood when the candidate opened ({})").format(tree, name)
+    if MADE_HERE_RE.match(subject):
+        # An orphan worktree (`git worktree add --orphan`) opens on its own first commit, which
+        # `kept_commit` would take for the starting point.
+        return "the worktree {} opens on a commit made there, so it has no commit to go back to ({})".format(
+            tree, name)
+    head = call(["rev-parse", "HEAD"], 1.5)
+    if not head or head[0] != 0:
+        return None
+    if head[1].strip() != created_on:
+        return "HEAD of the worktree {} is {}, it was created on {}".format(
+            tree, head[1].strip()[:12], created_on[:12])
+    kept = kept_commit(call, created_on, since)
+    if kept != "":
+        return None if kept is None else "in the worktree {}, {}".format(tree, kept)
+    private = call(["for-each-ref", "--count=1", "--format=%(refname)",
+                    "refs/worktree/", "refs/bisect/", "refs/rewritten/"], 1.5)
+    if not private or private[0] != 0:
+        return None
+    if private[1].strip():
+        return "the worktree {} holds a ref made there while the candidate was open ({})".format(
+            tree, private[1].strip())
+    blocker = status_blocker(call, tree, paths, unresolved)
+    if not blocker:
+        return blocker
+    return "in the worktree {}, {}".format(tree, blocker)
+
+
 REFLOG_TIME_RE = re.compile(r"@\{(\d+)\}")
+# Reflog times are whole seconds and the opening's is not, so an entry in the opening's second
+# counts as made after it; a worktree's file times are held to the opening the same way.
+REFLOG_TIME_SLACK = 1
 # Reflog subjects of the operations that create a commit here. A checkout, a reset, a rebase's
 # start or abort and a fast-forward only move HEAD onto a commit that already exists, fetched ones
 # included, and counting those blocked an aborted rebase probe (G12 review, F5).
@@ -1847,7 +2019,7 @@ def kept_commit(call, start, since):
             continue
         commit, selector, subject = parts
         stamp = REFLOG_TIME_RE.search(selector)
-        if (stamp and int(stamp.group(1)) + 1 >= since and MADE_HERE_RE.match(subject)
+        if (stamp and int(stamp.group(1)) + REFLOG_TIME_SLACK >= since and MADE_HERE_RE.match(subject)
                 and commit != start and commit not in made):
             made.append(commit)
     if len(made) > PUSH_CHECK_CAP:
@@ -1875,6 +2047,60 @@ def kept_commit(call, start, since):
     # A remote's `HEAD` only points at one of its branches, which names the push better.
     names = [name for name in names if not name.endswith("/HEAD")] or names
     return "a commit made while the candidate was open was pushed ({})".format(names[0]) if names else ""
+
+
+# A reflog line as git writes it: the previous and the new object, the identity ending in the time and
+# zone, and the subject after a tab, which `git worktree add` leaves out.
+REFLOG_LINE_RE = re.compile(
+    r"([0-9a-f]{40}(?:[0-9a-f]{24})?) ([0-9a-f]{40}(?:[0-9a-f]{24})?) [^\t]* (\d+) [+-]\d{4}(?:\t(.*))?")
+
+
+def first_reflog_entry(path):
+    """(previous object, new object, time, subject) of the first line of the reflog file at `path`,
+    or None when there is none to read.
+
+    Read from the file, because `git reflog` prints no entry's previous value. A repository that
+    keeps its refs in a reftable has no such file, and its worktrees then vouch for nothing.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            line = stream.readline().rstrip("\n")
+    except OSError:
+        return None
+    match = REFLOG_LINE_RE.fullmatch(line)
+    if not match:
+        return None
+    return match.group(1), match.group(2), int(match.group(3)), match.group(4) or ""
+
+
+def file_time(path):
+    """The modification time of the file at `path`, or None when it cannot be read."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def resolved_path(path):
+    """`path` as the file system resolves it, in the gate's spelling: git prints and records
+    resolved paths, and a junction or a short name spells the same folder differently (as
+    `chip_handoff.under` finds)."""
+    return cwg.normalize_path(os.path.realpath(path))
+
+
+def registered_place(admin):
+    """The working tree git registered for the git directory `admin`, resolved, or "" when git's
+    record of it cannot be read: the folder of the `.git` its `gitdir` file names (relative to
+    `admin` where worktrees keep relative paths), or, for the main worktree, which has no such file,
+    the folder holding `admin`."""
+    try:
+        with open(os.path.join(admin, "gitdir"), encoding="utf-8", errors="replace") as stream:
+            dotgit = stream.read().strip()
+    except FileNotFoundError:
+        return resolved_path(os.path.dirname(admin))
+    except OSError:
+        return ""
+    return resolved_path(os.path.dirname(os.path.join(admin, dotgit))) if dotgit else ""
 
 
 def porcelain_paths(root, output):
@@ -1919,7 +2145,7 @@ def receipt_preflight(receipt, entry):
             )
         return True, "preflight"
     if kind in OPERATIONAL_RECEIPTS:
-        if not restoration_blocker(entry):
+        if restoration_blocker(entry) == "":
             # A rebase probe aborted, an edit undone: the repository is back on the commit
             # the candidate opened on and clean, so nothing lasting changed after all.
             return True, "preflight"
