@@ -341,7 +341,14 @@ def separated_segments(command, shell="Bash"):
 # 4b840373, 0e4aedc8, a269a6fc). Only a target the text spells completely is followed — no
 # expansion, no glob, a directory that exists now — and a change inside a pipeline, a background
 # job, a subshell or a heredoc is not, because it moves nothing the rest of the command runs in.
+# `git -C <directory>` names where git works just as plainly, and whatever the shell's directory, so a
+# `git -C` in a pipeline counts too: a sync script run from the configuration home rewrote a clone the
+# command named only as `git -C <clone> diff --stat | …`, and nothing measured it (report 145e33b8).
 DIRECTORY_COMMANDS = frozenset(("cd", "chdir", "pushd", "set-location", "sl", "push-location"))
+# Git's options before its subcommand that take the next word as their value; `-C` is read apart.
+GIT_VALUE_OPTIONS = frozenset((
+    "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source",
+))
 RETURN_COMMANDS = frozenset(("popd", "pop-location"))
 DIRECTORY_OPTIONS = frozenset(("-l", "-p", "-e", "-@", "--", "-path", "-literalpath"))
 SHELL_WORD_RE = re.compile(QUOTED_TEXT + r"|\S+")
@@ -357,8 +364,8 @@ VARIABLE_WRITERS = frozenset((
     "readonly", "set", "unset", "eval", "source", ".", "let", "getopts", "printf", "exec",
 ))
 ASSIGNMENT_ANYWHERE_RE = re.compile(r"(?:^|[\s;&|(])[A-Za-z_]\w*\+?=")
-# How many repositories a command's own directory changes add to its snapshot, beyond the one it
-# starts in and the candidate's own. A target past this stays unmeasured.
+# How many repositories a command's own directory changes and `git -C` add to its snapshot, together,
+# beyond the one it starts in and the candidate's own. A target past this stays unmeasured.
 MAX_DIRECTORY_REPOSITORIES = 2
 
 
@@ -414,6 +421,26 @@ def literal_directory(arguments, current, shell="Bash", variables=None):
     return resolved if os.path.isdir(resolved) else None
 
 
+def git_directory(arguments, current, shell="Bash", variables=None):
+    """The existing directory git's `-C` options send it to, read from the arguments of a segment
+    that runs git, as `literal_directory` reads a `cd`; None when no `-C` comes before the
+    subcommand or one of them is not spelled completely. A later relative `-C` is taken from the
+    one before it, as git takes it."""
+    words = SHELL_WORD_RE.findall(arguments or "")
+    directory, index = None, 0
+    while index < len(words) and words[index].startswith("-"):
+        option = words[index]
+        index += 1
+        if option == "-C" and index < len(words):
+            directory = literal_directory(words[index], directory or current, shell, variables)
+            if directory is None:
+                return None
+            index += 1
+        elif option in GIT_VALUE_OPTIONS:
+            index += 1
+    return directory
+
+
 def assignments_of(segment):
     """The `(name, value)` pairs a segment that only assigns variables sets, or None when it runs
     anything. A value the shell would still expand or unescape is None: it is not known here."""
@@ -442,10 +469,11 @@ def assignments_of(segment):
 def directory_plan(command, cwd, shell="Bash"):
     """Where a command's literal directory changes take it: `(start, targets)`.
 
-    `targets` are the directories it changes into, in order. `start` is where its first segment
-    that runs anything runs, when only variable assignments and literal directory changes come
-    before it; None when that cannot be read. A change the text does not spell completely loses
-    the thread until a later absolute one picks it up again.
+    `targets` are the directories it works in by name, in order and each once: those it changes
+    into and those a `git -C` sends git to. `start` is where its first segment that runs anything
+    runs, when only variable assignments and literal directory changes come before it; None when
+    that cannot be read. A change the text does not spell completely loses the thread until a
+    later absolute one picks it up again.
     """
     pairs = separated_segments(command, shell)
     if pairs is None:
@@ -460,7 +488,8 @@ def directory_plan(command, cwd, shell="Bash"):
             # Nothing runs in an empty segment or a comment line.
             before = after or before
             continue
-        opaque = "<<" in text or text[0] in "({"
+        grouped = text[0] in "({"
+        opaque = "<<" in text or grouped
         head, rest = command_head(text)
         detached = "|" in (before, after) or after == "&"
         before = after
@@ -468,7 +497,7 @@ def directory_plan(command, cwd, shell="Bash"):
             target = literal_directory(rest, current, shell, variables)
             stack.append(current)
             current = target
-            if target:
+            if target and target not in targets:
                 targets.append(target)
             continue
         if not opaque and not detached and head in RETURN_COMMANDS:
@@ -483,6 +512,11 @@ def directory_plan(command, cwd, shell="Bash"):
                 else:
                     variables[name] = value
             continue
+        # Read before this segment's own assignments, which its words do not see; a group's inside is
+        # not read at all, while a heredoc's command line is.
+        named = git_directory(rest, current, shell, variables) if head == "git" and not grouped else None
+        if named and named not in targets:
+            targets.append(named)
         if head in VARIABLE_WRITERS or ASSIGNMENT_ANYWHERE_RE.search(text) or "$((" in text:
             variables.clear()
         if not started:
@@ -1089,7 +1123,7 @@ def shell_snapshot_path(data):
     )
 
 
-def run_git(cwd, *args):
+def run_git(cwd, *args, codes=(0,)):
     try:
         proc = subprocess.run(
             ["git", "-C", cwd, *args],
@@ -1099,7 +1133,7 @@ def run_git(cwd, *args):
         )
     except Exception:
         return None
-    return proc.stdout if proc.returncode == 0 else None
+    return proc.stdout if proc.returncode in codes else None
 
 
 def nul_paths(raw):
@@ -1130,11 +1164,24 @@ def file_token(path):
         return "unreadable"
 
 
+# More changed paths than one listing may hold: a tree this dirty proves nothing.
+GIT_LISTING_LIMIT = 4096
+
+
 def git_snapshot(cwd):
-    root_raw = run_git(cwd, "rev-parse", "--show-toplevel")
-    if root_raw is None:
+    """The repository holding `cwd` as a command found or left it: its root, HEAD, how far its HEAD
+    reflog reaches (`committed_changes` reads what a command added to it) and every path that
+    differs from HEAD, with a token of its content; None outside a repository or when git fails."""
+    # HEAD comes in the same call: `--verify -q` exits 1 and prints nothing more on a branch with no
+    # commit yet.
+    located = run_git(cwd, "rev-parse", "--show-toplevel", "--verify", "-q", "HEAD", codes=(0, 1))
+    lines = os.fsdecode(located).splitlines() if located else []
+    root = lines[0].strip() if lines else ""
+    if not root:
         return None
-    root = os.fsdecode(root_raw).strip()
+    head = lines[1].strip() if len(lines) > 1 else ""
+    snapshot = {"root": root, "head": head if OID_RE.fullmatch(head) else None,
+                "reflog": reflog_size(root), "overflow": False, "files": {}}
     sources = (
         ("worktree", ("diff", "--name-only", "-z", "--")),
         ("index", ("diff", "--cached", "--name-only", "-z", "--")),
@@ -1152,16 +1199,15 @@ def git_snapshot(cwd):
         for name in names:
             normalized = cwg.normalize_path(name)
             flags.setdefault(normalized, []).append(label)
-    if len(flags) > 4096:
-        return {"root": root, "overflow": True, "files": {}}
-    files = {}
+    if len(flags) > GIT_LISTING_LIMIT:
+        return dict(snapshot, overflow=True)
     for relative, labels in flags.items():
         absolute = os.path.join(root, *relative.split("/"))
-        files[relative] = {
+        snapshot["files"][relative] = {
             "flags": sorted(labels),
             "token": file_token(absolute),
         }
-    return {"root": root, "overflow": False, "files": files}
+    return snapshot
 
 
 def agent_config_roots():
@@ -1278,31 +1324,45 @@ def shell_snapshot(cwd, marker=None, directories=(), origin=None):
     command's directory: a session publishes from one worktree what it wrote in another, or keeps
     helper scripts beside a checkout. Those repositories are snapshotted too, and each lasting file
     that belongs to no repository gets a token of its own. `directories` are the ones the command
-    itself changes into, and their repositories are snapshotted as well; `origin` is the directory
-    the hook was given when the command starts elsewhere, whose repository the command can still
-    write to. Trees past the time budget are left out, and so stay unmeasured.
+    itself changes into or points `git -C` at, and their repositories are snapshotted as well, up to
+    `MAX_DIRECTORY_REPOSITORIES`; `origin` is the directory the hook was given when the command
+    starts elsewhere, whose repository the command can still write to. Trees past that cap or the
+    time budget, and those git could not list, stay unmeasured and are counted (`skipped`). Every repository the
+    command works in beyond the one it starts in — named, or the one it was run from — is kept
+    (`elsewhere`), and each snapshot says which root it was asked for (`asked`): one of them left
+    unmeasured leaves the command unresolved.
     """
     started = time.monotonic()
     snapshot = {"git": git_snapshot(cwd), "config": config_snapshot()}
     own = cwg.normalize_path((snapshot["git"] or {}).get("root") or "").rstrip("/")
     open_marker = isinstance(marker, dict) and not marker.get("closed")
     roots, loose = candidate_trees(marker, own) if open_marker else ([], [])
-    cache, entered = {}, []
+    cache, named = {}, []
     for directory in directories:
         root = repository_root(directory, cache)
-        if root and root != own and root not in roots and root not in entered:
-            entered.append(root)
+        if root and root != own and root not in named:
+            named.append(root)
+    entered = [root for root in named if root not in roots]
     roots = roots + entered[:MAX_DIRECTORY_REPOSITORIES]
     base = repository_root(origin, cache) if origin else ""
     if base and base != own and base not in roots:
         roots.append(base)
+    left_out = [root for root in entered[MAX_DIRECTORY_REPOSITORIES:] if root not in roots]
+    elsewhere = (named + [base]) if (base and base != own and base not in named) else named
+    if elsewhere:
+        snapshot["elsewhere"] = elsewhere
     if open_marker or roots:
         snapshot["repos"] = []
         for root in roots:
             if time.monotonic() - started > EXTRA_SNAPSHOT_BUDGET:
-                snapshot["skipped"] = len(roots) - len(snapshot["repos"])
                 break
-            snapshot["repos"].append(git_snapshot(root))
+            repo = git_snapshot(root)
+            if repo:
+                repo["asked"] = root
+            snapshot["repos"].append(repo)
+        skipped = len(left_out) + len(roots) - sum(1 for repo in snapshot["repos"] if repo)
+        if skipped:
+            snapshot["skipped"] = skipped
         snapshot["loose"] = {path: file_token(path) for path in loose}
     return snapshot
 
@@ -1578,6 +1638,11 @@ def rewritten(before, after):
     ]
 
 
+def recordable(relative):
+    """Whether a changed path a repository names, relative to its root, is one the marker records."""
+    return cwg.is_gated(relative) and not SYNCED_AGENT_TREE_RE.search("/" + relative)
+
+
 def snapshot_changes(before, after):
     """Every gated path two snapshots of one repository disagree on, each paired with whether
     the command rewrote its bytes - or None when nothing is provable.
@@ -1606,7 +1671,7 @@ def snapshot_changes(before, after):
     root = after["root"]
     changes = []
     for relative in rewritten(before, after):
-        if not cwg.is_gated(relative) or SYNCED_AGENT_TREE_RE.search("/" + relative):
+        if not recordable(relative):
             continue
         absolute = os.path.join(root, *relative.split("/"))
         was = (before_files.get(relative) or {}).get("token")
@@ -1945,6 +2010,243 @@ def integration_set_aside(before, after_git, marker, deadline):
     return paths if aside == paths else set()
 
 
+# A command that writes and commits in one go leaves both listings clean, and nothing recorded what it
+# wrote (reports 145e33b8, daebd6fc). What it committed is read from the HEAD reflog of the working tree:
+# the entries written past the size the pre-command snapshot recorded, which no other worktree of the
+# repository writes to. They must chain from the HEAD before the command to the HEAD after it, and each
+# move must carry a subject git (2.52) writes either for a commit it makes — the command's own writing —
+# or for moving HEAD onto what it computed or what already existed: a checkout, a reset, a merge, a pull,
+# a rebase's steps, the commit that concludes a merge. Those stay the merge and rebase judges' and the
+# Stop hook's catch-up's, as before. A move under any other subject (`git update-ref -m <anything>`), or a
+# log that does not chain (rewritten while the command ran), proves nothing. Of the command's own commits
+# only those the history HEAD ends on holds count, directly or through the commit a rebase replayed one
+# as: git's commits reachable from the new HEAD and not from the old one.
+OWN_COMMIT_RE = re.compile(r"^(?:commit(?: \((?:initial|amend|cherry-pick)\))?|cherry-pick|revert|am): ")
+GIT_MOVE_RE = re.compile(
+    r"^(?:checkout: moving from |reset: moving to |merge [^:]*: |pull\b[^:]*: |commit \(merge\): |am --abort$)"
+)
+# The previous value of a first commit's entry.
+NULL_OID_RE = re.compile(r"0{40}(?:0{24})?")
+# More commits of its own than one command is read for.
+OWN_COMMITS_LIMIT = 64
+# Seconds after the post-command hook started by which the commits must have been read.
+OWN_COMMITS_BUDGET = budget_override("CWG_OWN_COMMITS_BUDGET", 4.0)
+
+
+def reflog_path(root):
+    """The HEAD reflog of the working tree at `root`, beside its own HEAD; None outside a repository."""
+    pointer = head_pointer(root) if root else None
+    return os.path.join(os.path.dirname(pointer), "logs", "HEAD") if pointer else None
+
+
+def reflog_size(root):
+    """How many bytes the HEAD reflog at `root` holds, 0 before its first entry (and always for a
+    reftable repository, which keeps no such file: a move of its HEAD then matches no entry and
+    `committed_changes` proves nothing); None when it cannot be read."""
+    path = reflog_path(root)
+    try:
+        return os.path.getsize(path) if path else None
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def reflog_since(root, offset):
+    """`(previous, new, subject)` of each HEAD reflog entry at `root` past `offset` bytes, oldest
+    first; None when they cannot be read whole: the log was cut or rewritten beneath the offset, or
+    more than `REFLOG_TAIL_BYTES` came after it."""
+    path = reflog_path(root)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(max(offset - 1, 0))
+            data = stream.read(REFLOG_TAIL_BYTES + 2)
+    except FileNotFoundError:
+        return [] if offset == 0 else None
+    except OSError:
+        return None
+    if offset:
+        # The line the offset ended stays where it was unless the log was rewritten.
+        if data[:1] != b"\n":
+            return None
+        data = data[1:]
+    if len(data) > REFLOG_TAIL_BYTES or (data and not data.endswith(b"\n")):
+        return None
+    entries = []
+    for line in data.decode("utf-8", "replace").split("\n")[:-1]:
+        fields, _, subject = line.partition("\t")
+        fields = fields.split()
+        if len(fields) < 2 or not all(OID_RE.fullmatch(field) for field in fields[:2]):
+            return None
+        entries.append((fields[0], fields[1], subject))
+    return entries
+
+
+def rebase_step(subject):
+    """The step a reflog subject names when it is one of a rebase's, run by itself or by `pull --rebase`
+    (`pick`, `start`, `finish` …); None for any other subject."""
+    step = REBASE_STEP_RE.match(subject)
+    return step.group("step") if step and step.group("action").split()[0] in ("rebase", "pull") else None
+
+
+# A rebase's steps that write no commit: the start checks out what it replays onto, the finish and an
+# abort return to a branch.
+NON_REPLAY_STEPS = frozenset(("start", "finish", "abort"))
+
+
+def own_commits(entries, before_head, head):
+    """What the HEAD reflog entries written while a command ran say about the move from `before_head`
+    to `head`: `(made, replayed, rebased, moved_otherwise)` — the commits the command wrote itself
+    and the ones a rebase's steps wrote, both oldest first, the HEADs its rebases started from, and
+    whether HEAD moved any way but by the command's own commits. None when they do not account for
+    the move: they are no unbroken chain from one HEAD to the other, or one of them moved HEAD under a
+    subject that is neither a commit git makes (`OWN_COMMIT_RE`) nor one of its moves onto existing
+    work (`GIT_MOVE_RE`, `rebase_step`)."""
+    made, replayed, rebased, moved_otherwise, expected = [], [], [], False, before_head
+    for previous, new, subject in entries:
+        if previous != expected and not (expected is None and NULL_OID_RE.fullmatch(previous)):
+            return None
+        expected = new
+        if previous == new:
+            continue
+        if OWN_COMMIT_RE.match(subject):
+            made.append(new)
+            continue
+        step = rebase_step(subject)
+        if step is None and not GIT_MOVE_RE.match(subject):
+            return None
+        if step == "start":
+            rebased.append(previous)
+        elif step is not None and step not in NON_REPLAY_STEPS:
+            replayed.append(new)
+        moved_otherwise = True
+    return (made, replayed, rebased, moved_otherwise) if expected == head else None
+
+
+def unreachable(root, commits, heads, deadline):
+    """The `commits` the history of none of `heads` holds, or None when git cannot say before
+    `deadline`. Git lists the whole range, their own ancestors outside those histories included, so
+    only the commits asked about are kept."""
+    listing = git_until(deadline, root, ["rev-list"] + commits + ["--not"] + heads)
+    return None if listing is None else set(listing.split()) & set(commits)
+
+
+def patch_ids(root, commits, deadline):
+    """`{commit: patch id}` for the `commits` that change anything, by `git patch-id --stable`: the same
+    for a commit and the commit a rebase replays it as, whatever author or date the replay carries;
+    None when git cannot say before `deadline`."""
+    patch = git_until(deadline, root, ["diff-tree", "--stdin", "-p", "-r", "--root", "--no-renames", "--no-color"],
+                      stdin="".join(commit + "\n" for commit in commits))
+    listing = git_until(deadline, root, ["patch-id", "--stable"], stdin=patch) if patch else patch
+    if listing is None:
+        return None
+    return {fields[1]: fields[0] for fields in (line.split() for line in listing.splitlines()) if len(fields) == 2}
+
+
+def git_paths(root, arguments, deadline, stdin=None):
+    """The paths, normalized, a `-z` git listing names, or None when git cannot say before `deadline`."""
+    listing = git_until(deadline, root, arguments, stdin=stdin)
+    return None if listing is None else {cwg.normalize_path(name) for name in listing.split("\0") if name}
+
+
+def changed_paths(root, old, new, deadline):
+    """The paths that differ between commits `old` and `new`, every path `new` holds when `old` is
+    None (a branch with no commit yet); None when git cannot say before `deadline`."""
+    if old:
+        return git_paths(root, ["diff-tree", "-r", "--name-only", "--no-renames", "-z", old, new, "--"], deadline)
+    return git_paths(root, ["ls-tree", "-r", "--name-only", "-z", new], deadline)
+
+
+def committed_changes(earlier, later, deadline):
+    """The lasting paths the commits a command wrote itself changed in one repository, as
+    `snapshot_changes` pairs, every one rewritten; [] when it wrote none; None when that cannot be
+    read before `deadline`.
+
+    `earlier` and `later` are the repository's snapshots around the command. A path either one lists
+    is theirs to judge: committing bytes that were there before rewrites nothing (`snapshot_changes`).
+    Of the rest, a path counts when one of the command's own commits that the history HEAD ends on
+    holds changed it (against its parents) and it differs between the HEAD before the command and the
+    HEAD after it: what a checkout, a pull or a merge brought in is not the command's writing, a commit
+    reset or checked out away left nothing, and what its later commits undid is no change. When a
+    rebase ran in the same command, a commit of its own that HEAD's history lost and the rebase
+    started from counts through the commit it was replayed as (`patch_ids`), and one no replay
+    carries proves nothing. Past `OWN_COMMITS_LIMIT` commits or `GIT_LISTING_LIMIT` of their paths
+    nothing is proven either.
+    """
+    before_head, head = earlier.get("head"), later.get("head")
+    if "head" not in earlier or not head or head == before_head:
+        # HEAD where it was or on no commit, or a snapshot stored before HEAD was part of one.
+        return []
+    offset, root = earlier.get("reflog"), later["root"]
+    entries = reflog_since(root, offset) if offset is not None else None
+    chain = own_commits(entries, before_head, head) if entries is not None else None
+    if chain is None or max(len(chain[0]), len(chain[1])) > OWN_COMMITS_LIMIT:
+        return None
+    made, replayed, rebased, moved_otherwise = chain
+    kept = made
+    if made and moved_otherwise:
+        # A reset away and a fast-forward over the same file must not pass upstream's bytes off as the
+        # command's (G R2-01).
+        lost = unreachable(root, made, [head], deadline)
+        if lost is None:
+            return None
+        kept = [commit for commit in made if commit not in lost]
+        # Without a rebase nothing could have carried a lost commit on. With one, only a commit a rebase
+        # started from may have been replayed: one reset away before any rebase began was dropped,
+        # whatever the rebase then carried (G CV-01). A rebase whose start went unrecorded leaves every
+        # lost commit in doubt.
+        at_risk = set()
+        if lost and replayed:
+            dropped = unreachable(root, sorted(lost), rebased, deadline) if rebased else set()
+            if dropped is None:
+                return None
+            at_risk = lost - dropped
+        if at_risk:
+            # Replayed, the commit carries the same change into the new HEAD's history; one that no
+            # replay carries may have been dropped or rewritten on the way, which nothing here can tell
+            # apart (G R3-01, R3-02).
+            gone = unreachable(root, replayed, [head], deadline)
+            if gone is None:
+                return None
+            replays = [commit for commit in replayed if commit not in gone]
+            ids = patch_ids(root, sorted(at_risk) + replays, deadline)
+            if ids is None:
+                return None
+            carried = {ids[commit] for commit in replays if commit in ids}
+            if any(ids.get(commit) not in carried for commit in at_risk):
+                return None
+            # Only the replays of those commits: the rebase also replays what the branch held before
+            # the command, and upstream's bytes git merged into it are no writing of the command's.
+            own = {ids[commit] for commit in at_risk}
+            kept = kept + [commit for commit in replays if ids.get(commit) in own]
+    if not kept:
+        return []
+    written = git_paths(root, ["diff-tree", "--stdin", "-r", "-m", "--root", "--name-only", "--no-renames",
+                               "--no-commit-id", "-z"], deadline, stdin="".join(commit + "\n" for commit in kept))
+    if written is None or len(written) > GIT_LISTING_LIMIT:
+        return None
+    differs = changed_paths(root, before_head, head, deadline)
+    if differs is None:
+        return None
+    listed = set(earlier.get("files") or {}) | set(later.get("files") or {})
+    return [(os.path.join(root, *relative.split("/")), True) for relative in sorted(written & differs)
+            if relative not in listed and recordable(relative)]
+
+
+def repository_delta(earlier, later, deadline):
+    """`(changes, vouches)` for one repository's snapshots around a command: `snapshot_changes` with
+    the paths its own commits changed (`committed_changes`), None when the snapshots prove nothing,
+    and whether the tree proves the command changed nothing else there, which commits that could not
+    be read leave unproven."""
+    changes = snapshot_changes(earlier, later)
+    if changes is None:
+        return None, False
+    committed = committed_changes(earlier, later, deadline)
+    return changes + (committed or []), committed is not None
+
+
 def head_pointer(directory):
     """Path of the HEAD file governing `directory`, following a linked worktree pointer."""
     entry = os.path.join(directory, ".git")
@@ -2214,12 +2516,16 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
     repository really did gain those bytes and the candidate still answers for them.
 
     `unresolved` means a mutation was observed but the snapshot could not name what it touched,
-    so it may have been a source edit made through the shell. `snapshot_roots` bounds what an
+    so it may have been a source edit made through the shell. For a write-capable command its mark
+    is a barrier even beside the lasting paths the command did name: their measurement says nothing
+    about what no snapshot saw, such as commits that could not be read (report 145e33b8).
+    `snapshot_roots` bounds what an
     empty delta actually proves: each snapshot vouches for its own tree and for nothing else —
     the working repository, and the agent-configuration homes this machine keeps outside any
     repository. `vouched` are the candidate's lasting files outside every snapshotted tree that
     were measured one by one around the command. `unseen` is the repository the command ended in
-    when no snapshot covered it, `skipped` the number of repositories the time budget left out,
+    when no snapshot covered it, `skipped` the number of repositories left unmeasured (past the time
+    budget or the cap on named ones, or with commits that could not be read),
     and `no_snapshot` says the pre-command snapshot never arrived (its hook was cancelled or
     failed); the content mark keeps all three, so a block can say what went unmeasured. The
     placeholder of a command proven not to write (`write_capable_command` false) joins only a
@@ -2329,10 +2635,12 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         # bounded by the fingerprint's own budgets and is nothing at all while the candidate has
         # rewritten no lasting byte, which is the common case for a shell mutation before any
         # edit.
-        unknown = bool(unattributed_risk or not cwg.durable_paths(incoming))
+        # What no snapshot saw is held against a verdict only for a command that could write it.
+        blind = write_capable_command and unresolved
+        unknown = bool(unattributed_risk or blind or not cwg.durable_paths(incoming))
         fingerprint = content_fingerprint(content_paths)
         stats, stats_at = content_stats(content_paths[-MARKER_PATH_CAP:]), now
-        cause = command_cause(data, "edit" if cwg.durable_paths(incoming) else
+        cause = command_cause(data, "edit" if cwg.durable_paths(incoming) and not blind else
                               "unattributed" if unattributed_risk else "unresolved-write-capable")
         if unseen:
             cause["landed"] = unseen
@@ -3021,15 +3329,15 @@ def main():
                         session, shell_start_ts=started, cwd=ground, now=started
                     )
                     open_marker = cwg.read_json(cwg.marker_path(session))
+                    snapshot = shell_snapshot(
+                        ground, open_marker, entered, origin=None if ground == cwd else cwd,
+                    )
                     cwg.write_json(
                         shell_snapshot_path(data),
                         dict(
-                            shell_snapshot(
-                                ground, open_marker, entered,
-                                origin=None if ground == cwd else cwd,
-                            ),
+                            snapshot,
                             ts=started,
-                            head=head_commit(ground),
+                            head=(snapshot["git"] or {}).get("head") or head_commit(ground),
                             refs=cwg.refs_digest(ground),
                             start=ground,
                             merging=merge_in_progress(repository_root(ground, root_cache)),
@@ -3070,7 +3378,10 @@ def main():
             after = shell_snapshot(
                 earlier_git["root"] if isinstance(earlier_git, dict) and earlier_git.get("root") else cwd
             )
-            repo_changes = snapshot_changes(earlier_git, after["git"])
+            # What the command committed itself counts beside what the listings show (reports
+            # 145e33b8, daebd6fc); a tree whose commits could not be read vouches for nothing.
+            commits_deadline = hook_started + OWN_COMMITS_BUDGET
+            repo_changes, repo_vouches = repository_delta(earlier_git, after["git"], commits_deadline)
             # What an upstream merge brought in is git's computation, not this session's writing
             # (report f9920b99): it leaves the delta here and is handed on for the verdict carry.
             # Judged in the repository the command started in, whose HEAD the snapshot recorded.
@@ -3093,12 +3404,19 @@ def main():
             # rewrote. A watched home has no index to move a file through, so every change
             # there is one.
             rewrote = []
+            skipped = int(before.get("skipped") or 0)
+            # A covered repository whose HEAD moved onto commits that could not be read: what the
+            # command committed there is unseen, which leaves the command unresolved.
+            commits_unread = False
             # Each source answers for its own tree, so one of them proving nothing narrows what
             # the command is known not to have touched instead of discarding the other's answer.
             if repo_changes is not None:
                 shell_paths, rewrote = changed_and_rewritten(repo_changes)
-                snapshot_roots.append((after["git"] or {}).get("root"))
-                home_ground = True
+                if repo_vouches:
+                    snapshot_roots.append((after["git"] or {}).get("root"))
+                    home_ground = True
+                else:
+                    skipped, commits_unread = skipped + 1, True
             if config_paths is not None:
                 shell_paths = (shell_paths or []) + config_paths
                 rewrote = rewrote + config_paths
@@ -3112,7 +3430,7 @@ def main():
             # command run elsewhere can change them, and one that did not must not read as a
             # change nobody measured (reports b803660c, 946d53ef).
             earlier_repos = before.get("repos") or []
-            skipped = int(before.get("skipped") or 0)
+            measured = set()
             for index, earlier in enumerate(earlier_repos):
                 if time.monotonic() - hook_started > EXTRA_COMPARE_BUDGET:
                     # Left uncompared, the tree vouches for nothing, which the rules below
@@ -3121,13 +3439,20 @@ def main():
                     break
                 if not isinstance(earlier, dict) or not earlier.get("root"):
                     continue
-                changes = snapshot_changes(earlier, git_snapshot(earlier["root"]))
+                changes, vouches = repository_delta(earlier, git_snapshot(earlier["root"]), commits_deadline)
                 if changes is None:
                     continue
                 named, moved = changed_and_rewritten(changes)
                 shell_paths = (shell_paths or []) + named
                 rewrote = rewrote + moved
-                snapshot_roots.append(earlier["root"])
+                if vouches:
+                    snapshot_roots.append(earlier["root"])
+                    measured.add(earlier.get("asked"))
+                else:
+                    skipped, commits_unread = skipped + 1, True
+            # A repository the command works in beyond its start that nothing measured — past the cap
+            # or the time budget — may hold what it wrote, as one whose commits could not be read may.
+            unmeasured = commits_unread or any(root not in measured for root in before.get("elsewhere") or ())
             vouched = []
             for loose, token in (before.get("loose") or {}).items():
                 if file_token(loose) != token:
@@ -3187,7 +3512,7 @@ def main():
                     # A read-only lane's write is recorded like anyone's, and what it measurably
                     # changed expires the verdict through the paths themselves; only what the
                     # snapshot could not see is not held against the verdict the lane is producing.
-                    record_paths(data, shell_paths, unresolved=moved_unseen,
+                    record_paths(data, shell_paths, unresolved=moved_unseen or unmeasured,
                                  snapshot_roots=snapshot_roots,
                                  watched_roots=watched_roots, unattributed_risk=floor,
                                  write_capable_command=write_capable(data) and not lane,
@@ -3212,7 +3537,7 @@ def main():
                     record_paths(
                         data,
                         [cwg.SHELL_MUTATION_PATH],
-                        unresolved=not home_ground or moved_unseen,
+                        unresolved=not home_ground or moved_unseen or unmeasured,
                         snapshot_roots=snapshot_roots,
                         watched_roots=watched_roots,
                         unattributed_risk=floor,

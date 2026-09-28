@@ -78,6 +78,9 @@ AGENT_HOME = os.path.join(tempfile.gettempdir(), RUN + "_agent_home")
 os.makedirs(AGENT_HOME, exist_ok=True)
 os.environ["USERPROFILE"] = AGENT_HOME
 os.environ["HOME"] = AGENT_HOME
+# The marker reads the commits a command made itself within a few seconds of its hook's start; the
+# suite pins that logic, not this machine's load, so its hooks get a budget no scenario reaches.
+os.environ["CWG_OWN_COMMITS_BUDGET"] = "60"
 MARK_HOOK = os.path.join(HERE, "code_work_gate_mark.py")
 GATE_INBOX = os.path.join(HERE, "gate_inbox.py")
 def _discard_fixtures():
@@ -4955,12 +4958,12 @@ def mark_edit(sid, repo, relative, content="changed = True", python=sys.executab
     return cwg.normalize_path(target)
 
 
-def mark_shell(sid, repo, command, action=None, python=sys.executable):
+def mark_shell(sid, repo, command, action=None, python=sys.executable, tool="Bash"):
     """A mutating shell call as production delivers it: the snapshot pair around the work."""
     payload = {
         "session_id": sid,
         "tool_use_id": "shell-{}".format(uuid.uuid4().hex),
-        "tool_name": "Bash",
+        "tool_name": tool,
         "cwd": repo,
         "tool_input": {"command": command},
     }
@@ -8693,8 +8696,10 @@ for cause in (
 ):
     barrier = gate.describe_mark({"ts": time.time(), "fp": "a", "unknown": True, "cause": cause},
                                  lambda stamp: "12:00:00")
-    check("a barrier says how many repositories the time budget left out",
-          barrier.endswith(", with 2 repositories left unmeasured by the hook's time budget")
+    # `skipped` counts every repository left unmeasured since report 145e33b8, not the time budget's alone.
+    check("a barrier says how many repositories were left unmeasured, and why they can be",
+          barrier.endswith(", with 2 repositories left unmeasured: past the hook's time budget or the cap on "
+                           "those a command names, or with commits it could not read")
           and barrier.count("(") <= 1, barrier)
 
 # --- an intent-to-add placeholder is no staged content (report 265312d0)
@@ -8758,6 +8763,44 @@ with tempfile.TemporaryDirectory(prefix="cwg_directory_variables_") as base:
         check("directory_plan with variables: " + label, variable_plan(command) == expected,
               (command, variable_plan(command)))
 
+# --- `git -C` names a repository the command works in, as a literal `cd` does (report 145e33b8)
+with tempfile.TemporaryDirectory(prefix="cwg_git_directory_") as base:
+    left, right = os.path.join(base, "left"), os.path.join(base, "right")
+    os.makedirs(left)
+    os.makedirs(os.path.join(right, "sub"))
+    right_forward = right.replace(chr(92), "/")
+
+    def git_plan(command, shell):
+        start, targets = marker_hook.directory_plan(command, left, shell)
+        named = [None if path is None else os.path.relpath(path, base) for path in [start] + targets]
+        return named[0], named[1:]
+
+    for label, command, shell, expected in (
+        ("a literal path", "git -C {} diff --stat".format(right_forward), "Bash", ("left", ["right"])),
+        ("in a pipeline, which still runs git there",
+         "python sync.py | cat; git -C {} diff --stat | tail -3".format(right_forward), "Bash", ("left", ["right"])),
+        ("PowerShell's form of report 145e33b8",
+         "python3 sync.py | Out-Null; git -C {} diff --stat | Select-Object -Last 14".format(right), "PowerShell",
+         ("left", ["right"])),
+        ("a variable the command gave a literal value",
+         'R="{}"; git -C "$R" add -A && git -C "$R" commit -m x'.format(right_forward), "Bash", ("left", ["right"])),
+        ("a relative path", "git -C ../right status", "Bash", ("left", ["right"])),
+        ("a later relative -C taken from the one before",
+         "git -C {} -C sub status".format(right_forward), "Bash", ("left", [os.path.join("right", "sub")])),
+        ("options before it", "git --no-pager -c core.pager=cat -C {} log -1".format(right_forward), "Bash",
+         ("left", ["right"])),
+        ("a subcommand's own -C names no directory", "git commit -C HEAD --amend", "Bash", ("left", [])),
+        ("an unassigned variable", 'git -C "$NOWHERE" status', "Bash", ("left", [])),
+        ("a directory that does not exist", "git -C {}/missing status".format(right_forward), "Bash", ("left", [])),
+        ("the command line of a heredoc",
+         "git -C {} commit -F - <<'EOF'\nmessage\nEOF".format(right_forward), "Bash", ("left", ["right"])),
+        ("not inside a subshell", "(git -C {} status)".format(right_forward), "Bash", ("left", [])),
+        ("once, with a cd there as well", "git -C {0} status; cd {0} && make".format(right_forward), "Bash",
+         ("left", ["right"])),
+    ):
+        check("directory_plan with git -C: " + label, git_plan(command, shell) == expected,
+              (command, git_plan(command, shell)))
+
 # --- a throwaway written into a drive-root temp subdirectory outside any repository (report ff2c5007)
 if os.path.isdir("C:\\tmp"):
     with tempfile.TemporaryDirectory(prefix="cwg_scratch_rule_", dir="C:\\tmp") as scratch_dir, \
@@ -8800,6 +8843,11 @@ def put(directory, relative, content):
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8") as stream:
         stream.write(content)
+
+
+def covers_now(entry, stamp):
+    """Whether a verdict stated at `stamp` still covers the candidate the marker entry holds."""
+    return gate.content_covers(entry, stamp, float(entry.get("last_durable_ts") or 0.0))
 
 
 check("raw diff records keep the destination side of each path",
@@ -8847,9 +8895,6 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
 
     def at(relative):
         return cwg.normalize_path(os.path.join(work, *relative.split("/")))
-
-    def covers_now(entry, stamp):
-        return gate.content_covers(entry, stamp, float(entry.get("last_durable_ts") or 0.0))
 
     brought = {at("src/app.py"), at("src/new.py"), at("src/gone.py"), at("src/shared.py")}
     check("no merge is judged without the HEAD the snapshot recorded",
@@ -8990,6 +9035,161 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
         cleanup(sid)
         restart()
 
+    # The command's own commits are recorded (report daebd6fc); a merge commit and a fast-forward are
+    # not its writing, so a clean upstream merge stays unrecorded however it is committed.
+    for label, command, action in (
+        ("a clean upstream merge committed in one step", "git merge --no-ff --no-edit origin/main",
+         lambda: git_as_gate(work, "merge", "--quiet", "--no-ff", "--no-edit", "origin/main")),
+        ("a fast-forward pull", "git pull --ff-only", lambda: git_as_gate(work, "pull", "--quiet", "--ff-only")),
+    ):
+        sid = session()
+        try:
+            mark_shell(sid, work, command, action=action)
+            marker_entry, paths = recorded(sid)
+            check(label + " records none of the files it brought in",
+                  git_as_gate(work, "rev-parse", "HEAD").stdout.strip() != start and not (paths & brought),
+                  marker_entry)
+        finally:
+            cleanup(sid)
+            restart()
+
+    sid = session()
+    try:
+        def merge_then_commit():
+            git_as_gate(work, "merge", "--quiet", "--no-ff", "--no-edit", "origin/main")
+            put(work, "src/local.py", "local = 1\n")
+            git_as_gate(work, "add", "src/local.py")
+            git_as_gate(work, "commit", "--quiet", "-m", "local")
+        mark_shell(sid, work, "git merge --no-ff --no-edit origin/main && git add src/local.py && git commit -m local",
+                   action=merge_then_commit)
+        marker_entry, paths = recorded(sid)
+        check("a commit after a clean upstream merge in the same command is recorded, and the merge is not",
+              at("src/local.py") in set(marker_entry.get("content_paths") or []) and not (paths & brought),
+              marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        def commit_then_pull_rebase():
+            put(work, "src/local.py", "local = 2\n")
+            git_as_gate(work, "add", "src/local.py")
+            git_as_gate(work, "commit", "--quiet", "-m", "local")
+            git_as_gate(work, "pull", "--quiet", "--rebase")
+        mark_shell(sid, work, "git add src/local.py && git commit -m local && git pull --rebase",
+                   action=commit_then_pull_rebase)
+        marker_entry, paths = recorded(sid)
+        check("a commit that pull --rebase replayed onto upstream is recorded, and upstream's files are not",
+              at("src/local.py") in set(marker_entry.get("content_paths") or []) and not (paths & brought),
+              marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    # The rebase also replays what the branch held before the command; what git merged of upstream's
+    # into those commits is not the command's writing (G r1 F1).
+    sid = session()
+    try:
+        put(work, "src/shared.py", shared_base + "own line 21\n")
+        git_as_gate(work, "commit", "--quiet", "-am", "earlier")
+
+        def commit_then_pull_rebase_over_earlier():
+            put(work, "src/local.py", "local = 3\n")
+            git_as_gate(work, "add", "src/local.py")
+            git_as_gate(work, "commit", "--quiet", "-m", "local")
+            git_as_gate(work, "pull", "--quiet", "--rebase")
+        mark_shell(sid, work, "git add src/local.py && git commit -m local && git pull --rebase",
+                   action=commit_then_pull_rebase_over_earlier)
+        marker_entry, paths = recorded(sid)
+        check("pull --rebase over an earlier commit records only the command's own commit",
+              at("src/local.py") in set(marker_entry.get("content_paths") or []) and not (paths & brought),
+              marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    # A commit the same command then reset away left nothing, so a fast-forward that changes the same
+    # file stays upstream's (G R2-01).
+    sid = session()
+    try:
+        def commit_reset_fast_forward():
+            put(work, "src/app.py", "value = 99\n")
+            git_as_gate(work, "commit", "--quiet", "-am", "own app")
+            git_as_gate(work, "reset", "--quiet", "--hard", start)
+            git_as_gate(work, "merge", "--quiet", "--ff-only", "origin/main")
+        mark_shell(sid, work, "git commit -am 'own app' && git reset --hard HEAD~1 && git merge --ff-only origin/main",
+                   action=commit_reset_fast_forward)
+        marker_entry, paths = recorded(sid)
+        check("a commit reset away does not pass a fast-forward's file off as the command's",
+              git_as_gate(work, "rev-parse", "HEAD").stdout.strip() != start and not (paths & brought), marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    # The same after a rebase onto upstream, with the upstream commit's own author and author date (G R3-01).
+    sid = session()
+    try:
+        upstream_date = git_as_gate(work, "log", "-1", "--format=%ad", "--date=raw", "origin/main").stdout.strip()
+
+        def commit_same_date_reset_rebase():
+            put(work, "src/app.py", "value = 98\n")
+            subprocess.run(["git", "-C", work, "-c", "user.name=Code Work Gate", "-c", "user.email=gate@example.invalid",
+                            "commit", "--quiet", "-am", "own app"], check=True, capture_output=True,
+                           env=dict(os.environ, GIT_AUTHOR_DATE=upstream_date))
+            git_as_gate(work, "reset", "--quiet", "--hard", start)
+            git_as_gate(work, "rebase", "--quiet", "origin/main")
+        mark_shell(sid, work, "git commit -am 'own app' && git reset --hard HEAD~1 && git rebase origin/main",
+                   action=commit_same_date_reset_rebase)
+        marker_entry, paths = recorded(sid)
+        check("a commit reset away before a rebase onto upstream passes no upstream file off as the command's",
+              git_as_gate(work, "rev-parse", "HEAD").stdout.strip() != start and not (paths & brought), marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    # A replay that resets its author date still carries the command's change (G R3-02); one resolved by
+    # hand carries a different change, and the command is then unresolved.
+    sid = session()
+    try:
+        def commit_rebase_reset_date():
+            put(work, "src/own.py", "own = 1\n")
+            git_as_gate(work, "add", "src/own.py")
+            git_as_gate(work, "commit", "--quiet", "-m", "own")
+            git_as_gate(work, "rebase", "--quiet", "--reset-author-date", "origin/main")
+        mark_shell(sid, work, "git add src/own.py && git commit -m own && git rebase --reset-author-date origin/main",
+                   action=commit_rebase_reset_date)
+        marker_entry, paths = recorded(sid)
+        check("a commit a rebase replayed with a new author date is recorded, and upstream's files are not",
+              at("src/own.py") in set(marker_entry.get("content_paths") or []) and not (paths & brought),
+              marker_entry)
+    finally:
+        cleanup(sid)
+        restart()
+
+    sid = session()
+    try:
+        mark_edit(sid, work, "src/extra.py", "extra = 2")
+        verdict_ts = time.time()
+
+        def commit_rebase_resolve_by_hand():
+            put(work, "src/shared.py", "own line 1\n" + shared_base.split("\n", 1)[1])
+            git_as_gate(work, "commit", "--quiet", "-am", "own first line")
+            git_as_gate(work, "rebase", "origin/main", check=False)
+            put(work, "src/shared.py", "resolved line 1\n" + shared_base.split("\n", 1)[1])
+            git_as_gate(work, "add", "src/shared.py")
+            git_as_gate(work, "-c", "core.editor=true", "rebase", "--continue")
+        mark_shell(sid, work, "git commit -am 'own first line' && git rebase origin/main || git rebase --continue",
+                   action=commit_rebase_resolve_by_hand)
+        marker_entry, _ = recorded(sid)
+        check("a commit a rebase replayed as a different change leaves an unknown change behind",
+              (marker_entry.get("content_marks") or [{}])[-1].get("unknown") and not covers_now(marker_entry, verdict_ts),
+              marker_entry)
+    finally:
+        cleanup(sid)
+        git_as_gate(work, "rebase", "--abort", check=False)
+        restart()
+
     # --- a rebase onto upstream, or a merge committed by the same command, rewrites the candidate's
     # committed files on a clean tree, which no snapshot lists (report c4c78b99)
     later = time.monotonic() + 30
@@ -9042,6 +9242,18 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
         git_as_gate(work, "rebase", "--quiet", "origin/main")
 
     integration_case("a clean rebase onto upstream", "git rebase origin/main", rebase_upstream, True)
+
+    def temporary_commit_then_rebase():
+        # Committed and reset away before the rebase starts: nothing the rebase replays (G CV-01).
+        put(work, "src/tmp.py", "tmp = 1\n")
+        git_as_gate(work, "add", "src/tmp.py")
+        git_as_gate(work, "commit", "--quiet", "-m", "tmp")
+        git_as_gate(work, "reset", "--quiet", "--hard", "HEAD~1")
+        rebase_upstream()
+
+    integration_case("a clean rebase after a temporary commit reset away",
+                     "git add src/tmp.py && git commit -m tmp && git reset --hard HEAD~1 && git rebase origin/main",
+                     temporary_commit_then_rebase, True)
     integration_case("a clean rebase of a candidate that also deleted a file", "git rebase origin/main",
                      rebase_upstream, True,
                      also=lambda sid: mark_shell(sid, work, "git rm src/stay.py",
@@ -9140,6 +9352,337 @@ with tempfile.TemporaryDirectory(prefix="cwg_merge_judge_") as base:
                      content="own line 1\n" + shared_base.split("\n", 1)[1])
 
 del os.environ["CWG_MERGE_JUDGE_BUDGET"]
+
+# --- a repository named only by `git -C` is measured, and so is what a command commits itself
+# (reports 145e33b8, daebd6fc)
+with tempfile.TemporaryDirectory(prefix="cwg_named_repos_") as base:
+    home, clone, second, third = (os.path.join(base, name) for name in ("home", "clone", "second", "third"))
+    for directory in (home, clone, second, third):
+        candidate_repo(directory, os.path.basename(directory))
+    # Outside any repository, as the configuration home is.
+    elsewhere = os.path.join(base, "elsewhere")
+    os.makedirs(elsewhere)
+    seeded = {directory: git_as_gate(directory, "rev-parse", "HEAD").stdout.strip()
+              for directory in (home, clone, second, third)}
+
+    def forward(directory):
+        return directory.replace(chr(92), "/")
+
+    def inside(directory, relative):
+        return cwg.normalize_path(os.path.join(directory, *relative.split("/")))
+
+    def entry_of(sid):
+        return cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+
+    def reset_all():
+        for directory, commit in seeded.items():
+            git_as_gate(directory, "checkout", "--quiet", "--force", os.path.basename(directory))
+            git_as_gate(directory, "reset", "--quiet", "--hard", commit)
+            git_as_gate(directory, "clean", "-fdq")
+
+    def sync_clone():
+        put(clone, "src/seed.py", "value = 2\n")
+        put(clone, "src/synced.py", "synced = True\n")
+
+    synced = {inside(clone, "src/seed.py"), inside(clone, "src/synced.py")}
+    for label, command, tool in (
+        ("in bash", 'python sync.py | cat; git -C "{}" diff --stat | tail -3'.format(forward(clone)), "Bash"),
+        ("in PowerShell, as report 145e33b8 ran it",
+         "python3 sync.py | Out-Null; git -C {} diff --stat | Select-Object -Last 14".format(clone), "PowerShell"),
+    ):
+        sid = session()
+        try:
+            mark_shell(sid, elsewhere, command, action=sync_clone, tool=tool)
+            marked = entry_of(sid)
+            check("a script writing into a repository the command names only by git -C is recorded, " + label,
+                  synced <= set(marked.get("content_paths") or [])
+                  and not (marked.get("content_marks") or [{}])[-1].get("unknown"), marked)
+        finally:
+            cleanup(sid)
+            reset_all()
+
+    sid = session()
+    try:
+        mark_edit(sid, home, "src/candidate.py", "value = 3")
+        anchored = entry_of(sid)
+        # Dirt from before the command in the repository it names.
+        put(clone, "src/seed.py", "value = 9\n")
+        put(clone, "src/dirty.py", "dirty = True\n")
+        mark_shell(sid, home, 'git -C "{}" status'.format(forward(clone)))
+        marked = entry_of(sid)
+        check("git -C <repo> status alone records nothing",
+              all(marked.get(key) == anchored.get(key)
+                  for key in ("paths", "content_paths", "content_marks", "last_durable_ts", "last_write_ts")),
+              (anchored, marked))
+        fresh = session()
+        try:
+            mark_shell(fresh, elsewhere, 'git -C "{}" status'.format(forward(clone)))
+            check("and records no lasting path in a session with no candidate either",
+                  not cwg.durable_paths(entry_of(fresh).get("paths") or []), entry_of(fresh))
+        finally:
+            cleanup(fresh)
+    finally:
+        cleanup(sid)
+        reset_all()
+
+    capped = marker_hook.shell_snapshot(home, None, [clone, second, third])
+    check("repositories named past the cap are left out of the snapshot, counted, and kept as named",
+          [snapshot["asked"] for snapshot in capped["repos"]] == [cwg.normalize_path(clone), cwg.normalize_path(second)]
+          and capped.get("skipped") == 1
+          and capped.get("elsewhere") == [cwg.normalize_path(directory) for directory in (clone, second, third)], capped)
+    # Past the cap a named repository is not measured, so the command that names it is unresolved: a verdict
+    # from before it no longer covers the candidate, whatever it wrote there.
+    for label, measured_writes in (("beside writes that were measured", True), ("alone", False)):
+        sid = session()
+        try:
+            mark_edit(sid, home, "src/candidate.py", "value = 8")
+            verdict_ts = time.time()
+
+            def write_named():
+                if measured_writes:
+                    put(clone, "src/one.py", "one = 1\n")
+                    put(second, "src/two.py", "two = 2\n")
+                put(third, "src/three.py", "three = 3\n")
+            mark_shell(sid, home, "git -C {} status; git -C {} status; git -C {} status; python write.py".format(
+                forward(clone), forward(second), forward(third)), action=write_named)
+            marked = entry_of(sid)
+            paths = set(marked.get("paths") or [])
+            last = (marked.get("content_marks") or [{}])[-1]
+            check("a write past the cap of named repositories, " + label + ", is a barrier the mark counts",
+                  ({inside(clone, "src/one.py"), inside(second, "src/two.py")} <= paths) is measured_writes
+                  and inside(third, "src/three.py") not in paths and last.get("unknown")
+                  and (last.get("cause") or {}).get("skipped") == 1 and not covers_now(marked, verdict_ts), marked)
+        finally:
+            cleanup(sid)
+            reset_all()
+
+    # A move of HEAD under a subject git does not write is not read as no commit (G R1-03).
+    sid = session()
+    try:
+        mark_edit(sid, home, "src/candidate.py", "value = 9")
+        verdict_ts = time.time()
+
+        def commit_by_plumbing():
+            put(home, "src/plumbed.py", "plumbed = True\n")
+            git_as_gate(home, "add", "src/plumbed.py")
+            tree = git_as_gate(home, "write-tree").stdout.strip()
+            made = git_as_gate(home, "commit-tree", tree, "-p", "HEAD", "-m", "plumbed").stdout.strip()
+            git_as_gate(home, "update-ref", "-m", "custom sync", "HEAD", made)
+        mark_shell(sid, home, "python sync.py", action=commit_by_plumbing)
+        marked = entry_of(sid)
+        check("a commit moved onto HEAD by update-ref under its own subject leaves an unknown change",
+              (marked.get("content_marks") or [{}])[-1].get("unknown") and not covers_now(marked, verdict_ts), marked)
+    finally:
+        cleanup(sid)
+        reset_all()
+
+    def commit_in(directory, *relative, amend=False):
+        """What a sync that writes `relative` and commits everything does, as one action."""
+        def act():
+            for name in relative:
+                put(directory, name, "value = {!r}\n".format(uuid.uuid4().hex))
+            git_as_gate(directory, "add", "-A")
+            git_as_gate(directory, "commit", "--quiet", "-m", "sync", *(["--amend"] if amend else []))
+        return act
+
+    for label, cwd, command, action, written in (
+        ("in the repository it starts in", home, "python sync.py; git add -A; git commit -m sync",
+         commit_in(home, "src/sync.py", "src/seed.py"), {inside(home, "src/sync.py"), inside(home, "src/seed.py")}),
+        ("in a repository it names by git -C", elsewhere,
+         'python sync.py; git -C "{0}" add -A; git -C "{0}" commit -m sync'.format(forward(clone)),
+         commit_in(clone, "src/sync.py"), {inside(clone, "src/sync.py")}),
+        ("amending the last commit", home, "python sync.py; git commit -a --amend --no-edit",
+         commit_in(home, "src/seed.py", amend=True), {inside(home, "src/seed.py")}),
+    ):
+        sid = session()
+        try:
+            mark_edit(sid, home, "src/candidate.py", "value = 4")
+            verdict_ts = time.time()
+            mark_shell(sid, cwd, command, action=action)
+            marked = entry_of(sid)
+            check("files a command writes and commits itself are recorded as rewritten, " + label,
+                  written <= set(marked.get("content_paths") or [])
+                  and not covers_now(marked, verdict_ts), (written, marked))
+        finally:
+            cleanup(sid)
+            reset_all()
+
+    sid = session()
+    try:
+        mark_edit(sid, home, "src/candidate.py", "value = 5")
+        verdict_ts = time.time()
+        mark_shell(sid, home, "git add -A && git commit -m own", action=commit_in(home))
+        check("committing the reviewed bytes in one command still leaves the verdict covering",
+              covers_now(entry_of(sid), verdict_ts), entry_of(sid))
+    finally:
+        cleanup(sid)
+        reset_all()
+
+    # Report daebd6fc's shape: a new branch from a commit ahead of HEAD, then the sync and its commit;
+    # and the same from a branch HEAD is not on. What the switch brought in is not the command's writing.
+    def branch_with(name, relative, start_point):
+        git_as_gate(home, "branch", "--quiet", "--force", name, start_point)
+        git_as_gate(home, "switch", "--quiet", name)
+        put(home, relative, "{} = 1\n".format(name))
+        git_as_gate(home, "add", "-A")
+        git_as_gate(home, "commit", "--quiet", "-m", name)
+        git_as_gate(home, "switch", "--quiet", "home")
+
+    for label, prepare in (
+        ("ahead of HEAD", lambda: branch_with("ahead", "src/ahead.py", "home")),
+        ("beside HEAD", lambda: (branch_with("ahead", "src/ahead.py", "home"), commit_in(home, "src/local.py")())),
+    ):
+        sid = session()
+        try:
+            prepare()
+            mark_shell(sid, home, "git switch -c next ahead; python sync.py; git add -A; git commit -m sync",
+                       action=lambda: (git_as_gate(home, "switch", "--quiet", "-c", "next", "ahead"),
+                                       commit_in(home, "src/sync.py")()))
+            paths = set(entry_of(sid).get("paths") or [])
+            check("a commit made after switching to a branch " + label + " is recorded, and the switch is not",
+                  inside(home, "src/sync.py") in paths
+                  and not paths & {inside(home, "src/ahead.py"), inside(home, "src/local.py")}, entry_of(sid))
+        finally:
+            cleanup(sid)
+            reset_all()
+            git_as_gate(home, "branch", "--quiet", "-D", "ahead", "next", check=False)
+
+    # A commit of its own that a merge in the same command brought into HEAD's history counts.
+    sid = session()
+    try:
+        def commit_on_feature_then_merge():
+            git_as_gate(home, "switch", "--quiet", "-c", "feature")
+            commit_in(home, "src/feature.py")()
+            git_as_gate(home, "switch", "--quiet", "home")
+            git_as_gate(home, "merge", "--quiet", "--no-ff", "--no-edit", "feature")
+        mark_shell(sid, home, "git switch -c feature; python sync.py; git add -A; git commit -m sync; "
+                              "git switch home; git merge --no-ff feature", action=commit_on_feature_then_merge)
+        check("a commit of its own that a merge brought into HEAD's history is recorded",
+              inside(home, "src/feature.py") in set(entry_of(sid).get("content_paths") or []), entry_of(sid))
+    finally:
+        cleanup(sid)
+        reset_all()
+        git_as_gate(home, "branch", "--quiet", "-D", "feature", check=False)
+
+    # A repository whose HEAD moved and whose reflog cannot say how is measured by nothing.
+    sid = session()
+    try:
+        mark_edit(sid, home, "src/candidate.py", "value = 6")
+        verdict_ts = time.time()
+        git_as_gate(home, "config", "core.logAllRefUpdates", "false")
+        os.remove(os.path.join(home, ".git", "logs", "HEAD"))
+        mark_shell(sid, home, "python sync.py; git add -A; git commit -m sync", action=commit_in(home, "src/sync.py"))
+        marked = entry_of(sid)
+        last = (marked.get("content_marks") or [{}])[-1]
+        check("a commit no reflog records leaves an unknown change and the repository counted as unmeasured",
+              last.get("unknown") and (last.get("cause") or {}).get("skipped") == 1
+              and not covers_now(marked, verdict_ts), marked)
+    finally:
+        cleanup(sid)
+        git_as_gate(home, "config", "--unset", "core.logAllRefUpdates", check=False)
+        reset_all()
+
+# An unresolved command's mark is a barrier beside the paths it named, unless it is proven not to write.
+with tempfile.TemporaryDirectory(prefix="cwg_blind_") as repo:
+    candidate_repo(repo, "blind")
+    for label, capable in (
+        ("an unresolved write-capable command's mark is a barrier beside a lasting path it named", True),
+        ("while a command proven not to write leaves none", False),
+    ):
+        sid = session()
+        try:
+            named = mark_edit(sid, repo, "src/seed.py", "value = 7")
+            marker_hook.record_paths({"session_id": sid, "cwd": repo, "tool_name": "Bash",
+                                      "tool_input": {"command": "python sync.py"}},
+                                     [named], unresolved=True, snapshot_roots=[repo],
+                                     write_capable_command=capable, content_changed=[])
+            last = (cwg.read_json(cwg.marker_path(cwg.session_key(sid))).get("content_marks") or [{}])[-1]
+            check(label, bool(last.get("unknown")) is capable, last)
+        finally:
+            cleanup(sid)
+
+for label, entries, before_head, commits in (
+    ("a commit after a checkout", [("b", "u", "checkout: moving from main to next"), ("u", "a", "commit: sync"),
+                                   ("a", "a", "checkout: moving from next to HEAD")], "b", (["a"], [], [], True)),
+    ("a commit that pull --rebase replayed",
+     [("b", "c", "commit: x"), ("c", "u", "pull -q --rebase (start): checkout u"), ("u", "a", "pull -q --rebase (pick): x"),
+      ("a", "a", "pull -q --rebase (finish): returning to refs/heads/main")], "b", (["c"], ["a"], ["c"], True)),
+    ("a rebase's start, which writes no replay",
+     [("b", "a", "rebase (start): checkout a"), ("a", "a", "rebase (finish): returning to refs/heads/main")], "b",
+     ([], [], ["b"], True)),
+    ("commits alone", [("b", "c", "commit: x"), ("c", "a", "commit (amend): x")], "b", (["c", "a"], [], [], False)),
+    ("a fast-forward, which is none", [("b", "a", "merge origin/main: Fast-forward")], "b", ([], [], [], True)),
+    ("the concluding commit of a merge, which is none", [("b", "a", "commit (merge): Merge x")], "b",
+     ([], [], [], True)),
+    ("a first commit", [("0" * 40, "a", "commit (initial): x")], None, (["a"], [], [], False)),
+    ("entries that do not start at the HEAD before", [("c", "a", "commit: x")], "b", None),
+    ("entries that do not chain", [("b", "c", "commit: x"), ("d", "a", "commit: y")], "b", None),
+    ("entries that do not reach the HEAD after", [("b", "c", "commit: x")], "b", None),
+    ("a move under a subject git does not write", [("b", "a", "custom sync")], "b", None),
+    ("no entry for a move", [], "b", None),
+):
+    check("own commits read from the reflog: " + label,
+          marker_hook.own_commits(entries, before_head, "a") == commits, marker_hook.own_commits(entries, before_head, "a"))
+# A first commit on a branch with no commit yet: `rev-parse --verify -q HEAD` exits 1 there, and the
+# snapshot still finds the repository (G r1 F4).
+with tempfile.TemporaryDirectory(prefix="cwg_unborn_") as repo:
+    subprocess.run(["git", "init", "--quiet", repo], check=True)
+    switch_branch(repo, "unborn")
+    sid = session()
+    try:
+        def write_first_commit():
+            put(repo, "src/first.py", "first = 1\n")
+            git_as_gate(repo, "add", "-A")
+            git_as_gate(repo, "commit", "--quiet", "-m", "first")
+        mark_shell(sid, repo, "python sync.py; git add -A; git commit -m first", action=write_first_commit)
+        marked = cwg.read_json(cwg.marker_path(cwg.session_key(sid))) or {}
+        check("a first commit on an unborn branch is recorded as rewritten and leaves the command measured",
+              cwg.normalize_path(os.path.join(repo, "src", "first.py")) in set(marked.get("content_paths") or [])
+              and not (marked.get("content_marks") or [{}])[-1].get("unknown"), marked)
+    finally:
+        cleanup(sid)
+with tempfile.TemporaryDirectory(prefix="cwg_own_commits_") as repo:
+    candidate_repo(repo, "own")
+    for number in range(3):
+        put(repo, "src/history{}.py".format(number), "history = {}\n".format(number))
+        git_as_gate(repo, "add", "-A")
+        git_as_gate(repo, "commit", "--quiet", "-m", "history")
+    earlier = marker_hook.git_snapshot(repo)
+    put(repo, "src/next.py", "next = 1\n")
+    git_as_gate(repo, "add", "-A")
+    git_as_gate(repo, "commit", "--quiet", "-m", "next")
+    later = marker_hook.git_snapshot(repo)
+    committed = marker_hook.committed_changes(earlier, later, time.monotonic() + 30)
+    check("the commits a command made itself are read from its reflog",
+          committed == [(os.path.join(later["root"], "src", "next.py"), True)], (earlier, later, committed))
+    # Git lists a whole range for `<commits> --not <heads>`, the commits' own ancestors included.
+    check("of the commits asked about, only those no head's history holds are unreachable",
+          marker_hook.unreachable(repo, [later["head"]], [earlier["head"]], time.monotonic() + 30) == {later["head"]}
+          and marker_hook.unreachable(repo, [later["head"]], [git_as_gate(repo, "rev-parse", "HEAD~2").stdout.strip()],
+                                      time.monotonic() + 30) == {later["head"]}
+          and marker_hook.unreachable(repo, [earlier["head"]], [later["head"]], time.monotonic() + 30) == set())
+    check("and not when git has no time left for them",
+          marker_hook.committed_changes(earlier, later, time.monotonic() - 1) is None)
+    put(repo, "src/after.py", "after = 1\n")
+    git_as_gate(repo, "add", "-A")
+    git_as_gate(repo, "commit", "--quiet", "-m", "after")
+    last = marker_hook.git_snapshot(repo)
+    log_path = marker_hook.reflog_path(repo)
+    with open(log_path, "rb") as stream:
+        kept = stream.read()
+    # A log expired while the command ran, whose first new entry ends exactly where the old log did:
+    # what is read past the recorded size no longer starts at the HEAD before the command.
+    ident = "Code Work Gate <gate@example.invalid> 1790000000 +0000\tcommit: "
+    first = "{} {} {}".format(earlier["head"], later["head"], ident)
+    first += "x" * (earlier["reflog"] - len(first) - 1) + "\n"
+    with open(log_path, "wb") as stream:
+        stream.write(first.encode() + "{} {} {}y\n".format(later["head"], last["head"], ident).encode())
+    check("nor from a log rewritten while the command ran, even one cut where the old one ended",
+          len(first) == earlier["reflog"] and marker_hook.committed_changes(earlier, last, time.monotonic() + 30) is None)
+    with open(log_path, "wb") as stream:
+        stream.write(kept[:max(earlier["reflog"] - 10, 0)])
+    check("nor from a log cut beneath the size recorded before",
+          marker_hook.committed_changes(earlier, last, time.monotonic() + 30) is None)
 
 # --- a read-only lane's own commands do not expire the verdict it is producing (report a1c7b71b)
 check("cmp only compares", marker_hook.read_only_pipeline("cmp backend/schema.sql mirror/schema.sql && echo same"))
