@@ -2799,7 +2799,8 @@ def describe_mark(mark, clock):
     if cause.get("landed"):
         text += " that ended in {}, which no snapshot covered".format(cause["landed"])
     if cause.get("skipped"):
-        text += ", with {} repositories left unmeasured by the hook's time budget".format(cause["skipped"])
+        text += (", with {} repositories left unmeasured: past the hook's time budget or the cap on those a "
+                 "command names, or with commits it could not read").format(cause["skipped"])
     if cause.get("no_snapshot"):
         text += ", with no snapshot from before it (its PreToolUse hook was cancelled or failed)"
     return text
