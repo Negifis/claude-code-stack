@@ -16,7 +16,7 @@ template — it is a stack in daily use on Windows and on a Linux execution VM, 
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2231 gate assertions, 76 continuity checks, 49 guard checks, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2489 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
 | `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
 | `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
@@ -284,6 +284,13 @@ Also left out: the NotebookLM memory bridge and its `nlm-memory` command. `CLAUD
 locally. Neither the bridge nor its reference (`reference/notebooklm-memory.md`) is here, since
 they depend on tooling that isn't published. Without the bridge those steps have nothing to
 call: delete them, or ignore them, if you don't run NotebookLM.
+
+The same holds for Jev. The `jev-workflow` block in `CLAUDE.md` and the `<!-- jev-stage -->`
+blocks in skills, agents, commands and rules send semantic comparisons — ranking, grouping,
+duplicate checks, choosing among candidates — through the `jev-workflow` skill and its
+`mcp__jev-workflow__*` MCP server. Neither is here: both are private tooling. Without them the
+blocks say to continue natively, so a session loses nothing but the delegation; delete the
+blocks if you don't run Jev.
 
 ---
 
