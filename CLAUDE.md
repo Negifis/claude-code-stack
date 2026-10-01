@@ -129,3 +129,37 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
 - Before changing anything under `~/.claude`, read `~/.claude/reference/environment.md`.
   Deterministic hooks carry objective facts, skills carry judgment; hooks from every active
   scope are additive, so a project hook never duplicates the global gate.
+
+<!-- jev-workflow:start -->
+## Mandatory Jev intermediate steps
+
+At every new research, diagnostics, batch, review or check-selection stage, **MUST run the
+`jev-workflow` skill before making an eligible semantic comparison yourself**:
+- classify/group 3+ tasks, review comments, test/CI failures, log events or records;
+- rank 3+ retrieved documents, context fragments, search hits or diff sections by a stated rubric;
+- assess possible duplicates in 2+ locally shortlisted candidates;
+- choose among 2+ known skills/agents/tools/checks/values when meaning determines fit;
+- check a claim against explicitly supplied evidence (including a single claim).
+Its MCP tools are deferred: load them once per session with ToolSearch
+`select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate,mcp__jev-workflow__delegate_artifact`.
+Use `judge` for 2-8 short candidates already in the conversation and `prepare_and_delegate` for
+files; when the MCP is missing or older, the skill's `stage.py` CLI. Inspect only schema/count and
+at most two samples before programmatic preparation. Apply the returned IDs/judgments; inspect
+disputed items and the exact current source before edits. Never pre-read and semantically process
+the whole eligible set yourself. A valid cached judgment satisfies the call. Do not bypass because
+the choice seems easy or native tools are available.
+Code located by described behaviour: where the jev plugin is installed (`command -v jev`), use
+`jev find "<behaviour>" <dir>` when the name is unknown and `jev ask "<yes/no>" <dir> -q` to check
+one property across 3+ files instead of reading them all; exact names stay with Grep/Glob.
+
+Exact search, explicitly named skills, arithmetic, regex, parsing and formal rules stay native;
+architecture, complex diagnosis, writing and final validation stay with the main agent. Never
+authorize commands or waive required checks through Jev. Roles explicitly restricted to
+read-only/no writes/no network (Explore, reviewers, simplify lenses) leave Jev preprocessing to the
+parent, which passes the judgments in the packet; never loosen those restrictions.
+Use safely minimized technical data from the user-authorized task. Secrets, .env, credentials and
+raw confidential client data/correspondence stay local; if safe minimization is impossible,
+bypass. On unavailable/disabled/invalid/over-budget responses continue natively with intact
+originals; uncertainty requires review. No per-call narration, routing essays, quotas or requests
+on every prompt/tool call.
+<!-- jev-workflow:end -->

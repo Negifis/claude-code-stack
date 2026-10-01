@@ -1,6 +1,6 @@
 ---
 name: chip-handoff
-description: Give a spawn_task chip a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification before the child session is archived or sent back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
+description: Give a spawn_task chip a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification, then merge, accept and archive without asking the user, or send back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
 disable-model-invocation: false
 ---
 
@@ -67,7 +67,8 @@ After the work is done and `development-verification` has closed it:
    parent's own Stop hook lists it as waiting, and the chip is released. Do not retry, do not
    look for another route, and do not leave the report only in your own transcript.
 
-4. Do not archive the child session yourself. The parent decides, and may send it back.
+4. Do not archive the child session yourself. The parent archives it after accepting, or sends
+   it back.
 
 ## Accepting one
 
@@ -75,6 +76,11 @@ A report is a claim, not evidence. Chips reach you two ways: as a message, and �
 could not be delivered — as a line in your own Stop hook naming the chips still waiting. Both
 oblige you equally; `status` lists them at any time, and a resumed or scheduled session should
 drain it before picking the goal back up.
+
+The user set this up so as not to supervise chips one by one: this skill is their standing
+agreement to merge, accept and archive every chip that passes your verification, in the same
+turn, without asking them before or after. Only a chip that fails verification goes back with
+`--rework`.
 
 When a chip is waiting:
 
@@ -85,22 +91,42 @@ When a chip is waiting:
    you resolved by hand is a delta candidate (`development-verification` §6). For operational
    work: check the effect on the system, not the child's description of it.
 
-2. Then close it:
+2. **Merge it**, by what the report says:
+   - already merged («Влито в …», «… уже есть в …»), nothing to take, or an operational chip —
+     nothing to do;
+   - «Автомерж не выполнен» — run the `git merge --no-ff <branch>` it prints, in the tree it
+     names once that tree is on the parent branch; on a conflict resolve it by hand, which
+     makes the merge a delta candidate. When the reason is
+     a rewritten parent branch, carry the commits over with `git cherry-pick -x` instead;
+   - commits found off the chip branch or on a detached HEAD — merge or cherry-pick them when
+     the diff you verified is the result, otherwise send the chip back.
+
+   The merged result is your own candidate and closes under your own `development-verification`;
+   once its checks pass, accept and archive in the same turn.
+
+3. **Accept it and archive the child session:**
 
    ```bash
    python3 ~/.claude/hooks/chip_handoff.py close --chip <id> --accept
+   ```
+
+   `--accept` prints the child's `sessionId` when one was recorded; archive that session with
+   `mcp__ccd_session_mgmt__archive_session` right away; an approval the app shows for the call
+   is its own, not a question to repeat in chat. When it prints no id, find the session by the
+   chip's title in `list_sessions` — an id that is not of the `local_<uuid>` form is refused
+   rather than offered, because `archive_session` does not take it.
+
+   A chip that fails verification is sent back instead, and keeps its session:
+
+   ```bash
    python3 ~/.claude/hooks/chip_handoff.py close --chip <id> --rework "<что доделать>"
    ```
 
+   `--rework` prints the message to send back into the child session with `send_message` — the
+   child is waiting for exactly that.
+
    Closing is not optional bookkeeping: until a chip is closed its parent is reminded again on
    every turn, because a report nobody acted on is the failure this exists to catch.
-
-   `--accept` prints the child's `sessionId` when one was recorded; archive that session with
-   `mcp__ccd_session_mgmt__archive_session`, which asks the user for confirmation. When it
-   prints no id, find the session by the chip's title in `list_sessions` — an id that is not of
-   the `local_<uuid>` form is refused rather than offered, because `archive_session` does not
-   take it. `--rework` prints the message to send back into the child session with
-   `send_message` — the child is waiting for exactly that and should not have been closed.
 
 `status` lists chips still waiting on somebody; pass `--session <sessionId>` for this
 session's own.
@@ -124,8 +150,8 @@ block and this skill are what carry it.
   branch and a message; publication stays where `development-verification` puts it.
 - It does not merge into a branch somebody is sitting on, and never force-merges a conflict.
   A conflicted merge is aborted and reported with the conflicting paths.
-- It does not archive anything. `archive_session` always asks the user, and a chip sent back
-  for rework must keep its session.
+- The script archives nothing itself: the parent archives an accepted chip's session with
+  `archive_session` right after `--accept`, and a chip sent back for rework keeps its session.
 - It does not clean up worktrees beyond its own merge tree and a refused chip's clean tree, and
   it unlinks a tree's junctions and directory symlinks before removing either: on Windows git
   follows a junction and deletes its target. `tools/worktree-audit.mjs` owns the rest and parks

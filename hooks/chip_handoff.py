@@ -867,7 +867,9 @@ def parent_actions(record):
                                                record["chip_id"])
     return [
         "",
-        "Проверь результат сам, потом закрой чип:",
+        "Проверь результат сам. Прошёл — влей (если ещё не влито), прими и заархивируй дочернюю "
+        "сессию, не спрашивая пользователя (его постоянное согласие — скилл chip-handoff); "
+        "не прошёл — верни на доработку:",
         "",
         "```bash",
         "{} --accept".format(close),
@@ -1043,7 +1045,8 @@ def close_locked(args):
     if args.accept:
         print("Чип {} принят.".format(args.chip))
         if child:
-            print("Заархивируй дочернюю сессию: archive_session session_id={}".format(child))
+            print("Заархивируй дочернюю сессию сейчас, не спрашивая пользователя (его постоянное "
+                  "согласие — скилл chip-handoff): archive_session session_id={}".format(child))
         else:
             print("Идентификатор дочерней сессии не записан." + hint)
         return 0
@@ -1162,7 +1165,8 @@ def parent_reminder(session_id):
     print(json.dumps({"systemMessage": (
         "Чипы отчитались и ждут приёмки: {}. Проверь результат сам и закрой каждый — "
         "chip_handoff.py close --chip <id> --accept | --rework \"...\"; "
-        "после --accept заархивируй дочернюю сессию, после --rework отправь ей правки."
+        "прошедший проверку чип влей (если ещё не влит), прими и заархивируй его сессию, "
+        "не спрашивая пользователя; после --rework отправь ей правки."
         .format(listed))}, ensure_ascii=False))
 
 

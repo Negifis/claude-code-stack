@@ -15,6 +15,22 @@ pairing has to be free at the moment work starts, or it does not happen at all.
 
 ## Steps
 
+<!-- jev-stage:start -->
+At diagnostics, context selection or selection among genuinely ambiguous checks/tools, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and confidential data. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 1. **Read the issue.** `glab issue view <N>` — title, labels, status. If it does not exist or
    is already closed, say so and stop; do not invent a branch for a ticket nobody filed.
 

@@ -3,6 +3,22 @@ name: root-cause-engineering
 description: Before editing on a bug, a failing test, lint or type check, a flaky test, a regression, an unclear failure, a performance problem or a production incident.
 ---
 
+<!-- jev-stage:start -->
+At diagnostics, context selection or selection among genuinely ambiguous checks/tools, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and confidential data. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 # Root-Cause Engineering Protocol
 
 For bugs, flaky behavior, broken tests, regressions, unclear failures, or performance issues:

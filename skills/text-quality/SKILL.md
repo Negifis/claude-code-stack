@@ -3,6 +3,22 @@ name: text-quality
 description: Before finalizing any natural-language text, including Russian, commit messages and code comments.
 ---
 
+<!-- jev-stage:start -->
+Before preliminary semantic triage of diagnostic events, candidate findings or diff sections, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and confidential data. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 # Text Quality Layer
 
 Apply these rules to natural-language text Claude writes: chat replies, UI strings, site/app copy, documentation, README files, code comments, commit and PR messages, emails, advertising materials, and drafts.

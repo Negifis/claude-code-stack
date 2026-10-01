@@ -1632,7 +1632,7 @@ for command, fed, tail in (
 CONTINUED_LAUNCH = (
     'cd "C:/repo" && REVIEW_ID=r9 ; timeout 3600 codex exec --ignore-user-config \\' + chr(10)
     + "  --disable plugins --disable hooks \\" + chr(10)
-    + "  -m gpt-6-sol -c model_reasoning_effort=high \\" + chr(10)
+    + "  -m gpt-6.1-sol -c model_reasoning_effort=high \\" + chr(10)
     + native("  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW")
 )
 launch = marker_hook.codex_launch(CONTINUED_LAUNCH)
@@ -3170,14 +3170,14 @@ try:
     found = codex_lane.outage_from_text("ERROR: Selected model is at capacity. Please try a different model.", now=now)
     check("capacity is a bounded outage", found is not None and abs(found[0] - (now.timestamp() + codex_lane.DEFAULT_OUTAGE)) < 1, found)
     refusal = ('ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":'
-               '"The \'gpt-6-sol\' model requires a newer version of Codex. Please upgrade to the latest '
+               '"The \'gpt-6.1-sol\' model requires a newer version of Codex. Please upgrade to the latest '
                'app or CLI and try again."}}')
     found = codex_lane.outage_from_text(refusal, now=now)
     check("a model newer than the CLI is an outage that names the upgrade",
           found is not None and "upgrade" in found[1]
           and abs(found[0] - (now.timestamp() + codex_lane.DEFAULT_LIMIT_OUTAGE)) < 1, found)
     refusal = ('ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":'
-               '"The \'gpt-6-sol\' model is not supported when using Codex with a ChatGPT account."}}')
+               '"The \'gpt-6.1-sol\' model is not supported when using Codex with a ChatGPT account."}}')
     found = codex_lane.outage_from_text(refusal, now=now)
     check("the ChatGPT-account refusal of a new model is the same upgrade outage",
           found is not None and "upgrade" in found[1]
@@ -3594,7 +3594,7 @@ try:
     seed(sid, ["C:/repo/src/auth/session.ts"])
     events = base_events(include_simplify=True)
     add_codex_review(events, 128, "codex-cli",
-                     "Get-Content -Raw C:\\tmp\\packet.md | codex exec --json -m gpt-6-sol - "
+                     "Get-Content -Raw C:\\tmp\\packet.md | codex exec --json -m gpt-6.1-sol - "
                      "# CODE_WORK_GATE_REVIEW",
                      review_text("APPROVED"), tool="PowerShell")
     transcript = write_transcript(events)
@@ -9858,12 +9858,12 @@ check("the reported MR command can expire no verdict, though it plainly writes",
 # expires no verdict wherever it starts; one that also does anything else is an ordinary command
 # (report a5767180).
 REVIEW_FLAGS = ("--ignore-user-config \\\n  --disable plugins --disable hooks --disable memories \\\n"
-                "  -m gpt-6-sol -c model_reasoning_effort=high -c tools.web_search=true \\\n"
+                "  -m gpt-6.1-sol -c model_reasoning_effort=high -c tools.web_search=true \\\n"
                 "  --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \\\n")
 REVIEW_TAIL = native("  - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW")
 REVIEW_LAUNCH = "REVIEW_ID=g17r1; timeout 3600 codex exec " + REVIEW_FLAGS + REVIEW_TAIL
 XHIGH_LAUNCH = REVIEW_LAUNCH.replace("timeout 3600", "timeout 7000").replace(
-    "-m gpt-6-sol -c model_reasoning_effort=high", "-m gpt-6-astra -c model_reasoning_effort=ultra")
+    "-m gpt-6.1-sol -c model_reasoning_effort=high", "-m gpt-6-astra -c model_reasoning_effort=ultra")
 for label, command, expected in (
     ("the command's own template", REVIEW_LAUNCH, True),
     ("the XHIGH template", XHIGH_LAUNCH, True),
@@ -9911,7 +9911,7 @@ for label, command, expected in (
      REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", " &  # CODE_WORK_GATE_REVIEW"), False),
     ("an `&` inside the comment, which runs nothing", REVIEW_LAUNCH + " &", True),
     ("two launches", REVIEW_LAUNCH + "\n" + REVIEW_LAUNCH, False),
-    ("a substitution inside double quotes", REVIEW_LAUNCH.replace("-m gpt-6-sol", '-m "$(true)"'), False),
+    ("a substitution inside double quotes", REVIEW_LAUNCH.replace("-m gpt-6.1-sol", '-m "$(true)"'), False),
     ("a second stdin redirect", REVIEW_LAUNCH.replace("  # CODE_WORK_GATE_REVIEW", native(" < /c/tmp/other.md  # CODE_WORK_GATE_REVIEW")), False),
     ("comment lines around it", "# round 1\n# CODE_WORK_GATE_REVIEW\n" + REVIEW_LAUNCH + "\n# done", True),
     ("a command after two comment lines", "# a\n# b\ngit status\n" + REVIEW_LAUNCH, False),
@@ -10366,7 +10366,7 @@ finally:
 XHIGH_RECEIPT = "[gate] verified: XHIGH; KDF rewrite, XHIGH lenses and an XHIGH approval"
 XHIGH_SUBJECT = "the KDF rewrite"
 ASTRA_TURN = (cwg.XHIGH_CODEX_MODEL, cwg.XHIGH_CODEX_EFFORT)
-SOL_TURN = ("gpt-6-sol", "high")
+SOL_TURN = ("gpt-6.1-sol", "high")
 # The launch may name any model: only the turn the rollout log records decides the level.
 ASTRA_COMMAND = CODEX_CLI_COMMAND.replace(
     "codex exec", "codex exec -m gpt-6-astra -c model_reasoning_effort=ultra")

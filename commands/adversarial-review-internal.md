@@ -5,6 +5,22 @@ argument-hint: "[plan|code|file-path] [optional named risk]"
 
 # Native Adversarial Review
 
+<!-- jev-stage:start -->
+Before preliminary semantic triage of diagnostic events, candidate findings or diff sections, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and confidential data. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 This is the fallback review lane. `/adversarial-review` runs Codex and is the default; use this
 one when `codex_lane.py check` reports a recorded outage, Codex died before a verdict on its one
 allowed resume, or the user declined it — and say so in the report, since the reviewer then

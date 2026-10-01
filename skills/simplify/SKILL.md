@@ -53,6 +53,22 @@ weakening, and any suggestion whose equivalence cannot be established.
 
 ## Finite workflow
 
+<!-- jev-stage:start -->
+Before preliminary semantic triage of diagnostic events, candidate findings or diff sections, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and confidential data. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 1. One pass over the changed scope: local, the single lane, or the three lenses.
 2. Apply only concrete behavior-preserving improvements; rerun affected checks after edits.
 3. For broad or high-risk work, one confirmation run per lane is allowed after accepted edits,

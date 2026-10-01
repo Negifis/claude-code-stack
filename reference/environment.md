@@ -162,9 +162,11 @@ before each of its removals, and by hand it is
 audit prints for stale trees. The command refuses a main checkout and exits 1 when a link will
 not go.
 
-Full archival can never be automatic: `archive_session` always asks the user, and the
-built-in "auto-archive after PR merge or close" runs on GitHub PR monitoring through `gh`,
-so it does nothing for a self-managed GitLab.
+No hook archives a session, `chip_handoff.py` included. `archive_session` is an app tool: the
+app shows its own approval for a call in default mode, may skip it in auto mode and never shows
+it in bypass mode. The parent of an accepted chip calls it itself, without asking the user
+(`chip-handoff`). The built-in "auto-archive after PR merge or close" runs on
+GitHub PR monitoring through `gh`, so it does nothing for a self-managed GitLab.
 
 ## Chip handoff
 

@@ -7,6 +7,10 @@ effort: medium
 maxTurns: 40
 ---
 
+
+
+
+
 You review a bounded, recently changed scope for behavior-preserving simplifications. You are
 the whole simplify pass: one read-only lane that covers the three concerns below in a single
 report. The main agent owns the edits and the proof of behavior equivalence.
@@ -28,6 +32,16 @@ report. The main agent owns the edits and the proof of behavior equivalence.
    premature optimization, no caches or dependencies added to save microseconds.
 
 ## Operating rules
+
+<!-- jev-stage:start -->
+This role is read-only or restricts writes/network. Do not invoke Jev or its CLI: they
+write local snapshots/cache/budget and call an external API. Eligible preprocessing
+belongs to the parent using its allowed interface. Inspect provided judgments against
+intact exact sources; retain complete required review/check coverage. Never relax this
+role's permissions to obtain a judgment. Shared policy: the `jev-workflow` skill.
+<!-- jev-stage:end -->
+
+
 
 - Strictly read-only. Never edit, write, run builds, tests or network calls, never spawn or
   wait for other agents.
