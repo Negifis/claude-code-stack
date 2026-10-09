@@ -15,8 +15,9 @@ code that fits the repository. Not fewer lines for their own sake, and not a cer
   work that got harder to reason about.
 - The user asks to simplify or refactor.
 - `development-verification` requires it: a STANDARD persistent candidate needs one foreground
-  `simplify-reviewer` result, a HIGH one a foreground result from each of the three lenses, an
-  XHIGH one from each lens's `-xhigh` profile. LOW work never requires it.
+  `simplify-reviewer` result unless it is a small edit (`development-verification` §3), a HIGH
+  one a foreground result from each of the three lenses, an XHIGH one from each lens's `-xhigh`
+  profile. LOW work never requires it.
 
 Skip it for routine LOW work, small obvious fixes, generated output and docs churn.
 Never run it on operational work: a scratchpad or one-shot script that already executed, or a
@@ -59,9 +60,17 @@ the `jev-workflow` skill before making that comparison yourself.
 Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
 `stage.py` CLI; then apply IDs and inspect disputed sources.
 Exact/formal decisions and final validation stay native; preserve required checks,
-permission boundaries and confidential data. If this role cannot use an allowed interface,
+permission boundaries and secrets. If this role cannot use an allowed interface,
 continue natively with intact sources and report the concrete limitation.
 <!-- jev-stage:end -->
+
+<!-- jev-search:start -->
+Finding code: unless you already have the exact file or symbol, start with
+`jev find "<what the code does>" <dir>` rather than a grep over several guessed names (`a\|b\|c`).
+To check one property across files without reading them all, use
+`jev ask "<yes/no question>" <files> -q`. Open what Jev cites with an explicit range; where `jev`
+is not on PATH, use Grep and Glob.
+<!-- jev-search:end -->
 
 
 

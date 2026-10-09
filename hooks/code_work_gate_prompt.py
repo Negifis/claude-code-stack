@@ -40,7 +40,8 @@ def describe(entry):
         "End the final message with `[gate] verified: {}; <candidate and decisive checks>` "
         "(or pr-ready/draft-blocked after autonomous closure); a closing message without a "
         "receipt is blocked."
-    ).format(floor, files, "" if files == 1 else "s", since, cwg.receipt_requirements(floor), floor)
+    ).format(floor, files, "" if files == 1 else "s", since,
+             cwg.receipt_requirements(floor, shape["small"]), floor)
 
 
 def main():

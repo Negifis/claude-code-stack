@@ -261,12 +261,36 @@ def candidate_shape(entry):
     persistent = bool(lasting) or bool(entry.get("path_overflow")) or bool(
         entry.get("unattributed_durable")
     ) or (seen in RISK_ORDER and RISK_ORDER[seen] > RISK_ORDER["LOW"])
+    floor = max_risk(minimum_risk(paths), seen) if persistent else None
     return {
         "persistent": persistent,
-        "floor": max_risk(minimum_risk(paths), seen) if persistent else None,
+        "floor": floor,
         "files": len(set(lasting)),
         "first_ts": float(entry.get("first_ts")),
+        # Only a STANDARD candidate's requirements depend on it.
+        "small": floor == "STANDARD" and small_edit(entry),
     }
+
+
+# A STANDARD candidate this small owes no simplify lane: the main agent's own look covers it, as
+# `simplify` says of small obvious fixes, and the user wants a simple task finished without an
+# extra agent. Counted from Edit calls alone; a change the gate cannot count leaves it unmeasured.
+# What an Edit counts is its own change: a file the user had already left dirty is not measured.
+SMALL_EDIT_LINES = 3
+SMALL_EDIT_RULE = "a small edit (at most {} changed lines, all made with Edit)".format(SMALL_EDIT_LINES)
+
+
+def edited_line_count(entry):
+    """The candidate's changed lines as the marker hook counted them, or None when unmeasured."""
+    lines = (entry or {}).get("edited_lines")
+    return lines if type(lines) is int else None
+
+
+def small_edit(entry):
+    """Whether every lasting change of the candidate was an Edit, `SMALL_EDIT_LINES` changed lines
+    in all. Zero is not small: nothing lasting was counted, as when a commit alone opened it."""
+    lines = edited_line_count(entry)
+    return lines is not None and 0 < lines <= SMALL_EDIT_LINES
 
 
 # One line per gate decision, so a verdict that "expired" or a block that surprised the parent
@@ -298,6 +322,18 @@ def git_run(cwd, arguments, timeout, stdin=None):
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.returncode, proc.stdout
+
+
+def git_bytes(cwd, arguments, timeout, stdin=None):
+    """`git -C cwd …` stdout as bytes, undecoded, or None on any failure: for file contents, where
+    decoding could make two different bytes read the same."""
+    import subprocess
+    try:
+        proc = subprocess.run(["git", "-C", cwd] + list(arguments), capture_output=True,
+                              timeout=timeout, check=False, input=stdin)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def git_text(cwd, arguments, timeout, stdin=None):
@@ -388,8 +424,10 @@ XHIGH_CODEX_MODEL = "gpt-6-astra"
 XHIGH_CODEX_EFFORT = "ultra"
 
 
-def receipt_requirements(floor):
+def receipt_requirements(floor, small=False):
     """The evidence a persistent candidate at this floor must carry, in one clause."""
+    if floor == "STANDARD" and small:
+        return "affected checks; as {} it owes no {} lane".format(SMALL_EDIT_RULE, SIMPLIFY_LANE)
     return {
         "LOW": "the relevant deterministic check",
         "STANDARD": "affected checks and one foreground {} result".format(SIMPLIFY_LANE),

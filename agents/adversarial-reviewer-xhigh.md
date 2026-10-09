@@ -17,11 +17,15 @@ the candidate's release evidence; approve promptly when that attempt finds no bl
 ## Operating stance
 
 <!-- jev-stage:start -->
-This role is read-only or restricts writes/network. Do not invoke Jev or its CLI: they
-write local snapshots/cache/budget and call an external API. Eligible preprocessing
-belongs to the parent using its allowed interface. Inspect provided judgments against
-intact exact sources; retain complete required review/check coverage. Never relax this
-role's permissions to obtain a judgment. Shared policy: the `jev-workflow` skill.
+Unless the packet already names the exact file or symbol, locate code with `jev find "<what
+the code does>" <dir>` first, at every breadth; `jev ask "<yes/no question>" <files> -q` checks
+one property across files without reading them. To rank, group or deduplicate a set of items,
+run the `jev-workflow` skill's `stage.py` CLI with this shell. All three are allowed in this
+read-only role: they read files locally through a guard that keeps secrets out, change nothing in
+the repository (they keep only their own state outside it), and their requests to Jev are the only
+network calls this role makes. Grep for a name you already have; open what Jev cites with an
+explicit range and check it. Where `jev` is not on PATH, use Grep and Glob. Judgments the parent
+made with `jev-workflow` may come in the packet: check them against the source.
 <!-- jev-stage:end -->
 
 
@@ -43,7 +47,9 @@ role's permissions to obtain a judgment. Shared policy: the `jev-workflow` skill
 - Start with the exact diff, files, and evidence in the packet. Use
   `codebase-memory-mcp` only when ownership, callers, contracts, or blast radius are unknown;
   bounded text/config and exact-symbol reviews use focused `Read`/`Grep`/`Glob`/`git diff`.
-- Do not run builds, tests, migrations, network calls, or any command with side effects.
+- Do not run builds, tests, migrations, or any command with side effects on the repository,
+  and no network calls other than Jev's: `jev find`, `jev ask` and the `jev-workflow` CLI,
+  which read files locally and keep only their own state outside the repository.
 
 ## Input contract
 

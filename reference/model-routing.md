@@ -13,6 +13,7 @@ requirement.
 | Bounded simplify pass | `simplify-reviewer` for STANDARD, the three `simplify-*-reviewer` lenses for HIGH: Sonnet, `maxTurns: 40` | medium |
 | XHIGH simplify pass | the three `simplify-*-reviewer-xhigh` lenses: `claude-opus-5-5`, `maxTurns: 80` | max |
 | Routine implementation, focused QA, web research | `general-purpose` with `model: "sonnet"` passed explicitly | medium/high |
+| Stack specialist (`claude-code-workflows` plugin agents) | `model` passed explicitly as `subagent-delegation` says; the profiles' own `opus`/`inherit`/`haiku` do not follow this table | session default |
 | Architecture, security, root cause, adversarial review | `adversarial-reviewer` profile: Fable, `maxTurns: 60`; or Opus/Fable by explicit choice | high |
 | XHIGH adversarial review | `adversarial-reviewer-xhigh` profile: Fable, `maxTurns: 100` | max |
 | Orchestration, integration, final decision, user answer | primary agent | session default |
@@ -23,14 +24,20 @@ documented override mechanism for Claude Code 2.1.25x. `Plan` is left built-in: 
 seven weeks, both in plan mode where the strong model is the point. `CLAUDE_CODE_SUBAGENT_MODEL`
 is deliberately not set globally (the wa-tg-tun-new project sets it locally to
 `claude-sonnet-5-5`; see usage-optimization-2026-09.md): before 2.1.251 it overrode every agent's
-own `model`, including the reviewer's, and the `minimumVersion` floor of 2.1.246 is below that.
+own `model`, including the reviewer's.
 
 The aliases are pinned in `settings.json` (`env`, `ANTHROPIC_DEFAULT_OPUS_MODEL` and its
-`SONNET`/`FABLE` siblings): `opus` -> `claude-opus-5`, `sonnet` -> `claude-sonnet-5-5`, `fable` ->
-`claude-fable-5-1`. Raise the pins when a new generation ships;
-every agent profile follows them. The exact aliases available to the current Claude Code
-runtime are authoritative. Do not encode a machine-wide assumption that one named alias always
-exists or that the most expensive tier is required for every review.
+`SONNET`/`FABLE` siblings): `opus` -> `claude-opus-5-5`, `sonnet` -> `claude-sonnet-5-5`,
+`fable` -> `claude-fable-5-1`. Raise a pin only when every Claude Code that runs here accepts the
+new model — `claude-opus-5-5` needs 2.1.280, and an older build answers every `opus` lane with
+400 — and raise `minimumVersion` with it: it keeps the standalone CLI's updater from installing
+anything older, and stands at 2.1.286, the build verified on both machines.
+
+Every profile that names an alias follows the pins, plugin agents included: half of the 22
+plugin profiles declare `model: opus`, so one of those launched without `model` runs Opus 5.5 —
+an omission is a cost error (`subagent-delegation`). In general, the exact aliases available to the current
+Claude Code runtime are authoritative. Do not encode a machine-wide assumption that one named
+alias always exists or that the most expensive tier is required for every review.
 
 ## Rules
 

@@ -4983,6 +4983,250 @@ def age_marker(sid, seconds):
     return data
 
 
+# --- a small edit owes no simplify lane; whatever the gate cannot count keeps the lane owed
+APP_LINES = "".join("line_{} = {}\n".format(index, index) for index in range(1, 9))
+
+
+def rewrite_app(repo, old, new, replace_all=False, relative="src/app.py"):
+    """Change a file the way an Edit with these strings would, with no hook involved."""
+    target = os.path.join(repo, *relative.split("/"))
+    with open(target, encoding="utf-8") as stream:
+        text = stream.read()
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write(text.replace(old, new) if replace_all else text.replace(old, new, 1))
+    return target
+
+
+def mark_string_edit(sid, repo, old, new, tool="Edit", replace_all=False, relative="src/app.py"):
+    """An Edit reported with the strings the harness delivers, the file changed to match."""
+    target = rewrite_app(repo, old, new, replace_all, relative)
+    tool_input = {"file_path": target, "old_string": old, "new_string": new}
+    if replace_all:
+        tool_input["replace_all"] = True
+    return run(MARK_HOOK, {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": tool,
+                           "cwd": repo, "tool_input": tool_input})
+
+
+def hook_context(result):
+    """The note a hook added to the model's context, or an empty string."""
+    return (result.get("hookSpecificOutput") or {}).get("additionalContext", "")
+
+
+def edited_lines(sid):
+    return cwg.read_json(gate_paths(sid)[0]).get("edited_lines")
+
+
+def standard_stop_without_simplify(sid, label):
+    """The Stop hook's answer to a STANDARD receipt backed by the skill alone, no simplify lane."""
+    opened = age_marker(sid, 600)["first_ts"]
+    transcript = write_transcript([skill_use(opened + 1, "development-verification", label)])
+    try:
+        return run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                               "last_assistant_message": "[gate] verified: STANDARD; checks passed"})
+    finally:
+        cwg.remove(transcript)
+
+
+def counted(old, new, tool="Edit", **extra):
+    return mark.edit_size({"tool_name": tool, "tool_input": dict(old_string=old, new_string=new, **extra)})
+
+
+check("an Edit counts the lines it changed, not the context around them",
+      counted("a = 1\nb = 2\nc = 3\n", "a = 1\nb = 20\nc = 3\n") == 1)
+check("an Edit that adds lines counts each added line", counted("a = 1\n", "a = 1\nb = 2\nc = 3\n") == 2)
+check("two changes inside one Edit count separately",
+      counted("a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 30\n") == 2)
+check("a line ending changed is a changed line", counted("a = 1\r\nb = 2\r\n", "a = 1\nb = 2\n") == 2)
+check("an Edit too long to diff cheaply counts past the limit",
+      counted("".join("x\n" for _ in range(mark.EDIT_DIFF_LINE_LIMIT + 1)),
+              "".join("y\n" for _ in range(mark.EDIT_DIFF_LINE_LIMIT + 1))) > cwg.SMALL_EDIT_LINES)
+check("replace_all, Write and NotebookEdit cannot be counted",
+      [counted("a", "b", replace_all=True), counted("a", "b", tool="Write"), counted("a", "b", tool="NotebookEdit")]
+      == [None, None, None])
+check("a STANDARD candidate owes the simplify lane unless it is small",
+      gate.simplify_missing("STANDARD", {}) == [gate.SIMPLIFY_LANE]
+      and gate.simplify_missing("STANDARD", {}, small=True) == [])
+check("a small edit still owes every HIGH lens",
+      gate.simplify_missing("HIGH", {}, small=True) == list(gate.SIMPLIFY_LENSES))
+check("small_edit needs a counted size within the limit",
+      [cwg.small_edit({"edited_lines": lines})
+       for lines in (1, cwg.SMALL_EDIT_LINES, cwg.SMALL_EDIT_LINES + 1, 0, None, True)]
+      + [cwg.small_edit({})] == [True, True, False, False, False, False, False])
+
+with tempfile.TemporaryDirectory(prefix="cwg_small_edit_") as repo:
+    candidate_repo(repo, "small-edit")
+    os.makedirs(os.path.join(repo, "src", "auth"))
+    for relative in ("src/app.py", "src/auth/session.py"):
+        with open(os.path.join(repo, *relative.split("/")), "w", encoding="utf-8") as stream:
+            stream.write(APP_LINES)
+    commit_paths(repo, "src", "app")
+
+    def restore_app():
+        subprocess.run(["git", "-C", repo, "checkout", "--quiet", "--", "src"], check=True)
+
+    sid = session()
+    try:
+        opened = mark_string_edit(sid, repo, "line_2 = 2\nline_3 = 3\nline_4 = 4\n",
+                                  "line_2 = 2\nline_3 = 30\nline_4 = 4\n")
+        check("a one-line Edit records one changed line", edited_lines(sid) == 1, edited_lines(sid))
+        check("the opening note says a small edit owes no simplify lane",
+              "path floor STANDARD" in hook_context(opened)
+              and "owes no {} lane".format(gate.SIMPLIFY_LANE) in hook_context(opened), opened)
+        mark_shell(sid, repo, "git commit -am small", action=lambda: commit_paths(repo, "src/app.py", "small"))
+        check("committing a small edit keeps it small", edited_lines(sid) == 1, edited_lines(sid))
+        result = standard_stop_without_simplify(sid, "small-dev")
+        check("a small STANDARD edit closes without a simplify lane",
+              result.get("continue") is True and "decision" not in result, result)
+    finally:
+        cleanup(sid)
+        subprocess.run(["git", "-C", repo, "reset", "--quiet", "--hard", "HEAD~1"], check=True)
+
+    sid = session()
+    try:
+        mark_string_edit(sid, repo, "line_2 = 2\n", "line_2 = 20\n")
+        grown = mark_string_edit(sid, repo, "line_5 = 5\nline_6 = 6\nline_7 = 7\n",
+                                 "line_5 = 50\nline_6 = 60\nline_7 = 70\n")
+        check("growing past the limit is announced with the lane it now owes",
+              "grew past a small edit" in hook_context(grown)
+              and "one foreground {} result".format(gate.SIMPLIFY_LANE) in hook_context(grown), grown)
+        result = standard_stop_without_simplify(sid, "grown-dev")
+        check("an edit grown past the limit owes the simplify lane again",
+              result.get("decision") == "block"
+              and "simplify lenses have no foreground result" in result.get("reason", ""), result)
+    finally:
+        cleanup(sid)
+        restore_app()
+
+    # Each starts from a counted one-line Edit, so the field is shown live before it is lost.
+    for label, step in (
+        ("replace_all", lambda sid: mark_string_edit(sid, repo, "= 5", "= 50", replace_all=True)),
+        ("a Write", lambda sid: mark_string_edit(sid, repo, "line_5 = 5\n", "line_5 = 50\n", tool="Write")),
+        ("a shell rewrite", lambda sid: mark_shell(
+            sid, repo, "python rewrite.py", action=lambda: rewrite_app(repo, "line_8 = 8\n", "line_8 = 80\n"))),
+    ):
+        sid = session()
+        try:
+            mark_string_edit(sid, repo, "line_1 = 1\n", "line_1 = 10\n")
+            check("before {} the edit is counted".format(label), edited_lines(sid) == 1, edited_lines(sid))
+            step(sid)
+            check("{} leaves the size unmeasured".format(label), edited_lines(sid) is None, edited_lines(sid))
+            result = standard_stop_without_simplify(sid, "unmeasured-dev")
+            check("{} keeps the simplify lane owed".format(label), result.get("decision") == "block", result)
+        finally:
+            cleanup(sid)
+            restore_app()
+
+    sid = session()
+    try:
+        rewrite_app(repo, "line_6 = 6\n", "line_6 = 60\nline_6b = 61\nline_6c = 62\n")
+        mark_shell(sid, repo, "git commit -am dirty", action=lambda: commit_paths(repo, "src/app.py", "dirty"))
+        check("a commit of a tree the cycle never counted is not counted as nothing",
+              edited_lines(sid) is None, edited_lines(sid))
+        mark_string_edit(sid, repo, "line_1 = 1\n", "line_1 = 10\n")
+        result = standard_stop_without_simplify(sid, "dirty-dev")
+        check("so a one-line Edit after it still owes the simplify lane", result.get("decision") == "block", result)
+    finally:
+        cleanup(sid)
+        subprocess.run(["git", "-C", repo, "reset", "--quiet", "--hard", "HEAD~1"], check=True)
+
+    # Counted small, but the bytes on disk say more: each is held to the lane, and the block says why.
+    base = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    info = os.path.join(repo, ".git", "info")
+    os.makedirs(info, exist_ok=True)
+
+    def git(*arguments):
+        subprocess.run(["git", "-C", repo] + list(arguments), check=True)
+
+    def leave_dirty():
+        rewrite_app(repo, "line_6 = 6\n", "line_6 = 60\nline_6b = 61\nline_6c = 62\n")
+
+    def commit_all(sid):
+        mark_shell(sid, repo, "git commit -am both", action=lambda: commit_paths(repo, "src/app.py", "both"))
+
+    def rewrite_unmeasured(sid=None):
+        rewrite_app(repo, "line_5 = 5\nline_6 = 6\nline_7 = 7\n", "line_5 = 50\nline_6 = 60\nline_7 = 70\n")
+
+    def add_loose():
+        shutil.copy(os.path.join(repo, "src", "app.py"), os.path.join(repo, "src", "loose.py"))
+
+    def add_ignored():
+        with open(os.path.join(info, "exclude"), "w", encoding="utf-8") as stream:
+            stream.write("src/ignored.py\n")
+        shutil.copy(os.path.join(repo, "src", "app.py"), os.path.join(repo, "src", "ignored.py"))
+
+    def hide_from_index():
+        git("update-index", "--assume-unchanged", "src/app.py")
+        rewrite_unmeasured()
+
+    def hide_from_diff():
+        with open(os.path.join(info, "attributes"), "w", encoding="utf-8") as stream:
+            stream.write("*.py diff=hide\n")
+        git("config", "diff.hide.textconv", "true")
+        rewrite_unmeasured()
+
+    def restore_state():
+        git("update-index", "--no-assume-unchanged", "src/app.py")
+        subprocess.run(["git", "-C", repo, "config", "--unset", "diff.hide.textconv"], check=False)
+        for name in ("exclude", "attributes"):
+            cwg.remove(os.path.join(info, name))
+        git("reset", "--quiet", "--hard", base)
+        git("clean", "--quiet", "-fdx", "src")
+
+    cases = [
+        ("a file left dirty before the cycle, committed with the edit", leave_dirty, commit_all,
+         "src/app.py", "4 lines differ"),
+        ("a large rewrite no hook measured", None, rewrite_unmeasured, "src/app.py", "4 lines differ"),
+        ("an edit to a file git does not track", add_loose, None, "src/loose.py", "not a regular file"),
+        ("an edit to an ignored file", add_ignored, None, "src/ignored.py", "not a regular file"),
+        ("a rewrite assume-unchanged hides from git", hide_from_index, None, "src/app.py", "4 lines differ"),
+        ("a rewrite a textconv filter hides from git diff", hide_from_diff, None, "src/app.py", "4 lines differ"),
+    ]
+    outside = os.path.join(os.path.dirname(repo), os.path.basename(repo) + "_outside.py")
+    with open(outside, "w", encoding="utf-8") as stream:
+        stream.write(APP_LINES)
+    try:
+        os.symlink(outside, os.path.join(repo, "src", "probe_link.py"))
+        os.remove(os.path.join(repo, "src", "probe_link.py"))
+    except OSError:
+        print("note: this machine cannot create symlinks; the link case is covered where it can")
+    else:
+        def link_tracked_file():
+            # The commit holds a regular src/app.py; on disk it becomes a link to a file elsewhere.
+            os.remove(os.path.join(repo, "src", "app.py"))
+            os.symlink(outside, os.path.join(repo, "src", "app.py"))
+        cases.append(("an edit through a link", link_tracked_file, None, "src/app.py", "reached through a link"))
+
+    for label, before, after, relative, reason in cases:
+        sid = session()
+        try:
+            if before:
+                before()
+            mark_string_edit(sid, repo, "line_1 = 1\n", "line_1 = 10\n", relative=relative)
+            check("{}: the edit itself is counted small".format(label), edited_lines(sid) == 1, edited_lines(sid))
+            if after:
+                after(sid)
+            result = standard_stop_without_simplify(sid, "disk-dev")
+            check("{}: the simplify lane stays owed".format(label),
+                  result.get("decision") == "block" and reason in result.get("reason", ""), result)
+        finally:
+            cleanup(sid)
+            restore_state()
+    cwg.remove(outside)
+
+    sid = session()
+    try:
+        high = mark_string_edit(sid, repo, "line_1 = 1\n", "line_1 = 10\n", relative="src/auth/session.py")
+        grown = mark_string_edit(sid, repo, "line_5 = 5\nline_6 = 6\nline_7 = 7\n",
+                                 "line_5 = 50\nline_6 = 60\nline_7 = 70\n", relative="src/auth/session.py")
+        check("a HIGH candidate's note never offers the small-edit exemption",
+              "path floor HIGH" in hook_context(high) and "owes no" not in hook_context(high), high)
+        check("and growing past the limit changes nothing to announce", hook_context(grown) == "", grown)
+    finally:
+        cleanup(sid)
+        restore_app()
+
+
 with tempfile.TemporaryDirectory(prefix="cwg_candidate_identity_") as repo:
     candidate_repo(repo, "candidate-one")
 
@@ -9745,6 +9989,18 @@ for command, expected in (
     ('NLM=~/.local/bin/nlm-memory.cmd | $NLM remember', False),
     ('$NLM remember', False),
     ('nlm-memory remember --summary x (y)', False),
+    ('jev find "where uploads retry" internal/', True),
+    ('cd C:/x && jev find "the code that rotates photos" . 2>&1 | head -20', True),
+    ('jev ask "does it retry on failure?" a.go b.go -q', True),
+    ('jev index .', True),
+    ('jev scan /home/in/workspace/charon', True),
+    ('jev gain', True),
+    ('jev lint edit', True),
+    ('jev probe', True),
+    ('jev version', True),
+    ('jev find "x" . && rm notes.txt', False),
+    ('jev hook nudge', False),
+    ('jev', False),
     ('python "C:/Users/in/.claude/hooks/gate_inbox.py" ack abcd --note "x (y)"', True),
     ('python "C:/Users/in/.claude/hooks/chip_handoff.py" open --title x', False),
     ('cd "C:/x" && python "C:/Users/in/.claude/hooks/chip_handoff.py" finish --chip c1 --message "done (all); ok"', True),

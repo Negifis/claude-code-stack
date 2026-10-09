@@ -1,6 +1,6 @@
 ---
 name: chip-handoff
-description: Give a spawn_task chip a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification, then merge, accept and archive without asking the user, or send back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
+description: For work outside the current task's scope (in-scope follow-ups go to a subagent). Give a spawn_task chip a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification, then merge, accept and archive without asking the user, or send back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
 disable-model-invocation: false
 ---
 
@@ -14,6 +14,10 @@ about.
 
 `hooks/chip_handoff.py` closes both ends. Use it for every chip, and let its own output tell
 you the next command; the paths below are the shape, not something to retype from memory.
+
+A chip is for work outside the current task's scope. Follow-up work inside the scope goes to a
+subagent (`development-verification` §4 defines the scope); neither kind is dropped as "not
+mine".
 
 ## Spawning one
 

@@ -34,11 +34,9 @@ report. The main agent owns the edits and the proof of behavior equivalence.
 ## Operating rules
 
 <!-- jev-stage:start -->
-This role is read-only or restricts writes/network. Do not invoke Jev or its CLI: they
-write local snapshots/cache/budget and call an external API. Eligible preprocessing
-belongs to the parent using its allowed interface. Inspect provided judgments against
-intact exact sources; retain complete required review/check coverage. Never relax this
-role's permissions to obtain a judgment. Shared policy: the `jev-workflow` skill.
+This role has no shell, so it does not run Jev itself. Jev results the parent puts in the
+packet (files from `jev find`, judgments from the `jev-workflow` skill) are leads: check them
+against the exact source.
 <!-- jev-stage:end -->
 
 

@@ -29,9 +29,15 @@ the `jev-workflow` skill before making that comparison yourself.
 Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
 `stage.py` CLI; then apply IDs and inspect disputed sources.
 Exact/formal decisions and final validation stay native; preserve required checks,
-permission boundaries and confidential data. If this role cannot use an allowed interface,
+permission boundaries and secrets. If this role cannot use an allowed interface,
 continue natively with intact sources and report the concrete limitation.
 <!-- jev-stage:end -->
+
+<!-- jev-search:start -->
+Behaviour described in words — where X happens, which files do Y — is `jev find "<what the
+code does>" <dir>`, run first. The graph tools below answer structure: callers, call chains,
+dependencies and the impact of a symbol you can name; exact strings stay with Grep.
+<!-- jev-search:end -->
 
 
 
