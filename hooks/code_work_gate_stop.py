@@ -125,6 +125,9 @@ TERMINAL_RE = re.compile(
 # Wall-clock budget for the git calls that decide whether a repository is back where the
 # candidate opened: the Stop hook has a twenty-second window of its own.
 RESTORE_BUDGET = 4.0
+# The same window bounds the two git calls that confirm a small edit on disk (`small_edit_blocker`).
+SMALL_DIFF_BUDGET = 2.0
+REGULAR_FILE_MODES = (b"100644", b"100755")
 ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
 VERIFIED_REASON_RE = re.compile(r"^({})\s*;\s*\S".format("|".join(RISK_ORDER)), re.IGNORECASE)
 OPERATIONAL_RECEIPTS = {"operational", "no-change"}
@@ -2338,11 +2341,78 @@ def round_verdicts(reviews):
     return read
 
 
-def simplify_missing(risk, state):
+def small_edit_blocker(entry):
+    """Why a candidate the marker counted as a small edit (`cwg.small_edit`) is not one on disk, or
+    None when it is.
+
+    Every lasting file must be a regular file of the commit the candidate opened on, in that one
+    repository, reached without a link, and the bytes on disk must differ from that commit's blob in
+    at most `SMALL_EDIT_LINES` lines, counted as an Edit is (`mark.changed_lines`; line endings do
+    not count, so a checkout's CRLF is no change). That catches what the Edit count cannot see:
+    bytes no hook measured, a file the user had already left dirty, a commit that took either along.
+    The bytes are compared here rather than through `git diff`, which answers for the index —
+    `assume-unchanged`, an ignored file and a `textconv` filter all hide bytes from it.
+    """
+    import code_work_gate_mark as mark
+    root = cwg.identity_root(entry.get("identity")).rstrip("/")
+    start = entry.get("head_at_start")
+    if not root or not isinstance(start, str) or not start or entry.get("path_overflow"):
+        return "the marker records no repository and commit it opened on"
+    paths, cache = cwg.durable_paths(marker_paths(entry)), {}
+    if not paths or any(mark.repository_root(path, cache) != root for path in paths):
+        return "a lasting file lies outside {}".format(root)
+    # The names the commit holds, spelled as the disk spells them where marker paths fold case. A
+    # link on the way leads to bytes the commit does not hold under that name.
+    real_root = os.path.realpath(root)
+    files = {}
+    for path in paths:
+        real = os.path.realpath(path)
+        if cwg.normalize_path(real) != path or not real.startswith(real_root + os.sep):
+            return "a lasting file is reached through a link"
+        files[real[len(real_root) + 1:].replace(os.sep, "/")] = real
+    deadline = time.monotonic() + SMALL_DIFF_BUDGET
+    listing = cwg.git_bytes(root, ["ls-tree", "-r", "-z", start, "--"] + list(files), SMALL_DIFF_BUDGET)
+    if listing is None:
+        return "git did not answer inside the hook's budget"
+    blobs = {}
+    for record in listing.split(b"\0"):
+        meta, _, name = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if len(fields) == 3 and fields[0] in REGULAR_FILE_MODES:
+            blobs[name.decode("utf-8", "surrogateescape")] = fields[2]
+    if any(name not in blobs for name in files):
+        return "a lasting file is not a regular file of the commit the candidate opened on"
+    contents = cwg.git_bytes(root, ["cat-file", "--batch"], max(deadline - time.monotonic(), 0.25),
+                             stdin=b"".join(blobs[name] + b"\n" for name in files))
+    if contents is None:
+        return "git did not answer inside the hook's budget"
+    lines, offset = 0, 0
+    for real in files.values():
+        newline = contents.find(b"\n", offset)
+        header = contents[offset:newline].split(b" ")
+        if newline < 0 or len(header) != 3 or not header[2].isdigit():
+            return "git did not answer inside the hook's budget"
+        size = int(header[2])
+        before, offset = contents[newline + 1:newline + 1 + size], newline + 1 + size + 1
+        try:
+            with open(real, "rb") as stream:
+                after = stream.read()
+        except OSError:
+            return "a lasting file cannot be read"
+        if b"\0" in before or b"\0" in after:
+            return "a lasting file is binary"
+        lines += mark.changed_lines(before.splitlines(), after.splitlines())
+    if lines > cwg.SMALL_EDIT_LINES:
+        return "{} lines differ from the commit the candidate opened on".format(lines)
+    return None
+
+
+def simplify_missing(risk, state, small=False):
     """The simplify lanes this risk still needs a current foreground result from.
 
     A lens's XHIGH run is the same concern on a stronger model, so it stands in for that lens at
-    HIGH and in the STANDARD trio; a HIGH lens never stands in for an XHIGH one.
+    HIGH and in the STANDARD trio; a HIGH lens never stands in for an XHIGH one. A `small`
+    STANDARD candidate (`cwg.small_edit`) needs none.
     """
     def current(lane):
         return state.get(lane) == "current"
@@ -2354,7 +2424,7 @@ def simplify_missing(risk, state):
     if risk == "HIGH":
         return uncovered
     if risk == "STANDARD":
-        return [] if current(SIMPLIFY_LANE) or not uncovered else [SIMPLIFY_LANE]
+        return [] if small or current(SIMPLIFY_LANE) or not uncovered else [SIMPLIFY_LANE]
     return []
 
 
@@ -2489,7 +2559,13 @@ def evaluate_receipt(receipt, entry, evidence):
             simplify_state[reviewer] = "exhausted"
         elif retries:
             simplify_state[reviewer] = "failed"
-    missing_simplify = simplify_missing(effective_risk, simplify_state)
+    # Counted small by the marker and confirmed on disk; git is asked only when it would matter.
+    small_blocker = None
+    small = effective_risk == "STANDARD" and cwg.small_edit(entry)
+    if small:
+        small_blocker = small_edit_blocker(entry)
+        small = small_blocker is None
+    missing_simplify = simplify_missing(effective_risk, simplify_state, small)
     simplify_unavailable = False
     if missing_simplify:
         if kind == "draft-blocked" and any(
@@ -2497,7 +2573,8 @@ def evaluate_receipt(receipt, entry, evidence):
         ):
             simplify_unavailable = True
         else:
-            return False, simplify_block(effective_risk, missing_simplify, simplify_state)
+            return False, simplify_block(effective_risk, missing_simplify, simplify_state) + (
+                "; the small-edit exemption does not hold: {}".format(small_blocker) if small_blocker else "")
 
     ordinary_ts, ordinary_verdict = latest(ordinary_reviews)
     closure_ts, closure_verdict = latest(closure_reviews)
@@ -2855,7 +2932,8 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "Satisfy the observable evidence contract. development-verification must have been "
             "invoked once in this session, plus honest candidate-bound checks. Simplify evidence "
             "is a foreground lane result for this candidate: a STANDARD candidate needs one "
-            "{lane} result, a HIGH candidate one result from each of the three lenses "
+            "{lane} result unless it is {small}, a HIGH candidate one result from each of the "
+            "three lenses "
             "({lenses}), launched together. The lane results are the evidence, in whatever order "
             "they ran, so do not re-run a completed pass to satisfy this; two failed attempts of "
             "a required lane end draft-blocked. HIGH "
@@ -2868,7 +2946,7 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
             "APPROVED from {xreviewer} or from a Codex round on {xmodel} at {xeffort} effort. "
             "ESCALATE is not terminal: continue through at most two closure validations to READY "
             "or BLOCKED."
-        ).format(lane=SIMPLIFY_LANE, lenses=", ".join(SIMPLIFY_LENSES),
+        ).format(lane=SIMPLIFY_LANE, small=cwg.SMALL_EDIT_RULE, lenses=", ".join(SIMPLIFY_LENSES),
                  xlenses=", ".join(XHIGH_LENSES), xreviewer=cwg.XHIGH_REVIEWER,
                  xmodel=cwg.XHIGH_CODEX_MODEL, xeffort=cwg.XHIGH_CODEX_EFFORT)
     inbox = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate_inbox.py")

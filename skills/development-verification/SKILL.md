@@ -80,8 +80,10 @@ check that nothing made in it survives on its branch before closing the undo.
   effect, or a local reversible configuration edit with no runtime/public-contract change.
   Run the relevant deterministic check. No independent review.
 - **STANDARD** — a bounded logic or user-visible change with limited blast radius. Run
-  affected tests and static checks and one `simplify-reviewer` lane. Add independent review
-  only for a concrete complexity, uncertainty, or integration risk.
+  affected tests and static checks and one `simplify-reviewer` lane; a small edit — at most
+  three changed lines in all, every one made with Edit, in files git tracks, and git showing no
+  more than that since the candidate opened — needs no lane, the main agent's own look covers
+  it. Add independent review only for a concrete complexity, uncertainty, or integration risk.
 - **HIGH** — security, auth and permissions short of critical, data/schema/migrations,
   concurrency/distributed state, public contracts, production/release, irreversible effects,
   or a broad cross-component diff. Run affected checks, one broad final check when warranted,
@@ -121,6 +123,14 @@ so the receipt shape is never a surprise.
 
 ## 4. Verify the candidate
 
+<!-- jev-search:start -->
+Finding affected code, callers or tests: unless you already have the exact file or symbol, start with
+`jev find "<what the code does>" <dir>` rather than a grep over several guessed names (`a\|b\|c`).
+To check one property across files without reading them all, use
+`jev ask "<yes/no question>" <files> -q`. Open what Jev cites with an explicit range; where `jev`
+is not on PATH, use Grep and Glob.
+<!-- jev-search:end -->
+
 - Bind evidence to the exact candidate diff/revision and the relevant configuration,
   dependency, environment, and artifact inputs.
 - Run narrow checks first. After a remediation, rerun only checks whose covered code or inputs
@@ -131,14 +141,20 @@ so the receipt shape is never a surprise.
   failures included. One the candidate caused, or one inside its scope, is fixed in the
   candidate at its root (`root-cause-engineering`), never by fitting the test or the rule to
   the code.
-- A pre-existing or out-of-scope failure is not ignored; it is handed off for a fix of its own:
-  to a `spawn_task` chip (`chip-handoff`) by default, or to a subagent working in its own
-  worktree when the fix is small, disjoint from the candidate and needed before this task ends.
-  Either way the fix stays a separate change, never mixed into the candidate's diff. One
-  handoff per root cause, carrying the exact command, the failing output and the evidence that
-  the failure is not the candidate's: the same check failing the same way on the base revision,
-  where only the failing cases need to run. The final answer names each failure and where it
-  went.
+- A pre-existing failure, or any other follow-up the work turns up, is never dropped as "not
+  mine"; it is handed off for a fix of its own. The task's scope is the work the user's request
+  covers: its goal and the files and systems it authorizes touching. Inside it, whatever its
+  size, the follow-up goes to a subagent — a required handoff, not the optional delegation
+  `subagent-delegation` weighs — in its own worktree (`isolation: "worktree"`) when the
+  directory is a git repository, otherwise as the only writer of the files it touches; what it
+  turns up comes back to the parent under this same rule. Outside the scope it goes to a
+  `spawn_task` chip (`chip-handoff`). Either way the fix stays a separate change, never mixed
+  into the candidate's diff, and the parent verifies the result itself. One handoff per root
+  cause. A failing check's handoff carries the exact command, the failing output and
+  the evidence that the failure is not the candidate's: the same check failing the same way on
+  the base revision, where only the failing cases need to run. Any other follow-up's handoff
+  carries why it is needed, its scope and what done looks like. The final answer names each
+  follow-up and where it went.
 - A disabled check is a hidden failure: a skip, xfail or focus marker, a suppression comment
   (`eslint-disable`, `# noqa`, `# type: ignore`, `@ts-ignore`), a rule or path excluded in a
   linter or type-checker configuration, a CI job allowed to fail, a bypassed hook
@@ -163,7 +179,7 @@ required for STANDARD, HIGH and XHIGH and optional for LOW (a local pass for a c
 reuse, control-flow, type/error, resource, or efficiency concern).
 
 - **STANDARD** — exactly one foreground `simplify-reviewer` lane (`run_in_background: false`)
-  covering reuse, quality and efficiency in one report.
+  covering reuse, quality and efficiency in one report; none for a small edit (section 3).
 - **HIGH** — the three lenses as separate foreground lanes, launched together in one message:
   `simplify-reuse-reviewer`, `simplify-quality-reviewer` and `simplify-efficiency-reviewer`,
   each on the same bounded scope. All three results are required; a lone `simplify-reviewer`
@@ -219,7 +235,8 @@ one. A later round may continue the same native reviewer
 with `SendMessage`: its verdict is read from that round's completion notification and filed at
 the `SendMessage`. One ledger and one round budget span the lanes: switching engines continues
 the review, never restarts it. Add at most one specialist only for a named non-overlapping
-risk; the lane that owns the verdict keeps it.
+risk (`subagent-delegation`); the lane that owns the verdict keeps it. No plugin agent or
+command stands in for the simplify pass or the review lane, or adds a review of its own.
 
 Obtain the verdict as the last step. Editing a lasting artifact after an approval invalidates
 it and costs another round (a delta round on the interdiff, not a new round 1 of the whole
@@ -374,6 +391,22 @@ three times per unchanged candidate; the receipt records evidence and never subs
 running the work.
 
 ## 10. When the hook is wrong
+
+<!-- jev-stage:start -->
+At diagnostics, context selection or selection among genuinely ambiguous checks/tools, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and secrets. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
 
 The Stop hook is right by default: a missing or misplaced receipt, a `REVISE`, an edit after the
 approval, a lane launched in the wrong mode are your mistakes, not the hook's. An anomaly is a

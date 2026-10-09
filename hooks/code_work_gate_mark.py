@@ -14,6 +14,7 @@ stale — a candidate abandoned without a terminal receipt must not spend the ne
 budgets.
 Fail-open: any error returns continue=true.
 """
+import difflib
 import json
 import hashlib
 import glob
@@ -183,6 +184,11 @@ GLAB_READ_RE = re.compile(
 # `rollback` restores files to paths a manifest names, `init`/`migrate`/`sync` reach into projects.
 BOOKKEEPING_COMMANDS = {
     "nlm-memory": frozenset(("recall", "remember", "stats", "doctor", "status", "maintain")),
+    # jev (code search by meaning) reads files and keeps its index, hook state and usage log
+    # only outside git working trees, refusing a state file that is a link or that lies in one
+    # as written or resolved, whatever JEV_DATA or XDG_CACHE_HOME say (jev internal/statedir).
+    # Agents run `jev find` before grep; `hook` is the plugin's entry point and stays write-capable.
+    "jev": frozenset(("find", "ask", "scan", "gain", "index", "lint", "probe", "version")),
 }
 # Scripts that write only their own state — the hooks' and the memory bridge — by subcommand (None: all).
 # `chip_handoff finish` merges in a scratch worktree under `state/chips` and moves only a branch no
@@ -2385,6 +2391,7 @@ def cycle_start(marker, now, identity, incoming):
         "refs_at_start": None,
         "opened_at": None,
         "displaced": None,
+        "edited_lines": 0,
     }
     existing = cwg.read_json(marker)
     if existing:
@@ -2428,6 +2435,8 @@ def cycle_start(marker, now, identity, incoming):
             "refs_at_start": existing.get("refs_at_start"),
             "opened_at": existing.get("opened_at"),
             "displaced": existing.get("displaced"),
+            # A marker written before the count existed leaves it unmeasured, never small.
+            "edited_lines": existing.get("edited_lines"),
         }
     if os.path.exists(marker):
         try:
@@ -2598,6 +2607,12 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         or (expired and cwg.durable_paths(paths))
         else cycle["last_durable_ts"]
     )
+    # The size of the candidate's lasting change, for the small-edit exemption (`cwg.small_edit`).
+    edited_lines = cycle["edited_lines"]
+    if last_durable_ts == now:
+        size = lasting_size(data, incoming, rewrote, content_paths, unattributed_risk, expired)
+        total = cwg.edited_line_count(cycle)
+        edited_lines = total + size if total is not None and size is not None else None
     content_marks = cycle.get("content_marks") or []
     # The candidate's own files a clean upstream merge changed. When that merge is all this command
     # changed in them, the mark it leaves names the content it replaced, whatever else the command
@@ -2696,7 +2711,59 @@ def record_paths(data, candidate_paths, unresolved=False, snapshot_roots=(),
         "refs_at_start": cycle.get("refs_at_start"),
         "opened_at": cycle.get("opened_at"),
         "displaced": cycle.get("displaced"),
+        "edited_lines": edited_lines,
     })
+
+
+def lasting_size(data, incoming, rewrote, content_paths, unattributed_risk, expired):
+    """The changed lines a call that changed something lasting adds to the candidate's count, or
+    None when it cannot be counted.
+
+    Only an Edit is counted. A shell command adds nothing when all it did to lasting files was stage
+    or commit ones this cycle already counted; one that rewrote lasting bytes, whose writes nobody
+    could see or attribute, or that brought lasting files the cycle never counted (a commit of a
+    tree that was already dirty) cannot be counted.
+    """
+    if str(data.get("tool_name") or "") not in cwg.SHELL_TOOLS:
+        return edit_size(data)
+    if unattributed_risk or expired or cwg.durable_paths(rewrote):
+        return None
+    return 0 if all(path in content_paths for path in cwg.durable_paths(incoming)) else None
+
+
+# Past this many lines left once the shared ends are trimmed, the count is far beyond the small-edit
+# limit, so it is not refined with difflib, which is quadratic on repetitive text.
+EDIT_DIFF_LINE_LIMIT = 400
+
+
+def edit_size(data):
+    """The lines an Edit call changed, or None for a call the gate cannot count: Write and
+    NotebookEdit rewrite a whole file, and `replace_all` changes an unknown number of places.
+    Line endings count, so a CRLF line turned LF is a changed line."""
+    tool_input = data.get("tool_input") or {}
+    old, new = tool_input.get("old_string"), tool_input.get("new_string")
+    if (str(data.get("tool_name") or "") != "Edit" or tool_input.get("replace_all")
+            or not isinstance(old, str) or not isinstance(new, str)):
+        return None
+    return changed_lines(old.splitlines(keepends=True), new.splitlines(keepends=True))
+
+
+def changed_lines(before, after):
+    """How many lines differ between two lists of lines: each block of old lines replaced by new
+    ones counts as the longer of the two. The Stop hook counts a candidate on disk the same way."""
+    # Shared lines at either end — the context an Edit carries to be unique — are not change.
+    shared = min(len(before), len(after))
+    start = 0
+    while start < shared and before[start] == after[start]:
+        start += 1
+    end = 0
+    while end < shared - start and before[-1 - end] == after[-1 - end]:
+        end += 1
+    before, after = before[start:len(before) - end], after[start:len(after) - end]
+    if max(len(before), len(after)) > EDIT_DIFF_LINE_LIMIT:
+        return max(len(before), len(after))
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal")
 
 
 def codex_launch(command):
@@ -3204,8 +3271,8 @@ def candidate_note(before, after):
     if new is None:
         return None
     if old is not None and old["first_ts"] == new["first_ts"] and (
-        old["persistent"], old["floor"]
-    ) == (new["persistent"], new["floor"]):
+        old["persistent"], old["floor"], old["small"]
+    ) == (new["persistent"], new["floor"], new["small"]):
         return None
     if not new["persistent"]:
         return (
@@ -3228,9 +3295,10 @@ def candidate_note(before, after):
         "it with `[gate] verified: {}; <candidate and decisive checks>` as the last line "
         "(pr-ready/draft-blocked only after autonomous closure).{}"
     ).format(
-        "opened" if opened else "floor raised",
+        "opened" if opened else "floor raised" if old["floor"] != new["floor"]
+        else "grew past a small edit" if old["small"] else "is a small edit",
         new["floor"], files, "" if files == 1 else "s", shown,
-        cwg.receipt_requirements(new["floor"]), new["floor"],
+        cwg.receipt_requirements(new["floor"], new["small"]), new["floor"],
         displacement_note(before, after),
     )
 

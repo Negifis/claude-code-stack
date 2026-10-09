@@ -3,9 +3,37 @@ name: root-cause-engineering
 description: Before editing on a bug, a failing test, lint or type check, a flaky test, a regression, an unclear failure, a performance problem or a production incident.
 ---
 
+<!-- jev-stage:start -->
+At diagnostics, context selection or selection among genuinely ambiguous checks/tools, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and secrets. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+<!-- jev-search:start -->
+Finding code: unless you already have the exact file or symbol, start with
+`jev find "<what the code does>" <dir>` rather than a grep over several guessed names (`a\|b\|c`).
+To check one property across files without reading them all, use
+`jev ask "<yes/no question>" <files> -q`. Open what Jev cites with an explicit range; where `jev`
+is not on PATH, use Grep and Glob.
+<!-- jev-search:end -->
+
+
+
+
+
+
+
 # Root-Cause Engineering Protocol
 
-For bugs, flaky behavior, broken tests, regressions, unclear failures, or performance issues:
+For bugs, flaky behavior, broken tests, regressions, unclear failures, or performance issues.
+This protocol owns the decisions; stack-specific technique — debuggers, profilers, bisecting,
+instrumentation — is in the `developer-essentials:debugging-strategies` skill, and a failure
+independent of the candidate can go to the debugger lane (`subagent-delegation`) with this
+protocol in its packet.
 
 1. Reproduce or characterize the failure.
    - Capture the exact command, error, observed behavior, and expected behavior.

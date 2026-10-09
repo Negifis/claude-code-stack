@@ -16,7 +16,7 @@ template — it is a stack in daily use on Windows and on a Linux execution VM, 
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2231 gate assertions, 76 continuity checks, 49 guard checks, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2590 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
 | `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
 | `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, and an `Explore` profile that overrides the built-in one |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
@@ -40,9 +40,11 @@ It does **not** perform judgment. It checks a small set of facts that either app
 transcript or don't:
 
 - the `development-verification` skill was invoked once for this session;
-- a standard-risk candidate has one foreground `simplify-reviewer` result, and a high-risk one
-  a foreground result from each of the three lenses (`simplify-reuse-reviewer`,
-  `simplify-quality-reviewer`, `simplify-efficiency-reviewer`);
+- a standard-risk candidate has one foreground `simplify-reviewer` result — unless it is a
+  small edit: at most three changed lines, all made with Edit, which the hook confirms byte for
+  byte against the commit the candidate opened on — and a high-risk one a foreground result from
+  each of the three lenses (`simplify-reuse-reviewer`, `simplify-quality-reviewer`,
+  `simplify-efficiency-reviewer`);
 - for a high-risk candidate, an independent adversarial review produced a verdict, and that
   verdict is *newer* than the last change to a lasting artifact;
 - an XHIGH candidate — a level the `verified` receipt declares, never one a path sets — has
@@ -156,8 +158,9 @@ python hooks/hygiene_hooks_test.py
 
 ## Install
 
-Requires Claude Code ≥ 2.1.246 (the floor for the `Explore` override, `maxTurns` and
-`autoCompactWindow`; the template's `minimumVersion` says the same) and Python 3.11+;
+Requires Claude Code ≥ 2.1.286 (the template pins the `opus` alias to `claude-opus-5-5`, which a
+build older than 2.1.280 answers with 400; 2.1.286 is the build the stack was verified on, and
+`minimumVersion` keeps the updater from going below it) and Python 3.11+;
 `tools/worktree-audit.mjs` needs Node 18+.
 
 ```bash
@@ -195,6 +198,26 @@ python hooks/test_gate.py
 ```bash
 python test_install.py
 ```
+
+### Specialist plugins
+
+The stack's own agents explore and review. Stack work — Rust, Go, Python, TypeScript, React and mobile,
+databases and migrations, Kubernetes, CI/CD, tests, performance, security — goes to the agents of
+ten plugins from [wshobson/agents](https://github.com/wshobson/agents), which the
+`subagent-delegation` skill routes to, with the model to pass for each lane. The merged settings
+declare the marketplace and enable the plugins; installing them takes these two commands:
+
+```bash
+claude plugin marketplace add wshobson/agents
+```
+
+```bash
+for p in developer-essentials debugging-toolkit full-stack-orchestration deployment-validation systems-programming javascript-typescript python-development database-migrations kubernetes-operations frontend-mobile-development; do claude plugin install "$p@claude-code-workflows" --scope user; done
+```
+
+They carry no hooks and no MCP servers and cost about 5k always-on tokens together. Keep only the
+ones for the stacks you use: leave the others out of the loop and set them to `false` in
+`enabledPlugins`. Without a plugin the main agent does that work itself.
 
 ### Optional
 
@@ -235,6 +258,9 @@ Worth knowing before you turn it on:
 - `autoCompactWindow: "300k"` and `skillListingMaxDescChars: 320` ship in the template on
   purpose; the measurements behind them are in `reference/usage-optimization-2026-09.md`.
   Drop them if your sessions are short.
+- `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` and `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`: at most
+  three subagents at once and none of them opens its own. A HIGH candidate's three lenses take
+  all three slots.
 - Exec form needs Claude Code 2.1.139 or later; the template's `minimumVersion` is higher
   anyway. `--merge-settings` recognizes this stack's hooks in either form, so an earlier
   shell-form install is replaced, not registered twice.
@@ -284,6 +310,13 @@ Also left out: the NotebookLM memory bridge and its `nlm-memory` command. `CLAUD
 locally. Neither the bridge nor its reference (`reference/notebooklm-memory.md`) is here, since
 they depend on tooling that isn't published. Without the bridge those steps have nothing to
 call: delete them, or ignore them, if you don't run NotebookLM.
+
+The same holds for Jev. The `jev-workflow` block in `CLAUDE.md` and the `<!-- jev-stage -->`
+blocks in skills, agents, commands and rules send semantic comparisons — ranking, grouping,
+duplicate checks, choosing among candidates — through the `jev-workflow` skill and its
+`mcp__jev-workflow__*` MCP server. Neither is here: both are private tooling. Without them the
+blocks say to continue natively, so a session loses nothing but the delegation; delete the
+blocks if you don't run Jev.
 
 ---
 

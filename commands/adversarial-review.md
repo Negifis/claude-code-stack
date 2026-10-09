@@ -5,6 +5,31 @@ argument-hint: "[--required] [plan|code|file-path] [optional named risk]"
 
 # Codex Adversarial Review
 
+<!-- jev-stage:start -->
+Before preliminary semantic triage of diagnostic events, candidate findings or diff sections, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and secrets. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+<!-- jev-search:start -->
+Finding code: unless you already have the exact file or symbol, start with
+`jev find "<what the code does>" <dir>` rather than a grep over several guessed names (`a\|b\|c`).
+To check one property across files without reading them all, use
+`jev ask "<yes/no question>" <files> -q`. Open what Jev cites with an explicit range; where `jev`
+is not on PATH, use Grep and Glob.
+A reviewer with a shell may use `jev find`, `jev ask` and the `jev-workflow` CLI as well.
+<!-- jev-search:end -->
+
+
+
+
+
+
+
 This is the default review lane. Codex judges the candidate from outside the model that wrote
 it, which is the point of independent review; `/adversarial-review-internal` takes over only
 when Codex cannot deliver a verdict or the user declines it.
@@ -109,7 +134,7 @@ timeout 3600 codex exec --ignore-user-config \
   --disable computer_use --disable browser_use --disable browser_use_external \
   --disable image_generation --disable apps --disable in_app_browser \
   --disable skill_search --disable tool_suggest \
-  -m gpt-6-sol -c model_reasoning_effort=high -c tools.web_search=true \
+  -m gpt-6.1-sol -c model_reasoning_effort=high -c tools.web_search=true \
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
   - < /c/tmp/codex-packet-${REVIEW_ID}.md 2>/c/tmp/codex-${REVIEW_ID}.err  # CODE_WORK_GATE_REVIEW
 ```
@@ -153,7 +178,7 @@ Compare the sets, never the timestamps: those names are truncated to whole secon
 concurrent session can look newer than the round that actually ran. `--last` is only for the
 case where nothing else on the machine could have started a session in between.
 
-The model is `gpt-6-sol` (`gpt-6-astra` on an XHIGH round), which an older CLI refuses with `requires a newer version of Codex`
+The model is `gpt-6.1-sol` (`gpt-6-astra` on an XHIGH round), which an older CLI refuses with `requires a newer version of Codex`
 or, as 0.154.0 did, with `is not supported when using Codex with a ChatGPT account` (the
 verified versions are in `reference/codex-routing.md`). Either refusal is recorded as an
 outage like a usage limit. The fix is `npm install -g @openai/codex@latest` followed by

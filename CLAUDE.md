@@ -30,14 +30,20 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
 - One primary reasoning stream owns the task, integration, verification, and the final
   decision. A subagent is for a bounded independent result — disjoint exploration, genuinely
   parallel work, a specialist check, or the one review lane the gate requires — and its output
-  is evidence, not authority. Ordinary sequential work stays in the main conversation.
+  is evidence, not authority. Ordinary sequential work stays in the main conversation; a
+  follow-up that must stay a separate change goes by the follow-up rule below.
 - Route the lane, not the task: agent profiles already carry a proportionate model and effort;
   pass `model: "sonnet"` to `general-purpose` unless it needs strong reasoning. Reuse an
   existing lane for follow-up; never duplicate a slow one. See `subagent-delegation`.
 - One writer per file or tightly coupled scope. Review lanes are read-only, never delegate,
   and never open their own gate.
-- Every `spawn_task` chip goes through `chip-handoff`; the parent verifies a chip's result
-  itself before closing it.
+- Follow-up work the task turns up is never dropped as "not mine". Inside the task's scope
+  (`development-verification` §4) it goes to a subagent; outside the scope it goes to a
+  `spawn_task` chip through `chip-handoff`. The parent verifies a subagent's or a chip's result
+  itself before relying on it or closing it.
+- Subagents never open subagents, and at most three run at once. Stack specialist lanes are the
+  `claude-code-workflows` plugin agents; `subagent-delegation` names which one and with which
+  model. A plugin agent's "use proactively" does not override these rules.
 
 # Code Work Gate
 
@@ -49,7 +55,7 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
   against a live system) is judged before execution and closes with an operational receipt;
   a step that changed nothing closes as `no-change`.
 - LOW: the relevant deterministic check. STANDARD: affected checks and one `simplify-reviewer`
-  lane. HIGH: affected checks, the three simplify lenses (`simplify-reuse-reviewer`,
+  lane, none for a small edit (`development-verification` §3). HIGH: affected checks, the three simplify lenses (`simplify-reuse-reviewer`,
   `simplify-quality-reviewer`, `simplify-efficiency-reviewer`) launched together, and one
   independent adversarial review — Codex first
   (`/adversarial-review`, after `codex_lane.py check`), the native reviewer when Codex cannot
@@ -96,8 +102,7 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
   explicitly justified.
 - Every failure a check reports — tests, e2e, lint, types, build, any other — is fixed at its
   root, never by fitting the test or the rule to the code; first decide whether the code
-  regressed. A pre-existing or out-of-scope failure goes to a chip or a subagent; none is
-  ignored. Write a test only against behavior verified to work. Never disable a check, and
+  regressed. A pre-existing failure is handed off by the Delegation rule above; none is ignored. Write a test only against behavior verified to work. Never disable a check, and
   re-enable any found disabled — no exceptions. Procedures: `development-verification` §4,
   `root-cause-engineering`, `engineering-workflow`.
 - Keep tool output out of context: tail or grep a log, read a fragment, filter test output to
@@ -129,3 +134,43 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
 - Before changing anything under `~/.claude`, read `~/.claude/reference/environment.md`.
   Deterministic hooks carry objective facts, skills carry judgment; hooks from every active
   scope are additive, so a project hook never duplicates the global gate.
+
+<!-- jev-workflow:start -->
+## Jev — use it first, in every session and every subagent
+
+Jev is allowed in the main session and in every subagent with a shell (Explore and the reviewers
+included); a subagent without one gets Jev results from its parent in the packet. It reads files
+locally through a guard that keeps secrets out. Where `jev` is not on PATH (`command -v jev`
+prints nothing in Bash; `Get-Command jev` errors in PowerShell), find code with Grep and Glob; the
+judging steps below still work.
+
+Finding code:
+- Unless you were already given the exact file or symbol, locate code with
+  `jev find "<what the code does>" <dir or repository>` first: where something happens, which
+  files do X. It ranks files by meaning in a few seconds, across a whole repository too.
+- About to grep for several alternative names (`foo\|bar\|baz`): that is a guess, so run
+  `jev find` instead. On such a grep over a directory the hook may run it for you and add the top
+  files to your context; open them. A silent hook does not mean "no match".
+- One property across 3+ files: `jev ask "<yes/no question>" <files or dir> -q` instead of
+  reading them all.
+- An exact name or path you already have: Grep or Glob.
+- Open what Jev cites with Read and an explicit range; a score is a lead. If Jev finds nothing and
+  a miss would matter, search another way.
+- When delegating, tell an exploration or review subagent to start with `jev find`; for one
+  without a shell, run it yourself and put the files in its packet.
+
+Judging items: classifying or grouping 3+ tasks, review comments, failures, log events or
+records; ranking 3+ documents, fragments, search hits or diff sections; checking possible
+duplicates; choosing among 2+ known skills, tools, checks or values; checking a claim against
+evidence. Run the `jev-workflow` skill for these: load its MCP tools with ToolSearch
+`select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate,mcp__jev-workflow__delegate_artifact`, use `judge` for short candidates
+already in the conversation and `prepare_and_delegate` for files (its `stage.py` CLI when the MCP
+is missing), let it read the set instead of reading it all yourself, then apply the returned IDs
+and check disputed items against the source.
+
+Data: anything from the user's task may be sent (data_class `internal`), logs, client records and
+correspondence included. Only secrets stay out: passwords, tokens, keys, .env and credential
+files. If Jev is unavailable or returns an error, continue with the native tools and the intact
+sources. Jev informs the work; architecture, final validation, command authorization and the
+required checks stay with you.
+<!-- jev-workflow:end -->

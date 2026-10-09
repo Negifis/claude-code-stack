@@ -15,8 +15,9 @@ code that fits the repository. Not fewer lines for their own sake, and not a cer
   work that got harder to reason about.
 - The user asks to simplify or refactor.
 - `development-verification` requires it: a STANDARD persistent candidate needs one foreground
-  `simplify-reviewer` result, a HIGH one a foreground result from each of the three lenses, an
-  XHIGH one from each lens's `-xhigh` profile. LOW work never requires it.
+  `simplify-reviewer` result unless it is a small edit (`development-verification` §3), a HIGH
+  one a foreground result from each of the three lenses, an XHIGH one from each lens's `-xhigh`
+  profile. LOW work never requires it.
 
 Skip it for routine LOW work, small obvious fixes, generated output and docs churn.
 Never run it on operational work: a scratchpad or one-shot script that already executed, or a
@@ -52,6 +53,30 @@ Reject aesthetic churn, speculative abstraction, dependency additions, semantic 
 weakening, and any suggestion whose equivalence cannot be established.
 
 ## Finite workflow
+
+<!-- jev-stage:start -->
+Before preliminary semantic triage of diagnostic events, candidate findings or diff sections, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and secrets. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+<!-- jev-search:start -->
+Finding code: unless you already have the exact file or symbol, start with
+`jev find "<what the code does>" <dir>` rather than a grep over several guessed names (`a\|b\|c`).
+To check one property across files without reading them all, use
+`jev ask "<yes/no question>" <files> -q`. Open what Jev cites with an explicit range; where `jev`
+is not on PATH, use Grep and Glob.
+<!-- jev-search:end -->
+
+
+
+
+
+
 
 1. One pass over the changed scope: local, the single lane, or the three lenses.
 2. Apply only concrete behavior-preserving improvements; rerun affected checks after edits.

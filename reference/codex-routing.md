@@ -67,7 +67,7 @@ under `~/.codex/agents/`. Read the relevant settings instead of maintaining anot
 catalog in this reference.
 
 The user selects Sol for native Codex work and keeps Luna where it was chosen: the `explorer`
-role and the `low` and `research` profiles run on `gpt-6-luna`. The root baseline is `gpt-6-sol`
+role and the `low` and `research` profiles run on `gpt-6-luna`. The root baseline is `gpt-6.1-sol`
 with `medium` effort. Discovery uses the configured `explorer` role, deterministic checks use
 `test_runner` at `low`, bounded implementation uses `implementer` at `medium`, and independent
 review uses `reviewer`/`adversarial-reviewer` at `high`. The gate's XHIGH review round is the one
@@ -79,8 +79,8 @@ Do not silently fall back to another model when Sol is unavailable.
 Use the companion's supported `--effort high` for an independent review and its baseline for
 ordinary implementation. Verify the installed parser before using another level. The installed
 codex-plugin-cc 1.0.6 accepts flags only through `xhigh`; do not claim its flag reaches `max`
-or `ultra`. Native Codex 0.156.1 supports `low`, `medium`, `high`, `xhigh`, `max`, `ultra` for
-`gpt-6-sol`. Its existing `deep` profile selects high and `max` selects max; the `low` profile
+or `ultra`. The installed model metadata lists `low`, `medium`, `high`, `xhigh`, `max`, `ultra` for
+`gpt-6.1-sol`. Its existing `deep` profile selects high and `max` selects max; the `low` profile
 selects low. Do not use `none` or `minimal` for Sol, enable Fast mode, or change billing
 automatically.
 
@@ -118,7 +118,7 @@ Give Codex a self-contained task:
 
 Source: OpenAI's model guidance for GPT-6 Astra,
 https://developers.openai.com/api/docs/guides/latest-model. It names five behaviours in which
-Astra differs from GPT-5.6 Sol. Codex lanes run on `gpt-6-sol` except the XHIGH review round,
+Astra differs from GPT-5.6 Sol. Codex lanes run on `gpt-6.1-sol` except the XHIGH review round,
 which runs on Astra, so every packet follows these answers: they cost nothing on Sol and are
 what an XHIGH round needs.
 
@@ -137,10 +137,10 @@ what an XHIGH round needs.
 - **It tests broadly.** Name the checks a change needs; a reversible, low-impact change gets no
   tests that mirror its implementation.
 
-Parameters: model `gpt-6-sol`; effort `low` to `max` (plus `ultra` in Codex), never `none` —
+Parameters: model `gpt-6.1-sol`; effort `low` to `max` (plus `ultra` in Codex), never `none` —
 keep a lane's current effort when moving it to another model and raise it only on a measured
 failure; the user config sets verbosity `medium`; the migration guide removes `temperature`,
-`top_p` and `top_logprobs` from requests. Codex 0.156.1 lists `gpt-6-sol` and runs it on the
+`top_p` and `top_logprobs` from requests. Codex 0.156.1 lists `gpt-6.1-sol` and runs it on the
 ChatGPT account; 0.154.0 refused it, so verify the actual executable used by the wrapper. The
 plugin's bundled `gpt-5-4-prompting` skill predates GPT-6; for Codex tasks this section wins
 where they differ.

@@ -6,6 +6,22 @@ allowed-tools: "Bash(python3:*), Read, Write, Edit"
 
 # Checkpoint
 
+<!-- jev-stage:start -->
+When restoring a checkpoint, retain the mandatory Jev intermediate-step policy and its tool/CLI availability, follow the mandatory eligible scenarios in
+the `jev-workflow` skill before making that comparison yourself.
+Load its MCP tools once per session via ToolSearch `select:mcp__jev-workflow__judge,mcp__jev-workflow__prepare_and_delegate`, or use its
+`stage.py` CLI; then apply IDs and inspect disputed sources.
+Exact/formal decisions and final validation stay native; preserve required checks,
+permission boundaries and secrets. If this role cannot use an allowed interface,
+continue natively with intact sources and report the concrete limitation.
+<!-- jev-stage:end -->
+
+
+
+
+
+
+
 Argument: `$ARGUMENTS` (empty means `write`).
 
 Resolve the path first:
