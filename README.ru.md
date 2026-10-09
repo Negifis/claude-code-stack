@@ -18,7 +18,7 @@
 
 | Каталог | Содержимое |
 |---|---|
-| `hooks/` | Code Work Gate с инбоксом аномалий, система непрерывности, страж плотности комментариев, передача чипов и гигиена сессий — вместе с регрессионными сьютами (2489 ассертов гейта, 86 проверок непрерывности, 49 проверок стража, сьюты чипов и гигиены) |
+| `hooks/` | Code Work Gate с инбоксом аномалий, система непрерывности, страж плотности комментариев, передача чипов и гигиена сессий — вместе с регрессионными сьютами (2590 ассертов гейта, 86 проверок непрерывности, 49 проверок стража, сьюты чипов и гигиены) |
 | `skills/` | 17 скиллов: инженерный процесс, верификация, тексты, делегирование, память, чипы и старт задачи |
 | `agents/` | Adversarial-ревьюер, линии simplify — `simplify-reviewer` и три линзы — их профили `-xhigh` для работы уровня XHIGH и профиль `Explore`, замещающий встроенный |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
@@ -42,9 +42,11 @@
 транскрипте, либо нет:
 
 - скилл `development-verification` был вызван в этой сессии один раз;
-- у кандидата стандартного риска есть один foreground-результат `simplify-reviewer`, а у
-  кандидата высокого риска — foreground-результат каждой из трёх линз
-  (`simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`);
+- у кандидата стандартного риска есть один foreground-результат `simplify-reviewer`, если это
+  не малая правка (не больше трёх изменённых строк, все сделаны через Edit, и хук сверяет это
+  побайтно с коммитом, на котором кандидат открылся), а у кандидата высокого риска —
+  foreground-результат каждой из трёх линз (`simplify-reuse-reviewer`,
+  `simplify-quality-reviewer`, `simplify-efficiency-reviewer`);
 - для кандидата высокого риска независимое adversarial-ревью дало вердикт, и этот вердикт
   **новее** последнего изменения долговременного артефакта;
 - у кандидата XHIGH — этот уровень объявляет квитанция `verified`, путь его не задаёт — эти
@@ -158,9 +160,10 @@ python hooks/hygiene_hooks_test.py
 
 ## Установка
 
-Нужны Claude Code ≥ 2.1.246 (пол для замещения `Explore`, `maxTurns` и `autoCompactWindow`;
-то же значение стоит в `minimumVersion` шаблона) и Python 3.11+; `tools/worktree-audit.mjs`
-требует Node 18+.
+Нужны Claude Code ≥ 2.1.286 (шаблон привязывает алиас `opus` к `claude-opus-5-5`, а сборка
+старше 2.1.280 отвечает на него ошибкой 400; 2.1.286 — сборка, на которой стек проверен, и
+`minimumVersion` не даёт обновлению опуститься ниже) и Python 3.11+;
+`tools/worktree-audit.mjs` требует Node 18+.
 
 ```bash
 git clone https://github.com/Negifis/claude-code-stack.git && cd claude-code-stack
@@ -198,6 +201,27 @@ python hooks/test_gate.py
 ```bash
 python test_install.py
 ```
+
+### Плагины-специалисты
+
+Собственные агенты стека только ищут по коду и проверяют. Работу по стеку — Rust, Go, Python,
+TypeScript, React и мобильные приложения, базы данных и миграции, Kubernetes, CI/CD, тесты,
+производительность, безопасность — берут агенты десяти плагинов из
+[wshobson/agents](https://github.com/wshobson/agents). Скилл `subagent-delegation` направляет
+к ним работу и называет модель для каждой линии. Слитые настройки объявляют маркетплейс и включают
+плагины, а ставят их две команды:
+
+```bash
+claude plugin marketplace add wshobson/agents
+```
+
+```bash
+for p in developer-essentials debugging-toolkit full-stack-orchestration deployment-validation systems-programming javascript-typescript python-development database-migrations kubernetes-operations frontend-mobile-development; do claude plugin install "$p@claude-code-workflows" --scope user; done
+```
+
+Хуков и MCP-серверов в них нет, в постоянном контексте все вместе занимают около 5 тыс. токенов.
+Оставьте только плагины для своих стеков: уберите остальные из цикла и поставьте им `false` в
+`enabledPlugins`. Без плагина эту работу делает основной агент.
 
 ### Необязательное
 
@@ -238,6 +262,9 @@ form: `command` — исполняемый файл, `args` — его аргу�
 - `autoCompactWindow: "300k"` и `skillListingMaxDescChars: 320` в шаблоне стоят намеренно;
   измерения, на которых они основаны, — в `reference/usage-optimization-2026-09.md`.
   Уберите их, если сессии короткие.
+- `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` и `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`: не больше
+  трёх субагентов одновременно, и ни один не открывает своих. Три линзы кандидата HIGH занимают
+  все три места.
 - Exec form требует Claude Code 2.1.139 или новее; `minimumVersion` шаблона и так выше.
   `--merge-settings` узнаёт хуки этого стека в любой форме, поэтому прежняя установка в shell
   form заменяется, а не регистрируется второй раз.

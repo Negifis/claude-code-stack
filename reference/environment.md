@@ -38,10 +38,24 @@ on 2026-09-26, 2.1.274 answered `Agent type … not found` for four profiles cre
 `~/.claude/agents` a quarter of an hour earlier in the same turn, and listed them when the
 following turn began.
 
+## Plugins
+
+Stack specialist agents and skills come from the `claude-code-workflows` marketplace
+(`wshobson/agents`), installed at user scope: developer-essentials, debugging-toolkit,
+full-stack-orchestration, deployment-validation, systems-programming, javascript-typescript,
+python-development, database-migrations, kubernetes-operations, frontend-mobile-development —
+about 5k always-on tokens by `claude plugin details`, no hooks, no MCP servers. Which agent
+serves which work is in `subagent-delegation`. On Windows `hooks/plugin_autoupdate.ps1` updates
+them with the other plugins, and an update can rename an agent: check that table against
+`claude plugin details <plugin>@claude-code-workflows` after one, and after a Claude Code update
+whether the bare agent names inside the plugins' commands still fail (`subagent-delegation`).
+`install.py --merge-settings` carries `enabledPlugins` and `extraKnownMarketplaces` over; the
+plugins themselves are installed with the commands in the README.
+
 ## Output style
 
-The global style is `output-styles/dense.md`, selected by `outputStyle` in
-`~/.claude/settings.json`. It must keep `keep-coding-instructions: true` in its frontmatter:
+`outputStyle` in `~/.claude/settings.json` selects the global style; the template ships `dense`
+(`output-styles/dense.md`), which must keep `keep-coding-instructions: true` in its frontmatter:
 without that flag Claude Code drops its built-in "Doing tasks" section from the system prompt,
 and that section carries the default no-comments policy the whole density setup rests on.
 
@@ -119,8 +133,8 @@ quality and efficiency in one report and is the STANDARD pass; `simplify-reuse-r
 `simplify-quality-reviewer.md` and `simplify-efficiency-reviewer.md` are the three lenses a HIGH
 candidate runs as separate lanes, and the complete trio also satisfies STANDARD. Their `-xhigh`
 twins (`simplify-*-reviewer-xhigh.md`, and `adversarial-reviewer-xhigh.md` for review) carry the
-same prompt re-pinned for XHIGH work: the lenses on `claude-opus-5-5` — the full id, since the
-`opus` alias is pinned to an older model — and the reviewer on its own model, all at `effort:
+same prompt re-pinned for XHIGH work: the lenses on `claude-opus-5-5` by its full id, which
+holds whatever the `opus` alias is pinned to, and the reviewer on its own model, all at `effort:
 max`, with `maxTurns` 80 for the lenses and 100 for the reviewer: at max effort two lenses ran out
 of 40 turns on a 1,400-line diff on 2026-09-26. `test_gate.py` fails when a twin's prompt drifts
 from its base profile.
