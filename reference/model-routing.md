@@ -8,8 +8,9 @@ requirement.
 
 | Lane | Profile / tier | Effort |
 |---|---|---|
-| Deterministic lookup, evidence collection, one named command | `haiku` (pass explicitly) | low |
-| Repository exploration | `Explore` profile: Sonnet, `maxTurns: 50` | medium |
+| Deterministic lookup, extraction, classification, summarizing given material, one named command | `haiku` (pass explicitly) | the session's, never `low` |
+| Repository exploration | `Explore` profile: Haiku, `maxTurns: 50` | medium |
+| Translation of files or strings in files | `translator` profile: Haiku, `maxTurns: 15`; a stronger tier as `subagent-delegation` says | medium |
 | Bounded simplify pass | `simplify-reviewer` for STANDARD, the three `simplify-*-reviewer` lenses for HIGH: Sonnet, `maxTurns: 40` | medium |
 | XHIGH simplify pass | the three `simplify-*-reviewer-xhigh` lenses: `claude-opus-5-5`, `maxTurns: 80` | max |
 | Routine implementation, focused QA, web research | `general-purpose` with `model: "sonnet"` passed explicitly | medium/high |
@@ -19,19 +20,25 @@ requirement.
 | Orchestration, integration, final decision, user answer | primary agent | session default |
 
 Built-in `Explore` and `Plan` inherit the main session's model (capped at Opus); the custom
-`agents/Explore.md` overrides the built-in with the Sonnet profile above, which is the
-documented override mechanism for Claude Code 2.1.25x. `Plan` is left built-in: two uses in
+`agents/Explore.md` overrides the built-in with the Haiku profile above, which is the
+documented override mechanism for Claude Code 2.1.25x. Explore moved from Sonnet to Haiku 5.5 on
+2026-10-09 after a spot check — three code-location questions, one run each on the VM — that both
+answered correctly with the same `file:line`, the Explore part costing about $0.005 on Haiku 5.5
+against $0.08 on Sonnet 5.5. If Explore results start missing locations or need a Sonnet rerun,
+set `agents/Explore.md` back to `sonnet`. `Plan` is left built-in: two uses in
 seven weeks, both in plan mode where the strong model is the point. `CLAUDE_CODE_SUBAGENT_MODEL`
 is deliberately not set globally (the wa-tg-tun-new project sets it locally to
 `claude-sonnet-5-5`; see usage-optimization-2026-09.md): before 2.1.251 it overrode every agent's
 own `model`, including the reviewer's.
 
 The aliases are pinned in `settings.json` (`env`, `ANTHROPIC_DEFAULT_OPUS_MODEL` and its
-`SONNET`/`FABLE` siblings): `opus` -> `claude-opus-5-5`, `sonnet` -> `claude-sonnet-5-5`,
-`fable` -> `claude-fable-5-1`. Raise a pin only when every Claude Code that runs here accepts the
-new model — `claude-opus-5-5` needs 2.1.280, and an older build answers every `opus` lane with
-400 — and raise `minimumVersion` with it: it keeps the standalone CLI's updater from installing
-anything older, and stands at 2.1.286, the build verified on both machines.
+`SONNET`/`FABLE`/`HAIKU` siblings): `opus` -> `claude-opus-5-5`, `sonnet` -> `claude-sonnet-5-5`,
+`fable` -> `claude-fable-5-1`, `haiku` -> `claude-haiku-5-5`; the `haiku` pin also sets the
+model of Claude Code's background work. Raise a pin only when every Claude Code that runs here
+accepts the new model — `claude-opus-5-5` needs 2.1.280 and `claude-haiku-5-5` 2.1.293; 2.1.274
+answered `claude-opus-5-5` with 400 on every `opus` lane — and raise `minimumVersion` with
+it: it keeps `claude update` from installing anything older (automatic updates are off in
+`~/.claude.json`), and stands at 2.1.293, the build verified on both machines.
 
 Every profile that names an alias follows the pins, plugin agents included: half of the 22
 plugin profiles declare `model: opus`, so one of those launched without `model` runs Opus 5.5 —
@@ -55,6 +62,36 @@ alias always exists or that the most expensive tier is required for every review
   Decrease it for fixed-shape work. Do not globally force maximum effort.
 - Name the actual tier in the final evidence only when model independence or depth materially
   affects confidence.
+
+## Claude Haiku 5.5
+
+Sources: the model's overview, what's-new and prompting pages under
+https://platform.claude.com/docs/en/models/haiku-5-5/overview, its announcement
+(https://www.anthropic.com/claude-haiku-5-5) and Claude Code's model-configuration page.
+
+- Released 2026-10-07 for high-volume, latency-sensitive work: classification, extraction,
+  routing, summaries and subagent tasks; the fastest current model. 1M context, 128k output.
+- $0.10/$0.50 per MTok while the prompt stays within 100k tokens, $0.50/$2.50 above it — a
+  twentieth of Sonnet 5.5's $2/$10, then a quarter. Its tokenizer counts the same text as about
+  30% more tokens than Haiku 4.5 did.
+- Effort `low` to `max`, default `medium`; thinking is always on in Claude Code. In a long agent
+  prompt — Claude Code's is one — `low` makes it skip searches, stop early and skip checks, so a
+  Haiku lane runs at `medium` or the session's effort, never `low`.
+- Not a coding lane for anything beyond mechanical edits: on Terminal-Bench 4.0 it scores 39.2%
+  against Sonnet 5.5's 70.6%, and Anthropic keeps complex agentic coding on Sonnet and Opus.
+- Translation, spot-checked on 2026-10-09: ten original texts (RU↔EN, EN→DE, EN→ZH), one run per
+  model, one blind judge (Fable 5.1, out of 100) — Haiku 5.5 87.6 at `medium` and 89.6 at `low`
+  (within the noise of one run; the profile keeps the default `medium`), Sonnet 5.5 92.4, Opus 5.5
+  93.4, at $0.02, $0.71 and $1.92 for the ten. Haiku scored 84–98 on technical text, Markdown, UI
+  strings and business mail and 80–84 on idioms, literary and legal text; its two major errors were
+  a Russian plural with the verb outside the ICU branch and a calqued idiom, and the `translator`
+  profile names both patterns.
+- Its safety classifiers can decline a request (`stop_reason: refusal`) where Haiku 4.5 did not,
+  with no server-side fallback, and a retry on Haiku usually refuses again: a refused lane goes
+  once to `sonnet` and is not retried on Haiku.
+- At `low` and `medium` it sometimes stops before the work is done, reports a code change done
+  without a check that exercises it, and skips a web search it needed without today's date. The
+  packet for a Haiku lane answers all three (`subagent-delegation`).
 
 ## Claude Fable 5.1
 
