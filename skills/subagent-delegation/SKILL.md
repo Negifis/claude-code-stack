@@ -46,6 +46,13 @@ call is not.
 - the simplify lanes `simplify` requires: one `simplify-reviewer` for STANDARD, the three lens
   agents for HIGH, their `-xhigh` profiles for XHIGH — one pass, not a panel;
 - independent QA whose evidence can be checked by the parent;
+- a translation whose source is already a file, files or strings in files: the `translator`
+  profile on Haiku 5.5, writing straight to the destination path in the packet, with
+  `model: "sonnet"` or `"opus"` passed for legal, literary, idiom-heavy or published marketing
+  text, and files beyond about 20k tokens split first. The parent checks the result by counting
+  placeholders, headings and keys on both sides and reads only the `Uncertain:` spots. Text that
+  exists only in the conversation stays with the parent: re-emitting it as a packet and reading the
+  translation back costs more than translating it;
 - an in-scope follow-up — a pre-existing failure or a fix the task turns up that does not belong
   in the candidate. Scope, isolation and the chip for out-of-scope work are defined in
   `development-verification` §4; neither kind is dropped as "not mine".
@@ -87,7 +94,7 @@ When a lane above needs stack expertise, use the `claude-code-workflows` plugin 
 
 - Pass `model` on every plugin lane: `sonnet` for bounded implementation, tests and local fixes;
   `opus` for architecture, a security judgment or a hard root cause; `haiku` only for mechanical
-  work. The profiles' own models do not follow this (`model-routing.md`).
+  work and read-only lookups. The profiles' own models do not follow this (`model-routing.md`).
 - Whatever a plugin agent's description says, diagnosing the task's own failure stays with the
   parent (`root-cause-engineering`), and so do architecture, backend and API design, integration
   and the final decision.
@@ -95,7 +102,7 @@ When a lane above needs stack expertise, use the `claude-code-workflows` plugin 
   checkpoints for approval by design, so it is never the default path for feature work.
 - The plugins' commands name their agents without the plugin prefix (e.g.
   `full-stack-orchestration-test-automator`), which Claude Code rejects with "Agent type … not
-  found" (verified on 2.1.286); launch the prefixed name from the table instead.
+  found" (verified on 2.1.293); launch the prefixed name from the table instead.
 
 ## Task packet
 
@@ -113,6 +120,12 @@ that it requests every independent read or search in one response; and the exact
 final message, the only thing the parent sees. The reasons and the rest of the list are in
 `~/.claude/reference/model-routing.md` under Claude Fable 5.1.
 
+A lane that runs on `haiku` (Haiku 5.5) needs, unless its agent file already says it: that it
+works until every part is done and reports a part it could not settle; that a code change is
+reported done only after a real check that exercises it; and today's date when it searches the
+web. Why, and where Haiku stops being the right tier, is under Claude Haiku 5.5 in
+`~/.claude/reference/model-routing.md`.
+
 ## Ownership and review
 
 - One writer per file or tightly coupled scope.
@@ -126,10 +139,11 @@ final message, the only thing the parent sees. The reasons and the rest of the l
 ## Model and effort
 
 The agent profile's model and effort are the default; the profiles in `~/.claude/agents` are
-routed by lane already (`Explore` and the simplify lanes on Sonnet/medium,
+routed by lane already (`Explore` on Haiku/medium, the simplify lanes on Sonnet/medium,
 `adversarial-reviewer` on Fable/high). Override only for a clear reason:
 
-- a deterministic lookup or a named command: `haiku`;
+- a deterministic lookup, extraction, classification, a summary of given material, or a named
+  command: `haiku`;
 - `general-purpose` and any built-in lane without a profile: pass `model: "sonnet"` unless
   the task is a genuine root-cause, architecture or security judgment — otherwise it inherits
   the main session's model and effort, which is the most expensive combination available;

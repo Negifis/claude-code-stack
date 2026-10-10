@@ -138,9 +138,9 @@ holds whatever the `opus` alias is pinned to, and the reviewer on its own model,
 max`, with `maxTurns` 80 for the lenses and 100 for the reviewer: at max effort two lenses ran out
 of 40 turns on a 1,400-line diff on 2026-09-26. `test_gate.py` fails when a twin's prompt drifts
 from its base profile.
-`agents/Explore.md` overrides the built-in Explore agent with a Sonnet profile. The measured
-cost baseline behind the lane calibration: `reference/usage-optimization-2026-09.md`, data in
-`state/usage-baseline/`.
+`agents/Explore.md` overrides the built-in Explore agent with a Haiku profile (`model-routing.md`
+says why). The measured cost baseline behind the lane calibration:
+`reference/usage-optimization-2026-09.md`, data in `state/usage-baseline/`.
 
 ## Guard
 

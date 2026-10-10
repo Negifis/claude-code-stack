@@ -18,7 +18,7 @@ template — it is a stack in daily use on Windows and on a Linux execution VM, 
 |---|---|
 | `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2590 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
 | `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
-| `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, and an `Explore` profile that overrides the built-in one |
+| `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, an `Explore` profile on Haiku that overrides the built-in one, and a `translator` profile on Haiku for files and string batches |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
 | `tools/` | `worktree-audit.mjs` — parks unsaved work and prunes stale worktrees (the `Setup` maintenance hook); `file-holders.ps1` — names the processes holding a file open (Windows) |
 | `reference/` | On-demand docs the model reads only when relevant — model routing, Codex routing, config layout, and the September 2026 usage optimization with its measured baseline |
@@ -158,9 +158,12 @@ python hooks/hygiene_hooks_test.py
 
 ## Install
 
-Requires Claude Code ≥ 2.1.286 (the template pins the `opus` alias to `claude-opus-5-5`, which a
-build older than 2.1.280 answers with 400; 2.1.286 is the build the stack was verified on, and
-`minimumVersion` keeps the updater from going below it) and Python 3.11+;
+Requires Claude Code ≥ 2.1.293, the build the stack was verified on: the template pins the
+`opus` alias to `claude-opus-5-5`, which needs 2.1.280, and `haiku` to `claude-haiku-5-5`, which
+needs 2.1.293, and `minimumVersion` keeps the updater from going below that. The `haiku` pin also
+sets the model of Claude Code's background work; on an older build, delete
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` and set `minimumVersion` to 2.1.280, and `Explore` and
+`translator` then run on that build's default Haiku. Python 3.11+ is needed too, and
 `tools/worktree-audit.mjs` needs Node 18+.
 
 ```bash
@@ -283,7 +286,8 @@ are in `reference/usage-optimization-2026-09.md`; the headline ones:
   quota or capacity, and the native lane then ran anyway; hence the breaker;
 - 29% of review delta rounds had no changed candidate between them, including 62
   "confirmation" reviews after an approval; the skill now forbids them;
-- the built-in `Explore` inherited Opus; the override runs it on Sonnet with a turn cap.
+- the built-in `Explore` inherited Opus; the override runs it on Sonnet with a turn cap (on
+  Haiku 5.5 since October 2026).
 
 ---
 
