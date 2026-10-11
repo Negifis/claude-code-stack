@@ -74,7 +74,7 @@ NOTIFY_TOOL = "mcp__ccd_session_mgmt__send_message"
 # receipt behind a leading backtick, as the gate's `receipt_line` does, without asking for the
 # closing one.
 GATE_RECEIPT = re.compile(
-    r"^`?\[gate\]\s*(?:verified|operational|no-change|pr-ready|draft-blocked)\s*:",
+    r"^`?\s*\[gate\]\s*(?:verified|operational|no-change|pr-ready|draft-blocked)\s*:",
     re.IGNORECASE | re.MULTILINE)
 
 TRANSLIT = {

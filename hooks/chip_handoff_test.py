@@ -314,10 +314,15 @@ def test_stop_hook_blocks_a_closing_chip(root):
 
 
 def test_stop_hook_reads_a_backticked_receipt(root):
-    repo = make_repo(root, "backticked-repo")
-    _, worktree = open_chip(repo)
-    code, out = stop(worktree, "Готово.\n\n`" + RECEIPT + "`")
-    check("a receipt in backticks still closes out the chip", code == 0 and '"block"' in out, out)
+    # The gate takes the receipt out of one pair of backticks and strips the space inside it, so
+    # both spellings close out the chip here too.
+    for name, wrapped in (("backticked-repo", "`" + RECEIPT + "`"),
+                          ("backticked-spaced-repo", "` " + RECEIPT + " `")):
+        repo = make_repo(root, name)
+        _, worktree = open_chip(repo)
+        code, out = stop(worktree, "Готово.\n\n" + wrapped)
+        check("a receipt in backticks still closes out the chip ({})".format(name),
+              code == 0 and '"block"' in out, out)
 
 
 def test_stop_hook_blocks_an_unsent_report(root):
