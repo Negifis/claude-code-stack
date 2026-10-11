@@ -300,6 +300,10 @@ def test_stop_hook_is_silent_without_a_receipt(root):
     _, worktree = open_chip(repo)
     code, out = stop(worktree, "Ещё работаю, ничего не закрываю.")
     check("ordinary turn is not blocked", code == 0 and out == "", out)
+    # An indented line is a quoted example, not a receipt; only the inside of a backtick pair
+    # may carry a space before `[gate]`.
+    code, out = stop(worktree, "Квитанция выглядит так:\n\n    " + RECEIPT + "\n\nПродолжаю.")
+    check("an indented example receipt is not a closing turn", code == 0 and out == "", out)
 
 
 def test_stop_hook_blocks_a_closing_chip(root):
