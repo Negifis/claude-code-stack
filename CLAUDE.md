@@ -149,8 +149,7 @@ Finding code:
   `jev find "<what the code does>" <dir or repository>` first: where something happens, which
   files do X. It ranks files by meaning in a few seconds, across a whole repository too.
 - About to grep for several alternative names (`foo\|bar\|baz`): that is a guess, so run
-  `jev find` instead. On such a grep over a directory the hook may run it for you and add the top
-  files to your context; open them. A silent hook does not mean "no match".
+  `jev find` instead.
 - One property across 3+ files: `jev ask "<yes/no question>" <files or dir> -q` instead of
   reading them all.
 - An exact name or path you already have: Grep or Glob.

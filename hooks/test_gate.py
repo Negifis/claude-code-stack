@@ -10729,6 +10729,25 @@ check("XHIGH ranks above HIGH, and no path floor reaches it",
 check("an XHIGH receipt parses with its level",
       gate.receipt_of(XHIGH_RECEIPT) == ("verified", XHIGH_RECEIPT.split(": ", 1)[1], "XHIGH"),
       gate.receipt_of(XHIGH_RECEIPT))
+
+# --- a receipt in one pair of backticks is the same receipt (report 20f86b95)
+OPERATIONAL_LINE = "[gate] operational: read the code first; the task runs in the background"
+check("a receipt in one pair of backticks parses as the bare one",
+      gate.receipt_of("Done.\n\n`" + OPERATIONAL_LINE + "`") == gate.receipt_of(OPERATIONAL_LINE)
+      == ("operational", OPERATIONAL_LINE.split(": ", 1)[1], None),
+      gate.receipt_of("`" + OPERATIONAL_LINE + "`"))
+check("inline code inside a backticked receipt stays part of it",
+      gate.receipt_of("`[gate] anomaly-reported: 20f86b95; the `[gate]` line was refused`")[:2]
+      == ("anomaly-reported", "20f86b95; the `[gate]` line was refused"))
+check("double backticks, a lone backtick, a list marker or a quote before [gate] still do not parse",
+      [gate.receipt_of(line) for line in ("``" + OPERATIONAL_LINE + "``", "`" + OPERATIONAL_LINE,
+                                          "- " + OPERATIONAL_LINE, "> " + OPERATIONAL_LINE)]
+      == [None, None, None, None])
+check("a [gate] line with something before it is named as misplaced",
+      gate.receipt_preflight(None, {}, "Done.\n- " + OPERATIONAL_LINE)
+      == (False, gate.MISPLACED_RECEIPT_REASON)
+      and gate.receipt_preflight(None, {}, "Done, no receipt here")
+      == (False, "terminal receipt is missing or malformed"))
 check("an XHIGH lens stands in for its HIGH lens, at HIGH and in the STANDARD trio",
       gate.simplify_missing("STANDARD", {lens: "current" for lens in gate.XHIGH_LENSES}) == []
       and gate.simplify_missing("HIGH", {gate.SIMPLIFY_LENSES[0]: "current",

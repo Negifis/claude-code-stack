@@ -313,6 +313,13 @@ def test_stop_hook_blocks_a_closing_chip(root):
     check("blocking is finite", out == "", out)
 
 
+def test_stop_hook_reads_a_backticked_receipt(root):
+    repo = make_repo(root, "backticked-repo")
+    _, worktree = open_chip(repo)
+    code, out = stop(worktree, "Готово.\n\n`" + RECEIPT + "`")
+    check("a receipt in backticks still closes out the chip", code == 0 and '"block"' in out, out)
+
+
 def test_stop_hook_blocks_an_unsent_report(root):
     repo = make_repo(root, "unsent-repo")
     _, worktree = open_chip(repo)
@@ -1519,6 +1526,7 @@ def main():
             test_close_refuses_a_chip_that_never_reported,
             test_stop_hook_is_silent_without_a_receipt,
             test_stop_hook_blocks_a_closing_chip,
+            test_stop_hook_reads_a_backticked_receipt,
             test_stop_hook_blocks_an_unsent_report,
             test_stop_hook_accepts_a_completed_handoff,
             test_parent_is_reminded_until_the_chip_is_closed,

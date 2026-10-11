@@ -192,6 +192,10 @@ preserved, and re-running never double-registers a hook:
 python install.py --merge-settings
 ```
 
+Upgrading an earlier install: the installer never deletes files, so remove
+`~/.claude/rules/jev-search.md` yourself if you have it. It is no longer shipped, loaded in every
+session, and described Jev hooks the stack does not register.
+
 Restart Claude Code, then confirm everything runs:
 
 ```bash
@@ -320,7 +324,8 @@ blocks in skills, agents, commands and rules send semantic comparisons — ranki
 duplicate checks, choosing among candidates — through the `jev-workflow` skill and its
 `mcp__jev-workflow__*` MCP server. Neither is here: both are private tooling. Without them the
 blocks say to continue natively, so a session loses nothing but the delegation; delete the
-blocks if you don't run Jev.
+blocks if you don't run Jev. The `<!-- jev-search -->` blocks likewise point to a `jev` CLI that
+is not published here; where `jev` is not on PATH they fall back to Grep and Glob.
 
 ---
 

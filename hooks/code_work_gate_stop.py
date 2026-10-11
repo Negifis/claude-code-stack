@@ -129,6 +129,10 @@ RESTORE_BUDGET = 4.0
 SMALL_DIFF_BUDGET = 2.0
 REGULAR_FILE_MODES = (b"100644", b"100755")
 ANOMALY_REASON_RE = re.compile(r"^([0-9a-f]{8})\s*;\s*\S")
+MISPLACED_RECEIPT_REASON = (
+    "terminal receipt is malformed: the last line holds [gate] but does not start with it; nothing "
+    "may stand before [gate] on that line — no quote, list marker or emphasis"
+)
 VERIFIED_REASON_RE = re.compile(r"^({})\s*;\s*\S".format("|".join(RISK_ORDER)), re.IGNORECASE)
 OPERATIONAL_RECEIPTS = {"operational", "no-change"}
 VERDICT_LINE_RE = re.compile(
@@ -1618,8 +1622,20 @@ def reviewer_control(message):
     return controls.pop()
 
 
+def receipt_line(message):
+    """The final visible line, read as a receipt. One pair of backticks around the whole line —
+    the inline-code formatting a model reaches for — is formatting, not content: a session closed
+    every turn with a well-formed receipt in backticks and was refused as malformed (report
+    20f86b95)."""
+    line = final_line_outside_fence(message)
+    # `line[1]` leaves a double pair alone: that is no inline-code receipt.
+    if len(line) > 2 and line[0] == "`" and line[-1] == "`" and line[1] != "`":
+        line = line[1:-1].strip()
+    return line
+
+
 def receipt_of(message):
-    match = TERMINAL_RE.match(final_line_outside_fence(message))
+    match = TERMINAL_RE.match(receipt_line(message))
     if not match:
         return None
     kind = match.group(1).lower()
@@ -2128,14 +2144,19 @@ def candidate_floor(entry):
     return cwg.max_risk(minimum_risk(marker_paths(entry)), entry.get("minimum_risk_seen"))
 
 
-def receipt_preflight(receipt, entry):
+def receipt_preflight(receipt, entry, message=None):
     """Reject malformed, misclassified, or path-risk-downgraded receipts before scanning.
 
     An operational candidate may also close as `verified`: a lasting change the snapshots cannot
     see — prose written through the shell into an unwatched file — is still one, and its receipt
     is judged at the risk it declares (report c07fc211). That is no cheaper than `no-change`.
+    A last line that holds `[gate]` somewhere other than at its start is named as such, since
+    "missing or malformed" left that session nothing to correct.
     """
     if receipt is None:
+        line = receipt_line(message).lower()
+        if "[gate]" in line and not line.startswith("[gate]"):
+            return False, MISPLACED_RECEIPT_REASON
         return False, "terminal receipt is missing or malformed"
     kind, _, risk = receipt
     if candidate_class(entry) == cwg.WORK_OPERATIONAL:
@@ -3046,7 +3067,7 @@ def main():
                 return
             preflight_ok, reason = False, note
         else:
-            preflight_ok, reason = receipt_preflight(receipt, entry)
+            preflight_ok, reason = receipt_preflight(receipt, entry, data.get("last_assistant_message"))
         # The transcript is read once whatever the receipt looked like: the same scan answers
         # whether this session still has background work running.
         evidence = transcript_evidence(
