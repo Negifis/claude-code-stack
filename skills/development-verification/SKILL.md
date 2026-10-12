@@ -190,7 +190,8 @@ reuse, control-flow, type/error, resource, or efficiency concern).
   HIGH lens; a HIGH lens never satisfies XHIGH.
 - Follow the `simplify` skill for the packet. Apply only accepted behavior-preserving findings
   and rerun affected checks.
-- Maximum two runs of any one lane per candidate: the second only as that lane's delta
+- Maximum two runs of any one lane per candidate, counted apart for a subagent that runs its
+  own gate (section 6): the second only as that lane's delta
   confirmation after accepted edits on broad or high-risk work. A lane result that already
   exists for this candidate is that lane's completed pass; never re-run it for bookkeeping, and
   never after review approval. A candidate ends with its receipt: edits made after a closed
@@ -291,6 +292,21 @@ BLOCKING_THRESHOLD = HIGH
   opens a new candidate) starts at round 1: number the packet from there. An ESCALATE before
   round 3 is not terminal — the hook reads it as that round's REVISE, and the review continues
   within its budget.
+
+An implementing subagent may close its own scope through this gate before handing it back: the
+simplify lanes and the review lane its risk needs, launched from inside it in the foreground
+(`run_in_background: false`, Codex as a foreground `codex exec` call), because a subagent cannot
+end its turn to wait for a notification. The Stop hook reads those lanes from the transcript of
+a subagent the session launched itself and files each verdict at its launch, so a lasting edit
+after the launch — the parent's integration, a sibling's write — expires it like any other. A
+lane the subagent sent to the background, a call moved there at its timeout and a round resumed
+with `SendMessage` count only as review activity; a later round is a new foreground lane. The
+parent still checks the result and runs the affected checks, and reviews again only what it
+changed after that approval. Two subagents reviewing at the same time write one review sequence,
+which the gate cannot read as two: run implementing subagents that close their own gate one at a
+time, and when implementing subagents run in parallel, they hand back checked work and the
+parent runs the gate once over the integrated candidate. The simplify pass cap counts per
+subagent.
 
 `ESCALATE` is terminal only for the review loop; the parent continues immediately with the
 autonomous closure below. If a required reviewer is unavailable after the bounded wait policy

@@ -922,6 +922,96 @@ def judge_background_agents(evidence, launches, notices_by_task):
                     status=last_status, reason=reason)
 
 
+# The tools a first-layer subagent's gate lanes are called through, as its transcript spells them.
+NESTED_TOOL_TOKENS = tuple('"{}"'.format(name)
+                           for name in (*cwg.SHELL_TOOLS, "Agent", "Task", "SendMessage"))
+
+
+def lane_kind(subtype):
+    """What an Agent call's lane is to the gate: "simplify", "review" or a plain "agent"."""
+    if subtype in SIMPLIFY_REVIEWERS:
+        return "simplify"
+    return "review" if cwg.REVIEWER in subtype else "agent"
+
+
+def shell_call(payload, stamp, call_id):
+    """A shell call's record: any one of them may turn out to be the Codex review lane."""
+    command = str(payload.get("command") or "")
+    required = REQUIRED_EXTERNAL_TOKEN in command
+    return {
+        "kind": "external",
+        "required": required,
+        # COMPAT: a shell call is foreground unless it is explicitly detached — the harness
+        # omits the field entirely for the ordinary case, so demanding an explicit false here made
+        # every real Codex result invisible and left the native lane as the only one that could
+        # satisfy a HIGH candidate. A detached launch, or a foreground one the harness moved to
+        # the background at its timeout, is judged later from its completion notification and
+        # output file.
+        "foreground": payload.get("run_in_background") is not True,
+        "started": stamp,
+        "marked": required or REVIEW_INTENT_TOKEN in command,
+        "call_id": call_id,
+        "command": command,
+        "label": command.strip().splitlines()[0][:80] if command.strip() else "",
+    }
+
+
+def agent_lane_call(payload, stamp):
+    """An Agent call's record: its lane, the level it runs at and whether it ran in the
+    foreground."""
+    subtype = str(payload.get("subagent_type") or "").lower()
+    # A model passed with the call overrides the profile's pin, so an XHIGH lens run that way
+    # proves only its HIGH lens (and a reviewer, `lane_tier`).
+    if payload.get("model") and subtype in XHIGH_BASE:
+        subtype = XHIGH_BASE[subtype]
+    return {
+        "kind": lane_kind(subtype),
+        "subtype": subtype,
+        "tier": lane_tier(subtype, payload),
+        # Claude Code 2.1.198+ defaults subagents to background. Require an explicit false so an
+        # upgrade cannot turn a verdict-bearing call into an async launch that looks complete in
+        # the transcript. The opposite polarity of `shell_call` is deliberate: the two tools carry
+        # opposite defaults, and unifying them would blind one lane.
+        "foreground": payload.get("run_in_background") is False,
+        "started": stamp,
+        "label": str(payload.get("description") or subtype)[:80],
+    }
+
+
+def subagent_transcripts(path, since):
+    """The transcripts of this session's first-layer subagents written inside the window.
+
+    The harness keeps each subagent's transcript beside the session's, as
+    `<session>/subagents/agent-<id>.jsonl`, with `spawnDepth` and `agentType` in the
+    `.meta.json` next to it. A lane a subagent launched shows only there. A second-layer
+    transcript is a lane's own work, and so is a first-layer simplify or review lane's, so
+    neither is read; nor is one without its meta, whose depth nobody can tell. A helper's, such
+    as `Explore`'s, is read and holds no gate lane. The second of slack matches the scan's own.
+    """
+    folder = os.path.join(os.path.splitext(path)[0], "subagents")
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not (name.startswith("agent-") and name.endswith(".jsonl")):
+            continue
+        transcript = os.path.join(folder, name)
+        try:
+            if os.stat(transcript).st_mtime + 1 < since:
+                continue
+        except OSError:
+            continue
+        meta = cwg.read_json(transcript[:-len(".jsonl")] + ".meta.json")
+        if not isinstance(meta, dict) or meta.get("spawnDepth") != 1:
+            continue
+        if lane_kind(str(meta.get("agentType") or "").lower()) != "agent":
+            continue
+        found.append(transcript)
+    return found
+
+
 def transcript_evidence(path, since, skill_since=None):
     """Collect protocol evidence for a candidate.
 
@@ -936,6 +1026,8 @@ def transcript_evidence(path, since, skill_since=None):
         "skills": {},
         "simplify_successes": {},
         "simplify_failures": {},
+        # {lens: {stream: passes}}, the stream "" for the session's own lanes.
+        "simplify_passes": {},
         "ordinary_reviews": [],
         "closure_reviews": [],
         "review_failures": [],
@@ -989,10 +1081,21 @@ def transcript_evidence(path, since, skill_since=None):
         else:
             finish(report)
 
-    def settle(call, block, stamp, text):
+    def file_unbound(stamp, why):
+        """File a review result nothing binds as failed review activity, with why: it reopens an
+        earlier approval instead of leaving it the last word."""
+        evidence["review_failures"].append(stamp)
+        evidence["unbound_reasons"].append((len(evidence["review_events"]), why))
+        record_control(evidence, stamp, ("unbound", None), malformed=True)
+
+    def settle(call, block, stamp, text, filed_at=None):
         """File one foreground result inside the window: a Codex shell call, a simplify lane or a
-        native review, `text` being what it reported."""
+        native review, `text` being what it reported. `filed_at` replaces `stamp` as the moment it
+        is filed at, which `scan_nested` sets to the lane's launch."""
         failed = bool(block.get("is_error"))
+        at = stamp if filed_at is None else filed_at
+        agent = call.get("stream", "")
+        origin = {"agent": agent} if agent else {}
         if call["kind"] == "external":
             # A review round is a terminal control line the session log shows a Codex run producing
             # while the call was open — text alone can be printed by anything, and `codex` also
@@ -1008,47 +1111,161 @@ def transcript_evidence(path, since, skill_since=None):
             judged = bound and not failed
             evidence["external_results"].append(
                 (
-                    stamp,
+                    at,
                     block.get("tool_use_id"),
                     call["required"],
                     "success" if judged else "failure",
                 )
             )
             if judged:
-                record_control(evidence, stamp, control, tier=tier)
-                review_note(at=stamp,
-                            engine="codex", verdict=control[1], tier=tier)
+                record_control(evidence, at, control, tier=tier)
+                review_note(at=at, engine="codex", verdict=control[1], tier=tier, **origin)
             elif bound or (stated and call["marked"]):
                 # An unattributable verdict is never filed as one, but dropping it would leave an
                 # earlier approval as the last word — so a call that declared itself the review
                 # lane is heard as failed activity, which reopens that approval. The declaration
                 # is needed only here: a result the session log vouches for has proved what it is.
-                evidence["review_failures"].append(stamp)
                 if bound:
                     why = "the review call failed after stating its verdict"
                 elif unbriefed:
                     why = "the Codex session that printed the verdict " + UNBRIEFED
                 else:
                     why = "no Codex run's log shows the verdict the call printed"
-                evidence["unbound_reasons"].append((len(evidence["review_events"]), why))
-                record_control(evidence, stamp, ("unbound", None), malformed=True)
+                file_unbound(at, why)
             return
         if call["kind"] == "simplify":
             subtype = call["subtype"]
             if failed:
-                evidence["simplify_failures"].setdefault(subtype, []).append(stamp)
+                evidence["simplify_failures"].setdefault(subtype, []).append(at)
             elif text.strip():
-                evidence["simplify_successes"].setdefault(subtype, []).append(stamp)
+                evidence["simplify_successes"].setdefault(subtype, []).append(at)
+                # The pass cap is per subagent: its own pass judged its work, not a repeat of the
+                # parent's.
+                passes = evidence["simplify_passes"].setdefault(subtype, {})
+                passes[agent] = passes.get(agent, 0) + 1
             return
         if failed:
-            evidence["review_failures"].append(stamp)
-            evidence["review_events"].append((stamp, "failure", None))
+            evidence["review_failures"].append(at)
+            evidence["review_events"].append((at, "failure", None))
             return
         control = reviewer_control(text)
         tier = call.get("tier")
-        record_control(evidence, stamp, control, malformed=True, tier=tier)
+        record_control(evidence, at, control, malformed=True, tier=tier)
         if control[0] in ("ordinary", "closure"):
-            review_note(at=stamp, engine="native", verdict=control[1], tier=tier)
+            review_note(at=at, engine="native", verdict=control[1], tier=tier, **origin)
+
+    def unjudged(agent, stamp, why):
+        """File a subagent's lane that no result here can judge as review activity."""
+        file_unbound(stamp, why)
+        review_note(at=stamp, engine="nested", verdict=None, agent=agent, reason=why)
+
+    def nested_call(block, stamp, agent):
+        """The record of a first-layer subagent's shell call or gate lane, or None."""
+        tool_name, payload, call_id = block.get("name"), block.get("input"), block.get("id")
+        if not isinstance(payload, dict) or not call_id:
+            return None
+        if tool_name in cwg.SHELL_TOOLS:
+            call = shell_call(payload, stamp, call_id)
+        elif tool_name in ("Agent", "Task"):
+            call = agent_lane_call(payload, stamp)
+            if call["kind"] == "agent":
+                return None
+        else:
+            return None
+        call.update(stream=agent, call_id=call_id)
+        return call
+
+    def scan_nested(transcript):
+        """File the gate lanes a first-layer subagent ran on its own work before handing it back.
+
+        Only a foreground result is read, filed at the lane's launch: the parent and the
+        subagent's siblings may have edited while it ran, and an edit after the launch must
+        expire the verdict exactly as it does a background one. A result that points at a
+        hand-back is read from that hand-back, as the session's own are. A lane sent to the
+        background, a call moved there at its timeout and a round resumed with SendMessage report
+        only to the subagent, in notifications this scan does not judge, so each is filed as review
+        activity — a resumption of any reviewer the subagent ever launched, before the window or in
+        the background included. A transcript that cannot be read fails the whole scan, through the
+        caller's handler.
+        """
+        agent = os.path.basename(transcript)[len("agent-"):-len(".jsonl")]
+        launched, review_calls, reviewers = {}, set(), set()
+        handbacks, pointed = {}, []
+        with open(transcript, encoding="utf-8", errors="replace") as nested:
+            for raw in nested:
+                # Parsed only when it can matter: a hand-back, a call to a tool a lane runs on, or
+                # the result of a lane. A subagent's reads and their results are most of its lines.
+                if not ('"handback"' in raw
+                        or ('"tool_use"' in raw and any(name in raw for name in NESTED_TOOL_TOKENS))
+                        or ('"tool_result"' in raw and (any(call_id in raw for call_id in launched)
+                                                     or any(call_id in raw for call_id in review_calls)))):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    evidence["scan_failed"] = True
+                    continue
+                stamp = parse_ts(entry.get("timestamp"))
+                in_window = stamp + 1 >= since
+                if entry.get("type") in ("attachment", "user") and '"handback"' in raw:
+                    sender, report = handback_of(entry)
+                    if sender:
+                        handbacks.setdefault(sender, []).append([stamp, report, False])
+                        continue
+                for block in content_blocks(entry):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        payload = block.get("input")
+                        if (in_window and block.get("name") == "SendMessage" and isinstance(payload, dict)
+                                and str(payload.get("to") or "") in reviewers):
+                            unjudged(agent, stamp, "a subagent resumed its reviewer with SendMessage")
+                            continue
+                        call = nested_call(block, stamp, agent)
+                        if call is None:
+                            continue
+                        if call["kind"] == "review":
+                            review_calls.add(call["call_id"])
+                        if not in_window:
+                            continue
+                        if call["kind"] == "external":
+                            evidence["external_calls"].append(
+                                (stamp, call["call_id"], call["required"], call["foreground"]))
+                        if call["foreground"]:
+                            launched[call["call_id"]] = call
+                        elif call["kind"] == "review" or call.get("marked"):
+                            unjudged(agent, stamp, "a subagent ran its review lane in the background")
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    text = result_text(block)
+                    if block.get("tool_use_id") in review_calls:
+                        # Every name the harness gives the reviewer: a pointer can come without a
+                        # trailer, and its hand-back still files a verdict.
+                        for named in (AGENT_TRAILER_RE.search(text), AGENT_BG_RE.match(text),
+                                      HANDBACK_POINTER_RE.match(text)):
+                            if named:
+                                reviewers.add(named.group(1))
+                    call = launched.pop(block.get("tool_use_id"), None)
+                    if call is None:
+                        continue
+                    if call["kind"] == "external" and background_ack(text, True):
+                        if call["marked"]:
+                            unjudged(agent, stamp, "a subagent's review call moved to the background")
+                        continue
+                    # SECURITY: as in the session's own scan, only a lane's result is followed to a
+                    # hand-back, and never to another agent than the harness's trailer names.
+                    pointer = HANDBACK_POINTER_RE.match(text) if call["kind"] != "external" else None
+                    trailer = AGENT_TRAILER_RE.search(text) if pointer else None
+                    if pointer and (trailer is None or trailer.group(1) == pointer.group(1)):
+                        pointed.append((call, block, stamp, pointer.group(1), text))
+                    else:
+                        settle(call, block, stamp, text, filed_at=call["started"])
+        # A hand-back can be recorded after the result that points at it, so pointers wait for the
+        # whole transcript; one nothing answers is read as itself, a result with no verdict.
+        for call, block, stamp, sender, text in pointed:
+            report = take_handback(handbacks, sender, call["started"], stamp)
+            settle(call, block, stamp, text if report is None else report, filed_at=call["started"])
 
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
@@ -1164,9 +1381,7 @@ def transcript_evidence(path, since, skill_since=None):
                                             engine="codex-background", verdict=control[1],
                                             task=task_id, tier=tier)
                             else:
-                                evidence["review_failures"].append(stamp)
-                                evidence["unbound_reasons"].append((len(evidence["review_events"]), unbound_why))
-                                record_control(evidence, stamp, ("unbound", None), malformed=True)
+                                file_unbound(stamp, unbound_why)
                                 review_note(at=stamp, engine="codex-background",
                                               verdict=None, task=task_id, status=status,
                                               reason="no single briefed Codex verdict between "
@@ -1225,11 +1440,7 @@ def transcript_evidence(path, since, skill_since=None):
                                         (stamp, call["call_id"], call["required"], "failure")
                                     )
                                     evidence["background_judged"].append(call["call_id"])
-                                    evidence["review_failures"].append(stamp)
-                                    evidence["unbound_reasons"].append(
-                                        (len(evidence["review_events"]), "the review task was stopped"))
-                                    record_control(evidence, stamp, ("unbound", None),
-                                                   malformed=True)
+                                    file_unbound(stamp, "the review task was stopped")
                                     review_note(at=stamp, engine="codex-background",
                                                   verdict=None, task=stopped,
                                                   status="stopped",
@@ -1262,61 +1473,17 @@ def transcript_evidence(path, since, skill_since=None):
                         if before_candidate and tool_name not in ("Agent", "Task"):
                             continue
                         if tool_name in cwg.SHELL_TOOLS and call_id:
-                            command = str(payload.get("command") or "")
-                            required = REQUIRED_EXTERNAL_TOKEN in command
-                            # COMPAT: a shell call is foreground unless it is explicitly
-                            # detached — the harness omits the field entirely for the ordinary
-                            # case, so demanding an explicit false here made every real Codex
-                            # result invisible and left the native lane as the only one that
-                            # could satisfy a HIGH candidate. A detached launch, or a foreground
-                            # one the harness moved to the background at its timeout, is judged
-                            # later from its completion notification and output file.
-                            foreground = payload.get("run_in_background") is not True
-                            calls[call_id] = {
-                                "kind": "external",
-                                "required": required,
-                                "foreground": foreground,
-                                "started": stamp,
-                                "marked": required or REVIEW_INTENT_TOKEN in command,
-                                "call_id": call_id,
-                                "command": command,
-                                "label": command.strip().splitlines()[0][:80] if command.strip() else "",
-                            }
+                            call = calls[call_id] = shell_call(payload, stamp, call_id)
                             evidence["external_calls"].append(
-                                (stamp, call_id, required, foreground)
+                                (stamp, call_id, call["required"], call["foreground"])
                             )
                             continue
 
-                        if tool_name not in ("Agent", "Task"):
+                        if tool_name not in ("Agent", "Task") or not call_id:
                             continue
-                        subtype = str(payload.get("subagent_type") or "").lower()
-                        if not call_id:
-                            continue
-                        # A model passed with the call overrides the profile's pin, so an XHIGH
-                        # lens run that way proves only its HIGH lens (and a reviewer, `lane_tier`).
-                        if payload.get("model") and subtype in XHIGH_BASE:
-                            subtype = XHIGH_BASE[subtype]
-                        # Claude Code 2.1.198+ defaults subagents to background. Require an
-                        # explicit false so an upgrade cannot turn a verdict-bearing call into
-                        # an async launch that looks complete in the transcript. The opposite
-                        # polarity of the shell check above is deliberate: the two tools carry
-                        # opposite defaults, and unifying them would blind one lane.
-                        foreground = payload.get("run_in_background") is False
-                        agent_call = {
-                            "kind": "agent",
-                            "subtype": subtype,
-                            "tier": lane_tier(subtype, payload),
-                            "foreground": foreground,
-                            "started": stamp,
-                            "label": str(payload.get("description") or subtype)[:80],
-                            # A reviewer from before the window lends it nothing but its id,
-                            # which a round inside the window may resume.
-                            "prior": before_candidate,
-                        }
-                        if subtype in SIMPLIFY_REVIEWERS:
-                            agent_call["kind"] = "simplify"
-                        elif "adversarial-reviewer" in subtype:
-                            agent_call["kind"] = "review"
+                        # A reviewer from before the window lends it nothing but its id, which a
+                        # round inside the window may resume.
+                        agent_call = dict(agent_lane_call(payload, stamp), prior=before_candidate)
                         if before_candidate and agent_call["kind"] != "review":
                             continue
                         calls[call_id] = agent_call
@@ -1397,6 +1564,8 @@ def transcript_evidence(path, since, skill_since=None):
                                       functools.partial(settle, call, block, stamp), text)
                     else:
                         settle(call, block, stamp, text)
+        for transcript in subagent_transcripts(path, since):
+            scan_nested(transcript)
         for waiting in awaiting.values():
             for _, _, finish, pointer in waiting:
                 finish(pointer)
@@ -2567,7 +2736,7 @@ def evaluate_receipt(receipt, entry, evidence):
         # Both lists are already candidate-bound by transcript_evidence.
         successes = evidence["simplify_successes"].get(reviewer, [])
         failures = sorted(evidence["simplify_failures"].get(reviewer, []))
-        if len(successes) > MAX_SIMPLIFY_PASSES:
+        if max(evidence["simplify_passes"].get(reviewer, {}).values(), default=0) > MAX_SIMPLIFY_PASSES:
             return False, "simplify exceeded the absolute {}-pass cap for {}".format(
                 MAX_SIMPLIFY_PASSES, reviewer
             )

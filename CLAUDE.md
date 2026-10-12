@@ -41,9 +41,12 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
   (`development-verification` §4) it goes to a subagent; outside the scope it goes to a
   `spawn_task` chip through `chip-handoff`. The parent verifies a subagent's or a chip's result
   itself before relying on it or closing it.
-- Subagents never open subagents, and at most three run at once. Stack specialist lanes are the
-  `claude-code-workflows` plugin agents; `subagent-delegation` names which one and with which
-  model. A plugin agent's "use proactively" does not override these rules.
+- Prefer at most three subagents at once; more only when each extra lane has its own
+  independent result. A subagent opens subagents only for helper lanes and its own gate lanes,
+  so that it hands its work back already through the gate, never to split its task again
+  (`subagent-delegation`). Stack specialist lanes are the `claude-code-workflows` plugin agents;
+  `subagent-delegation` names which one and with which model. A plugin agent's "use
+  proactively" does not override these rules.
 
 # Code Work Gate
 

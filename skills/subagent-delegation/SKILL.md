@@ -57,11 +57,18 @@ call is not.
   in the candidate. Scope, isolation and the chip for out-of-scope work are defined in
   `development-verification` §4; neither kind is dropped as "not mine".
 
-A subagent never opens subagents: `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` refuses it. A lane
-that turns up more work reports it, and the parent routes it. At most three subagents run at
-once (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3`). The HIGH simplify lenses take all three slots,
-so they start when no other lane is running; a launch refused at the cap is not retried at once
-but made again after a running lane's completion notification.
+A subagent opens subagents for two things only: a helper lane (`Explore`, `translator`,
+`claude-code-guide`) for a lookup or a translation, and the gate's own lanes, run in the
+foreground, so that an implementing subagent hands its scope back already through the gate
+(`development-verification` §6). It never splits its task again: work beyond its scope is
+reported, and the parent routes it. `hooks/subagent_nesting_guard.py` refuses any other lane
+inside a subagent, and `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2` stops the second layer, whose
+lanes carry no `Agent` tool anyway.
+
+Prefer at most three subagents at once, the HIGH simplify lenses counting as three; run more
+only when each extra lane has its own independent result worth a context. The only hard limit
+is Claude Code's own (20 by default): a launch refused there is not retried at once but made
+again after a running lane's completion notification.
 
 Keep small, linear, tightly coupled, destructive, sensitive, and ordinary sequential work local;
 an in-scope follow-up that must stay a separate change is the exception and goes to a subagent

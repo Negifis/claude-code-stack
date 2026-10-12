@@ -58,6 +58,12 @@ transcript or don't:
 Two review engines are accepted: external **Codex** (default) and the bundled native
 `adversarial-reviewer` subagent (fallback). One lane per round, never both.
 
+A subagent can take its own scope through the gate before handing it back: the lanes it
+launches itself, in the foreground, count for the parent's candidate, each verdict filed at the
+lane's launch, so an edit made while the lane ran expires it. Nesting is kept for that and for
+helper lanes: `subagent_nesting_guard.py`, a `PreToolUse` hook, refuses any other `Agent` call
+made inside a subagent.
+
 The Codex lane is verified against the Codex CLI's own rollout logs, not against the text of
 the command that was typed. The log is read with a binary search over an append-only,
 chronological file, so a review round buried in the middle of a multi-megabyte resumed
@@ -265,9 +271,10 @@ Worth knowing before you turn it on:
 - `autoCompactWindow: "300k"` and `skillListingMaxDescChars: 320` ship in the template on
   purpose; the measurements behind them are in `reference/usage-optimization-2026-09.md`.
   Drop them if your sessions are short.
-- `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` and `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`: at most
-  three subagents at once and none of them opens its own. A HIGH candidate's three lenses take
-  all three slots.
+- `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2` and no concurrency cap below Claude Code's own
+  (20). The second layer is for helper lanes (`Explore`, `translator`, `claude-code-guide`) and
+  a subagent's own gate lanes, which `hooks/subagent_nesting_guard.py` enforces; the skills ask
+  for at most three subagents at once as a preference, not a limit.
 - Exec form needs Claude Code 2.1.139 or later; the template's `minimumVersion` is higher
   anyway. `--merge-settings` recognizes this stack's hooks in either form, so an earlier
   shell-form install is replaced, not registered twice.

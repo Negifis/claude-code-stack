@@ -418,7 +418,9 @@ SIMPLIFY_LENSES = (
 # XHIGH runs each lens and the native reviewer from a profile of its own, pinned to the strongest
 # model at maximum effort, so the lane name the transcript shows is the evidence of the level.
 XHIGH_LENSES = tuple(lens + "-xhigh" for lens in SIMPLIFY_LENSES)
-XHIGH_REVIEWER = "adversarial-reviewer-xhigh"
+REVIEWER = "adversarial-reviewer"
+XHIGH_REVIEWER = REVIEWER + "-xhigh"
+GATE_LANES = (SIMPLIFY_LANE, *SIMPLIFY_LENSES, *XHIGH_LENSES, REVIEWER, XHIGH_REVIEWER)
 # The Codex turn an XHIGH verdict must come from, as its rollout log records that turn.
 XHIGH_CODEX_MODEL = "gpt-6-astra"
 XHIGH_CODEX_EFFORT = "ultra"
