@@ -273,8 +273,11 @@ Worth knowing before you turn it on:
   Drop them if your sessions are short.
 - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2` and no concurrency cap below Claude Code's own
   (20). The second layer is for helper lanes (`Explore`, `translator`, `claude-code-guide`) and
-  a subagent's own gate lanes, which `hooks/subagent_nesting_guard.py` enforces; the skills ask
-  for at most three subagents at once as a preference, not a limit.
+  a subagent's own gate lanes, which `hooks/subagent_nesting_guard.py` enforces: set the depth
+  only together with that hook's entry, which runs on every `Agent` call. The skills ask for at
+  most three subagents at once as a preference, not a limit. An earlier install keeps its
+  `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` through `--merge-settings`, and its own `CLAUDE.md`
+  still says subagents never open subagents: delete the key and update that paragraph by hand.
 - Exec form needs Claude Code 2.1.139 or later; the template's `minimumVersion` is higher
   anyway. `--merge-settings` recognizes this stack's hooks in either form, so an earlier
   shell-form install is replaced, not registered twice.

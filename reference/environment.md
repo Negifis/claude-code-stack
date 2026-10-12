@@ -38,12 +38,15 @@ on 2026-09-26, 2.1.274 answered `Agent type … not found` for four profiles cre
 `~/.claude/agents` a quarter of an hour earlier in the same turn, and listed them when the
 following turn began.
 
-Nesting is two layers (`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`; Claude Code's default is three)
-and no concurrency cap is set below Claude Code's own, 20. `hooks/subagent_nesting_guard.py`, a
-`PreToolUse` hook on `Agent|Task`, denies a call that carries `agent_id` — one made inside a
+Nesting is two layers (`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`) and no concurrency cap is set
+below Claude Code's own; its defaults are three layers and 20 running subagents
+(https://code.claude.com/docs/en/sub-agents, read 2026-10-12). `hooks/subagent_nesting_guard.py`,
+a `PreToolUse` hook on `Agent|Task`, denies a call that carries `agent_id` — one made inside a
 subagent — unless it names a helper lane (`Explore`, `translator`, `claude-code-guide`) or a gate
-lane; its suite is `hooks/subagent_nesting_guard_test.py`, which also fails when a lane the Stop
-hook accepts is missing from the list. A type list in a subagent's `tools` is ignored by Claude
+lane; without it, depth 2 lets a subagent start any lane. It starts a Python process on every
+`Agent` call, the main conversation's included, and returns at once there. Its suite is
+`hooks/subagent_nesting_guard_test.py`, which also fails when a lane the Stop hook accepts is
+missing from the list. A type list in a subagent's `tools` is ignored by Claude
 Code and a `permissions.deny` rule would bind the main conversation too, which is why the list
 lives in a hook.
 

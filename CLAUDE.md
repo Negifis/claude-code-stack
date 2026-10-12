@@ -43,7 +43,7 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
   itself before relying on it or closing it.
 - Prefer at most three subagents at once; more only when each extra lane has its own
   independent result. A subagent opens subagents only for helper lanes and its own gate lanes,
-  so that it hands its work back already through the gate, never to split its task again
+  to hand its work back already through the gate; it never splits its task again
   (`subagent-delegation`). Stack specialist lanes are the `claude-code-workflows` plugin agents;
   `subagent-delegation` names which one and with which model. A plugin agent's "use
   proactively" does not override these rules.
