@@ -300,6 +300,10 @@ def test_stop_hook_is_silent_without_a_receipt(root):
     _, worktree = open_chip(repo)
     code, out = stop(worktree, "Ещё работаю, ничего не закрываю.")
     check("ordinary turn is not blocked", code == 0 and out == "", out)
+    # An indented line is a quoted example, not a receipt; only the inside of a backtick pair
+    # may carry a space before `[gate]`.
+    code, out = stop(worktree, "Квитанция выглядит так:\n\n    " + RECEIPT + "\n\nПродолжаю.")
+    check("an indented example receipt is not a closing turn", code == 0 and out == "", out)
 
 
 def test_stop_hook_blocks_a_closing_chip(root):
@@ -311,6 +315,18 @@ def test_stop_hook_blocks_a_closing_chip(root):
     for _ in range(4):
         _, out = stop(worktree, "Готово.\n\n" + RECEIPT)
     check("blocking is finite", out == "", out)
+
+
+def test_stop_hook_reads_a_backticked_receipt(root):
+    # The gate takes the receipt out of one pair of backticks and strips the space inside it, so
+    # both spellings close out the chip here too.
+    for name, wrapped in (("backticked-repo", "`" + RECEIPT + "`"),
+                          ("backticked-spaced-repo", "` " + RECEIPT + " `")):
+        repo = make_repo(root, name)
+        _, worktree = open_chip(repo)
+        code, out = stop(worktree, "Готово.\n\n" + wrapped)
+        check("a receipt in backticks still closes out the chip ({})".format(name),
+              code == 0 and '"block"' in out, out)
 
 
 def test_stop_hook_blocks_an_unsent_report(root):
@@ -1519,6 +1535,7 @@ def main():
             test_close_refuses_a_chip_that_never_reported,
             test_stop_hook_is_silent_without_a_receipt,
             test_stop_hook_blocks_a_closing_chip,
+            test_stop_hook_reads_a_backticked_receipt,
             test_stop_hook_blocks_an_unsent_report,
             test_stop_hook_accepts_a_completed_handoff,
             test_parent_is_reminded_until_the_chip_is_closed,

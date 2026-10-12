@@ -41,9 +41,12 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
   (`development-verification` §4) it goes to a subagent; outside the scope it goes to a
   `spawn_task` chip through `chip-handoff`. The parent verifies a subagent's or a chip's result
   itself before relying on it or closing it.
-- Subagents never open subagents, and at most three run at once. Stack specialist lanes are the
-  `claude-code-workflows` plugin agents; `subagent-delegation` names which one and with which
-  model. A plugin agent's "use proactively" does not override these rules.
+- Prefer at most three subagents at once; more only when each extra lane has its own
+  independent result. A subagent opens subagents only for helper lanes and its own gate lanes,
+  to hand its work back already through the gate; it never splits its task again
+  (`subagent-delegation`). Stack specialist lanes are the `claude-code-workflows` plugin agents;
+  `subagent-delegation` names which one and with which model. A plugin agent's "use
+  proactively" does not override these rules.
 
 # Code Work Gate
 
@@ -149,8 +152,7 @@ Finding code:
   `jev find "<what the code does>" <dir or repository>` first: where something happens, which
   files do X. It ranks files by meaning in a few seconds, across a whole repository too.
 - About to grep for several alternative names (`foo\|bar\|baz`): that is a guess, so run
-  `jev find` instead. On such a grep over a directory the hook may run it for you and add the top
-  files to your context; open them. A silent hook does not mean "no match".
+  `jev find` instead.
 - One property across 3+ files: `jev ask "<yes/no question>" <files or dir> -q` instead of
   reading them all.
 - An exact name or path you already have: Grep or Glob.

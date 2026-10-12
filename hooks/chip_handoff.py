@@ -70,9 +70,11 @@ CCD_SESSION_RE = re.compile(
 NOTIFY_TOOL = "mcp__ccd_session_mgmt__send_message"
 # The kinds are `code_work_gate_stop.TERMINAL_RE`'s, deliberately copied rather than imported:
 # each hook family here stays importable on its own. This one only asks whether the turn looks
-# like a closing one, so it stays a loose search where the gate's is a strict parse.
+# like a closing one, so it stays a loose search where the gate's is a strict parse: it takes a
+# receipt behind a leading backtick, as the gate's `receipt_line` does, without asking for the
+# closing one.
 GATE_RECEIPT = re.compile(
-    r"^\[gate\]\s*(?:verified|operational|no-change|pr-ready|draft-blocked)\s*:",
+    r"^(?:`\s*)?\[gate\]\s*(?:verified|operational|no-change|pr-ready|draft-blocked)\s*:",
     re.IGNORECASE | re.MULTILINE)
 
 TRANSLIT = {

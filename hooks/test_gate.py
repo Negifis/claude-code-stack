@@ -10729,6 +10729,25 @@ check("XHIGH ranks above HIGH, and no path floor reaches it",
 check("an XHIGH receipt parses with its level",
       gate.receipt_of(XHIGH_RECEIPT) == ("verified", XHIGH_RECEIPT.split(": ", 1)[1], "XHIGH"),
       gate.receipt_of(XHIGH_RECEIPT))
+
+# --- a receipt in one pair of backticks is the same receipt (report 20f86b95)
+OPERATIONAL_LINE = "[gate] operational: read the code first; the task runs in the background"
+check("a receipt in one pair of backticks parses as the bare one",
+      gate.receipt_of("Done.\n\n`" + OPERATIONAL_LINE + "`") == gate.receipt_of(OPERATIONAL_LINE)
+      == ("operational", OPERATIONAL_LINE.split(": ", 1)[1], None),
+      gate.receipt_of("`" + OPERATIONAL_LINE + "`"))
+check("inline code inside a backticked receipt stays part of it",
+      gate.receipt_of("`[gate] anomaly-reported: 20f86b95; the `[gate]` line was refused`")[:2]
+      == ("anomaly-reported", "20f86b95; the `[gate]` line was refused"))
+check("double backticks, a lone backtick, a list marker or a quote before [gate] still do not parse",
+      [gate.receipt_of(line) for line in ("``" + OPERATIONAL_LINE + "``", "`" + OPERATIONAL_LINE,
+                                          "- " + OPERATIONAL_LINE, "> " + OPERATIONAL_LINE)]
+      == [None, None, None, None])
+check("a [gate] line with something before it is named as misplaced",
+      gate.receipt_preflight(None, {}, "Done.\n- " + OPERATIONAL_LINE)
+      == (False, gate.MISPLACED_RECEIPT_REASON)
+      and gate.receipt_preflight(None, {}, "Done, no receipt here")
+      == (False, "terminal receipt is missing or malformed"))
 check("an XHIGH lens stands in for its HIGH lens, at HIGH and in the STANDARD trio",
       gate.simplify_missing("STANDARD", {lens: "current" for lens in gate.XHIGH_LENSES}) == []
       and gate.simplify_missing("HIGH", {gate.SIMPLIFY_LENSES[0]: "current",
@@ -10813,6 +10832,217 @@ for base, xhigh, pins in [
     check("the {} profile is named for its lane and pinned to {}".format(xhigh, ", ".join(pins)),
           "\nname: {}\n".format(xhigh) in front
           and all("\n{}\n".format(pin) in front for pin in pins), front)
+
+
+# --- a first-layer subagent closes its own work through the gate before handing it back
+def implementer(depth=1, agent_type="general-purpose"):
+    return {"agentType": agent_type, "spawnDepth": depth, "toolUseId": "toolu_impl",
+            "requestShape": "foreground"}
+
+
+def stop_with_nested(sid, events, nested, receipt=VERIFIED_HIGH):
+    """`nested`: (agent id, meta or None, events) per subagent transcript beside the session's."""
+    transcript = write_transcript(events)
+    folder = os.path.join(os.path.splitext(transcript)[0], "subagents")
+    os.makedirs(folder)
+    for agent, meta, agent_events in nested:
+        base = os.path.join(folder, "agent-{}".format(agent))
+        with open(base + ".jsonl", "w", encoding="utf-8") as stream:
+            for event in agent_events:
+                # A string is a raw line, such as one cut off mid-write.
+                stream.write((event if isinstance(event, str) else json.dumps(event, ensure_ascii=False))
+                             + "\n")
+        if meta is not None:
+            with open(base + ".meta.json", "w", encoding="utf-8") as stream:
+                json.dump(meta, stream)
+    try:
+        return run(STOP_HOOK, {"session_id": sid, "transcript_path": transcript,
+                               "last_assistant_message": receipt})
+    finally:
+        cleanup(sid, transcript)
+        shutil.rmtree(os.path.splitext(transcript)[0], ignore_errors=True)
+
+
+def parent_events():
+    """The parent's side: the protocol skill and the implementer it launched in the foreground,
+    whose report quotes an approval it was given."""
+    events = base_events()
+    events.append(agent_use(121, "general-purpose", "impl-1"))
+    events.append(tool_result(150, "impl-1", "Done; " + review_text("APPROVED")))
+    return events
+
+
+def gated_work(review_at=140, verdict="APPROVED", lenses=SIMPLIFY_LENSES, review=None):
+    """What an implementer that closed its own gate leaves in its transcript."""
+    work = []
+    simplify_wave(work, 130, "nested-simplify", lenses)
+    if review is None:
+        add_review(work, review_at, "nested-review", review_text(verdict))
+    else:
+        work.extend(review)
+    return work
+
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work())])
+check("nested gate: an implementer's own lenses and approval close the parent's HIGH candidate",
+      verified(result), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+result = stop_with_nested(sid, parent_events(), [])
+check("nested gate: the implementer's report quoting an approval is no evidence",
+      blocked(result, "simplify"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"], durable_ts=140.2)
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work())])
+check("nested gate: a verdict is filed at its launch, so an edit while it ran expires it",
+      blocked(result, gate.HIGH_STALE_REASON), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(depth=2), gated_work())])
+check("nested gate: a second-layer transcript is a lane's own work, not read",
+      blocked(result, "simplify"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+result = stop_with_nested(sid, parent_events(), [("a1", None, gated_work())])
+check("nested gate: a transcript without its meta, whose depth nobody can tell, is not read",
+      blocked(result, "simplify"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+result = stop_with_nested(sid, parent_events(),
+                          [("a1", implementer(agent_type="simplify-reviewer"), gated_work())])
+check("nested gate: a first-layer simplify lane's transcript lends nothing",
+      blocked(result, "simplify"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = parent_events()
+add_review(events, 160, "review-1", review_text("APPROVED"))
+background = [agent_use(165, "adversarial-reviewer", "nested-bg", run_in_background=True),
+              tool_result(165.5, "nested-bg", "Async agent launched successfully.\nagentId: abc")]
+result = stop_with_nested(sid, events, [("a1", implementer(), gated_work(review=background))])
+check("nested gate: a review the implementer sent to the background is activity after the approval",
+      blocked(result, "continued after terminal APPROVED"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+work = gated_work()
+work[-1] = tool_result(140.5, "nested-review", review_text("APPROVED")
+                       + "\nagentId: rev1 (use SendMessage with to: 'rev1' to continue this agent)")
+work.append(entry(142, "assistant", [{"type": "tool_use", "id": "nested-resume", "name": "SendMessage",
+                                      "input": {"to": "rev1", "message": "round 2"}}]))
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), work)])
+check("nested gate: a reviewer the implementer resumed with SendMessage is activity after its verdict",
+      blocked(result, "continued after terminal APPROVED"), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+codex = []
+add_codex_review(codex, 140, "nested-codex", CODEX_CLI_COMMAND,
+                 codex_cli_output(review_text("APPROVED")))
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work(review=codex))])
+check("nested gate: a foreground Codex round the implementer ran, bound by its rollout, counts",
+      verified(result), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+forged = [bash_use(140, "nested-forged", CODEX_CLI_COMMAND),
+          tool_result(140.5, "nested-forged", review_text("APPROVED"))]
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work(review=forged))])
+check("nested gate: a printed verdict no Codex run logged binds nothing",
+      blocked(result, gate.HIGH_STALE_REASON), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+events = parent_events()
+simplify_wave(events, 122, "parent-simplify", SIMPLIFY_LENSES)
+simplify_wave(events, 126, "parent-simplify-2", SIMPLIFY_LENSES)
+result = stop_with_nested(sid, events, [("a1", implementer(), gated_work())])
+check("nested gate: the simplify pass cap counts per stream, so an implementer's pass is its own",
+      verified(result), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+work = gated_work()
+simplify_wave(work, 133, "nested-simplify-2", SIMPLIFY_LENSES)
+simplify_wave(work, 136, "nested-simplify-3", SIMPLIFY_LENSES)
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), work)])
+check("nested gate: a third pass of one lens inside one implementer still hits the cap",
+      blocked(result, "pass cap"), result)
+
+
+def cut_result(call_id, stamp):
+    """A tool result's line cut off mid-write, past its id."""
+    return ('{{"type": "user", "timestamp": "{}", "message": {{"role": "user", "content": '
+            '[{{"type": "tool_result", "tool_use_id": "{}", "content": "Reviewed the auth').format(
+                iso(stamp), call_id)
+
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+work = gated_work()
+work.insert(0, cut_result("read-1", 125))
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), work)])
+check("nested gate: a cut-off line no lane depends on leaves the scan whole",
+      verified(result), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+work = gated_work()
+work[-1] = cut_result("nested-review", 140.5)
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), work)])
+check("nested gate: a cut-off result of an open lane fails the scan",
+      blocked(result, "transcript scan failed"), result)
+
+# A reviewer is the subagent's whatever window or mode it was launched in, so resuming it later is
+# review activity even when its launch lent the candidate nothing.
+for label, launch in (
+    ("a reviewer launched before the window",
+     [agent_use(90, "adversarial-reviewer", "old-review"),
+      tool_result(90.5, "old-review", review_text("APPROVED")
+                  + "\nagentId: rev0 (use SendMessage with to: 'rev0' to continue this agent)")]),
+    ("a reviewer launched in the background",
+     [agent_use(90, "adversarial-reviewer", "old-review", run_in_background=True),
+      tool_result(90.5, "old-review", "Async agent launched successfully.\nagentId: rev0")]),
+):
+    sid = session()
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    work = launch + gated_work() + [
+        entry(145, "assistant", [{"type": "tool_use", "id": "resume-old", "name": "SendMessage",
+                                  "input": {"to": "rev0", "message": "round 2"}}])]
+    result = stop_with_nested(sid, parent_events(), [("a1", implementer(), work)])
+    check("nested gate: resuming {} is activity after the approval".format(label),
+          blocked(result, "review activity continued after terminal APPROVED"), result)
+
+for label, handed, expect_ok in (
+    ("a nested verdict delivered as a hand-back is read from it", "rev-hb", True),
+    ("a hand-back from another agent than the pointer names answers nothing", "someone-else", False),
+):
+    sid = session()
+    seed(sid, ["C:/repo/src/auth/session.ts"])
+    pointer = [agent_use(140, "adversarial-reviewer", "nested-review"),
+               tool_result(140.5, "nested-review", handback_pointer("rev-hb")),
+               handback_record(140.9, handed, review_text("APPROVED"))]
+    result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work(review=pointer))])
+    check("nested gate: " + label,
+          verified(result) if expect_ok else blocked(result, gate.HIGH_STALE_REASON), result)
+
+sid = session()
+seed(sid, ["C:/repo/src/auth/session.ts"])
+pointer = [agent_use(140, "adversarial-reviewer", "nested-review"),
+           tool_result(140.5, "nested-review", handback_pointer("rev-hb", trailer_id=False)),
+           handback_record(140.9, "rev-hb", review_text("APPROVED")),
+           entry(145, "assistant", [{"type": "tool_use", "id": "resume-hb", "name": "SendMessage",
+                                     "input": {"to": "rev-hb", "message": "round 2"}}])]
+result = stop_with_nested(sid, parent_events(), [("a1", implementer(), gated_work(review=pointer))])
+check("nested gate: resuming a reviewer known only from its pointer is activity after its verdict",
+      blocked(result, "review activity continued after terminal APPROVED"), result)
 
 
 print("PASS: {} assertions".format(PASSED))
