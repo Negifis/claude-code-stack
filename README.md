@@ -116,13 +116,15 @@ python hooks/comment_density_guard_test.py
 ### 4. Chips and session hygiene
 
 A chip is a session started for work outside the current one's scope: `start_session` in the
-Claude desktop app, `spawn_task` where that is the tool. Neither gives the child a way back.
-`chip_handoff.py` gives a chip its route home: for code, a worktree and branch off the parent's
-branch (the app cuts it for `start_session`, the hook for `spawn_task`), for operational work a
-report; a message to the parent session; and the parent's own verification before the child is
-archived or sent back. The `chip-handoff` skill is the procedure; the `Stop` hook blocks a chip
-session that closes work without handing it back, once the session is proven the chip's, and
-reminds the parent once that a reported chip is unverified.
+Claude desktop app, or `spawn_task` in a session that has only that. Neither gives the child
+session a way back. `chip_handoff.py` gives a chip its route home: a worktree and branch off the
+parent's branch for code (the app cuts them for `start_session`, the hook for `spawn_task`) or a
+report for operational work, a message to the parent session, and the parent's own verification
+before the child is archived or sent back. The `chip-handoff` skill is the procedure; the `Stop`
+hook blocks a chip session that closes work without handing it back, once the session is proven
+the chip's, and reminds the parent once that a reported chip is unverified. The chip hooks run
+on every `start_session` and every `SendMessage` (messages to subagents included): one Python
+start each, and only the spawn hook can take seconds.
 
 Three more hooks keep worktrees and sessions from silting up: `session_guard.py` warns when
 another live session already holds the working tree, `session_index.py` keeps a register of
@@ -282,8 +284,9 @@ Worth knowing before you turn it on:
   still says subagents never open subagents: delete the key and update that paragraph by hand.
 - `BASH_MAX_TIMEOUT_MS=7200000`: a subagent cannot wait for a background Codex review, so it
   runs the round in the foreground, and the ceiling has to hold the launch template's own
-  `timeout` (up to 7000 s). It stays within two hours, past which it would also lift the
-  background-command limit; `test_gate.py` checks both bounds.
+  `timeout` (up to 7000 s) plus the 100 s margin the subagent adds. It stays within two hours,
+  past which it would also lift the background-command limit in unattended sessions;
+  `test_gate.py` checks both bounds. `--merge-settings` sets it over a value of your own.
 - Exec form needs Claude Code 2.1.139 or later; the template's `minimumVersion` is higher
   anyway. `--merge-settings` recognizes this stack's hooks in either form, so an earlier
   shell-form install is replaced, not registered twice.
