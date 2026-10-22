@@ -8,7 +8,8 @@
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2"
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2",
+    "BASH_MAX_TIMEOUT_MS": "7200000"
   },
   "availableModels": [
     "opus",
@@ -128,7 +129,7 @@
         ]
       },
       {
-        "matcher": "mcp__ccd_session_mgmt__send_message",
+        "matcher": "^(?:mcp__ccd_session_mgmt__send_message|SendMessage)$",
         "hooks": [
           {
             "type": "command",
@@ -139,7 +140,7 @@
         ]
       },
       {
-        "matcher": "mcp__ccd_session__spawn_task",
+        "matcher": "^mcp__ccd_session__(?:spawn_task|start_session)$",
         "hooks": [
           {
             "type": "command",
@@ -163,7 +164,7 @@
         ]
       },
       {
-        "matcher": "mcp__ccd_session_mgmt__send_message",
+        "matcher": "^(?:mcp__ccd_session_mgmt__send_message|SendMessage)$",
         "hooks": [
           {
             "type": "command",
@@ -174,7 +175,7 @@
         ]
       },
       {
-        "matcher": "mcp__ccd_session__spawn_task",
+        "matcher": "^mcp__ccd_session__(?:spawn_task|start_session)$",
         "hooks": [
           {
             "type": "command",
@@ -233,7 +234,7 @@
         ]
       },
       {
-        "matcher": "mcp__ccd_session__spawn_task",
+        "matcher": "^mcp__ccd_session__(?:spawn_task|start_session)$",
         "hooks": [
           {
             "type": "command",

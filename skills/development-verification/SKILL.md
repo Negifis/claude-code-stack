@@ -147,8 +147,8 @@ is not on PATH, use Grep and Glob.
   size, the follow-up goes to a subagent — a required handoff, not the optional delegation
   `subagent-delegation` weighs — in its own worktree (`isolation: "worktree"`) when the
   directory is a git repository, otherwise as the only writer of the files it touches; what it
-  turns up comes back to the parent under this same rule. Outside the scope it goes to a
-  `spawn_task` chip (`chip-handoff`). Either way the fix stays a separate change, never mixed
+  turns up comes back to the parent under this same rule. Outside the scope it goes to a chip
+  (`chip-handoff`). Either way the fix stays a separate change, never mixed
   into the candidate's diff, and the parent verifies the result itself. One handoff per root
   cause. A failing check's handoff carries the exact command, the failing output and
   the evidence that the failure is not the candidate's: the same check failing the same way on
@@ -295,8 +295,9 @@ BLOCKING_THRESHOLD = HIGH
 
 An implementing subagent may close its own scope through this gate before handing it back: the
 simplify lanes and the review lane its risk needs, launched from inside it in the foreground
-(`run_in_background: false`, Codex as a foreground `codex exec` call), because a subagent cannot
-end its turn to wait for a notification. The Stop hook reads those lanes from the transcript of
+(`run_in_background: false`), because a subagent cannot end its turn to wait for a notification.
+Codex stays the first engine there: `/adversarial-review` names the foreground launch and its
+Bash `timeout`. The Stop hook reads those lanes from the transcript of
 a subagent the session launched itself and files each verdict at its launch, so a lasting edit
 after the launch — the parent's integration, a sibling's write — expires it like any other. A
 lane the subagent sent to the background, a call moved there at its timeout and a round resumed
