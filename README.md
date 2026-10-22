@@ -122,9 +122,10 @@ parent's branch for code (the app cuts them for `start_session`, the hook for `s
 report for operational work, a message to the parent session, and the parent's own verification
 before the child is archived or sent back. The `chip-handoff` skill is the procedure; the `Stop`
 hook blocks a chip session that closes work without handing it back, once the session is proven
-the chip's, and reminds the parent once that a reported chip is unverified. The chip hooks run
-on every `start_session` and every `SendMessage` (messages to subagents included): one Python
-start each, and only the spawn hook can take seconds.
+the chip's, and reminds the parent, without blocking, on every turn until a reported chip is
+closed. The chip hooks start Python twice on every `start_session` (before and after the call) and
+once on every `SendMessage` (messages to subagents included). The spawn hook can take seconds, and
+so can delivering a report while another session holds the card lock (up to 3 s).
 
 Three more hooks keep worktrees and sessions from silting up: `session_guard.py` warns when
 another live session already holds the working tree, `session_index.py` keeps a register of
