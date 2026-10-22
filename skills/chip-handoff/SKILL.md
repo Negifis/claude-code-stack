@@ -1,16 +1,17 @@
 ---
 name: chip-handoff
-description: For work outside the current task's scope (in-scope follow-ups go to a subagent). Give a spawn_task chip a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification, then merge, accept and archive without asking the user, or send back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
+description: For work outside the current task's scope (in-scope follow-ups go to a subagent). Give a chip — a session started with start_session, or spawn_task where that is the tool — a way back — own worktree and branch for code, a report for operational work, a message to the parent, and the parent's own verification, then merge, accept and archive without asking the user, or send back. Use when spawning a chip ("вынеси в чип", "отдельной задачей"), when finishing inside one, or when one reports back.
 disable-model-invocation: false
 ---
 
 # Give a chip a way back
 
-`spawn_task` hands the child a prompt and a directory. Nothing carries the parent's branch,
-the parent's session, or any route home, so a chip that succeeds still leaves its work in a
-place the parent never looks. Worse, a code chip spawned into the parent's own directory edits
-the tree a live session is using — the shared-tree failure `session_guard` exists to warn
-about.
+A chip is a session started for work outside this one's scope: `start_session` in the desktop
+app, `spawn_task` in a session that still has only that. Neither hands the child the parent's
+branch to merge into or anything to report back with, so a chip that succeeds still leaves its
+work in a place the parent never looks. `start_session` does give the child a worktree of its
+own and tells the parent when the child's turn ends — but that note quotes only the start of
+the child's last message, and a card the user starts tells the parent nothing at all.
 
 `hooks/chip_handoff.py` closes both ends. Use it for every chip, and let its own output tell
 you the next command; the paths below are the shape, not something to retype from memory.
@@ -21,14 +22,27 @@ mine".
 
 ## Spawning one
 
-Nothing to do. A `PreToolUse` hook registers the chip while `spawn_task` is being called and
-rewrites that call, so the child starts in its own worktree with the handoff block already in
-its prompt. Spawn the way you always would.
+Nothing to do beyond choosing the call. Work you noticed yourself is `start_session` with
+`initiation: "own_initiative"` — it waits as a card until the user starts it; work the user
+asked to run separately is `"user_asked"`, and starts at once. A `PreToolUse` hook registers
+the chip while the call is made and rewrites it, so the child starts with the handoff block
+already in its prompt.
 
-It cuts a branch and worktree whenever the directory is a repository with a commit to branch
-from, and otherwise registers an operational chip that reports instead. The chip stays
-provisional until the spawn actually lands; a call that is denied or cancelled takes its
-worktree and branch with it.
+- `start_session`, fresh: the hook asks for a worktree of the child's own
+  (`use_worktree: true`) cut from your branch (`source_branch`) and named after the chip
+  (`branch_name: chip-<id>-…`, which the app prefixes and suffixes). Values you pass yourself
+  are kept, and `use_worktree: false` — the child sharing your checkout — makes it an
+  operational chip that reports instead.
+- `start_session` that the app does not let the hook shape — an offer's brief sent with
+  `proposal_id`, a `fork` — still gets the handoff block; the child has its own worktree when
+  you work in one, and otherwise shares your checkout and reports.
+- No chip for an offer's first call (the brief comes later), a cloud session, an SSH host, a
+  preset or another repository's clone: nothing there can be merged here.
+- `spawn_task`: the hook cuts the branch and worktree itself and sends the child there.
+
+Either way a repository with a commit to branch from gets a code chip, and anything else an
+operational chip that reports instead. The chip stays provisional until the call lands; one
+that is refused takes its card, and for `spawn_task` its worktree and branch, with it.
 
 `open` remains for a chip you are setting up by hand:
 
@@ -48,22 +62,24 @@ After the work is done and `development-verification` has closed it:
    what belongs to the chip. An operational chip verifies its effect against the system, as
    that skill's operational track requires.
 
-2. Run the `finish` command from the handoff block. In a chip worktree it needs no arguments
-   beyond the summary; an operational chip passes its `--chip <id>`. Nothing else: `finish`
-   resolves your own `sessionId` through the app's session registry, so the parent can archive
-   you or send you back without being told who you are. It names the chip by id, so run it from
-   wherever the shell already is. Commits made in a worktree outside the chip's directory count
-   once they are on the chip branch; `git -C <chip tree> merge --ff-only <branch>` puts them
-   there without a `cd`.
+2. Run the `finish` command from the handoff block. It names the chip by id, and resolves your
+   own `sessionId` through the app's session registry, so the parent can archive you or send
+   you back without being told who you are. A child the app gave its worktree runs it from that
+   worktree: `finish` finds the tree by the branch named after the chip, and when the branch
+   carries no chip id, takes the tree it runs in — never the parent's own checkout or branch.
+   In a `spawn_task` chip's worktree, commits made in a worktree outside the chip's directory
+   count once they are on the chip branch; `git -C <chip tree> merge --ff-only <branch>` puts
+   them there without a `cd`.
 
    For code it merges into the parent branch when that branch is checked out nowhere, and
    otherwise leaves it alone — merging into a branch a live session holds would move the ref
    out from under that session's index. When it does not merge, it writes a bundle of the
    chip's commits as a second route. For operational work it prints the report.
 
-3. Send the printed message to the parent with `mcp__ccd_session_mgmt__send_message` and the
-   `session_id` from the handoff block. This is the step the parent usually sees; a branch
-   notifies nobody.
+3. Send the printed message to the parent with `mcp__ccd_session_mgmt__send_message` (or
+   `SendMessage` with `to`) and the `session_id` from the handoff block. This is the step the
+   parent acts on: the app's note that your turn ended carries only the start of your last
+   message, none of the commands, and a session the user started sends no note at all.
 
    A parent that runs unattended — a scheduled task, a remote-dispatched session — cannot be
    messaged at all, and the send is refused by the target, not by you. That refusal is a
@@ -79,7 +95,10 @@ After the work is done and `development-verification` has closed it:
 A report is a claim, not evidence. Chips reach you two ways: as a message, and — when the send
 could not be delivered — as a line in your own Stop hook naming the chips still waiting. Both
 oblige you equally; `status` lists them at any time, and a resumed or scheduled session should
-drain it before picking the goal back up.
+drain it before picking the goal back up. The app's own note that a session you started ended
+its turn is not a report: it names the child's branch, but the chip is handed off only once
+the child has run `finish` — until then `status` shows it `open`, and the child is still owed
+its own handoff.
 
 The user set this up so as not to supervise chips one by one: this skill is their standing
 agreement to merge, accept and archive every chip that passes your verification, in the same
@@ -137,16 +156,20 @@ session's own.
 
 ## What enforces it
 
-In a chip's worktree a `Stop` hook speaks only when the session closes out work — a `[gate]`
-receipt in the final message — and blocks at most three times, naming the exact command. An
-ordinary turn is never interrupted, and a chip that has reported and tried to deliver is
-released even when delivery was impossible. `PostToolUse` and `PostToolUseFailure` hooks on
-`send_message` record the attempt, and delivery when it succeeded. In the parent — and only in
-the session that actually opened the chip — the same Stop hook lists the chips waiting for
-acceptance and repeats, without ever blocking, until each is closed.
-
-An operational chip has no worktree, so the child side has no Stop enforcement — its handoff
-block and this skill are what carry it.
+In a chip's session a `Stop` hook speaks only when the session closes out work — a `[gate]`
+receipt in the final message — and blocks at most three times, naming the exact command. It
+knows the session for a chip's by its worktree, by a branch named after the chip, or by the
+handoff block its first message ends with. It blocks only on proof: the chip's worktree, a
+branch named after the chip, or the app's registry pairing the session with the child it
+started. A block in the first message without that proof — a session can quote one — is only
+mentioned, never enforced. It never takes the session that opened the chip, nor one the
+registry pairs with another id than the child; a fork, whose first message is its parent's, is
+told apart only by `finish`. An ordinary turn is never interrupted, and a chip that has
+reported and tried to deliver is released even when delivery was impossible. `PostToolUse` and
+`PostToolUseFailure` hooks on `send_message` and `SendMessage` record the attempt, and delivery
+when it succeeded. In the parent — and only in the session that actually opened the chip — the
+same Stop hook lists the chips waiting for acceptance and repeats, without ever blocking, until
+each is closed.
 
 ## What this deliberately does not do
 

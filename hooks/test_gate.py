@@ -7011,6 +7011,23 @@ check(
     session().startswith(RUN + "_test_"),
     RUN,
 )
+# A subagent cannot end its turn to wait for a background review, so its Codex round runs in the
+# foreground, its Bash timeout 100 s past the template's own `timeout` so that the template, not
+# the harness, ends a hung run: the Bash ceiling has to hold that, and stay within the two hours
+# past which it would also lift the background-command limit.
+BACKGROUND_LIMIT_MS = 2 * 3600 * 1000
+FOREGROUND_MARGIN_S = 100
+with io.open(os.path.join(REAL_CONFIG_HOME, "commands", "adversarial-review.md"), encoding="utf-8") as stream:
+    template_caps = [int(cap) for cap in re.findall(r"^timeout (\d+) codex exec", stream.read(), re.M)]
+bash_ceiling = int((registered.get("env") or {}).get("BASH_MAX_TIMEOUT_MS") or 0)
+ceiling_facts = {"template_caps_s": template_caps, "bash_max_timeout_ms": bash_ceiling}
+check("the Codex launch templates name their caps", bool(template_caps), ceiling_facts)
+check("BASH_MAX_TIMEOUT_MS is set", bash_ceiling > 0, ceiling_facts)
+check(
+    "a foreground Codex round and its margin fit under the Bash ceiling, within two hours",
+    (max(template_caps or [0]) + FOREGROUND_MARGIN_S) * 1000 <= bash_ceiling <= BACKGROUND_LIMIT_MS,
+    ceiling_facts,
+)
 check(
     "the marker answers both halves of a shell command",
     any("Bash" in matcher for matcher in marker_events.get("PreToolUse") or ())

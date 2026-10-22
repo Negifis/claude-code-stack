@@ -58,7 +58,8 @@ of 222 Codex review launches returned no verdict, most of them for exactly these
 and every one of them cost the parent several full-context turns before the native lane ran
 anyway.
 
-Launch Codex as a background shell call (`run_in_background: true`) and end the turn. A review
+In the parent session, launch Codex as a background shell call (`run_in_background: true`) and
+end the turn. A review
 takes ten to forty minutes, longer than a foreground Bash call may run (the harness moves the
 call to the background at its timeout anyway), and the gate judges a backgrounded lane from
 what the harness records for it: the launch acknowledgement names the task id and the output
@@ -69,6 +70,15 @@ file is for you to read, not evidence. So do not poll: no `sleep`/`tail` loops o
 stderr capture, no `Monitor`, no `TaskOutput` — each poll is a full-context request that buys
 nothing, and the Stop hook lets a turn end while this session's own review is still running.
 Read the output file and `codex-<id>.err` only after the notification, to report the findings.
+A subagent that closes its own scope through the gate (`development-verification` §6) cannot
+end its turn and come back, so it runs the same launch in the foreground
+(`run_in_background: false`) with the Bash tool's `timeout` 100 s past the template's own:
+3700000 for the first template below, 7100000 for the XHIGH one, both inside
+`BASH_MAX_TIMEOUT_MS=7200000`. The template's `timeout` then ends a hung run before the harness
+would move the call to the background, where no notification reaches the subagent and the gate
+reads the lane as unjudged. The gate reads the result as a foreground one, bound to the rollout
+log Codex wrote while the call was open; wherever this page waits for the notification, a
+subagent reads the call's return instead.
 Launch the review last: the verdict is filed at the launch, because the packet froze the
 candidate then, so an edit to a lasting file after the launch expires it exactly as it would a
 foreground verdict — measured by content, so an edit reverted byte for byte does not, while a
@@ -106,7 +116,7 @@ attributed stands as an unresolved lane rather than being restated by you. `Task
 for this candidate: it reopens an earlier approval and counts toward draft-blocked.
 
 When the user explicitly requires cross-engine evidence, `--required` is mandatory: include the
-literal marker `CODE_WORK_GATE_REQUIRED` in the actual shell command (the same background
+literal marker `CODE_WORK_GATE_REQUIRED` in the actual shell command (the same
 launch), which binds
 this exact result to the candidate. A required call that answers without a verdict counts as an
 unavailable reviewer and ends the work draft-blocked rather than falling back to the native
@@ -124,8 +134,9 @@ So launch the lane with the user configuration ignored and only what a reviewer 
 on. Session logging is unaffected: rollouts still land in `CODEX_HOME/sessions`, which is what
 the gate binds the verdict to.
 
-Run it with `run_in_background: true`; `timeout 3600` stays as the hard cap on a hung run, well
-inside the two hours after which the gate stops treating the task as in flight.
+Run it as above: in the background from the parent session, in the foreground from a subagent.
+`timeout 3600` stays the hard cap on a hung run, below a subagent's Bash timeout and well inside
+the two hours after which the gate stops treating a background task as in flight.
 
 ```bash
 timeout 3600 codex exec --ignore-user-config \

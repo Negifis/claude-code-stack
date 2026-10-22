@@ -14,6 +14,10 @@ effect instead. Either way `finish` prints the message the child sends to the pa
 `close` records the parent's verdict once the parent has checked the result: accepted, and the
 child session can be archived, or sent back with what is missing.
 
+`start_session`, which replaces `spawn_task` in the desktop app, starts the child itself in a
+worktree the app cuts, so for it the spawn hook cuts nothing: it names the child's branch after
+the chip, cuts it from the parent's branch, and `finish` finds the tree when the child reports.
+
 Two hooks keep it honest without nagging. In a chip's own worktree the Stop hook speaks only
 when the child closes out work — a `[gate]` receipt in the final message — because a chip that
 is done without a handoff is the failure this exists to prevent. In the parent, and only in the
@@ -58,16 +62,33 @@ SESSION_REGISTRY = os.path.join(os.environ.get("APPDATA") or
 SESSION_MAP_CACHE = os.path.join(hc.STATE_DIR, "session-map.json")
 SESSION_MAP_TTL = 300.0
 SPAWN_TOOL = "mcp__ccd_session__spawn_task"
+# The desktop app's successor to `spawn_task` (read from app 2.42304): it starts a sibling
+# session in a worktree it cuts itself, from `source_branch`, on a branch named after `branch_name`.
+START_TOOL = "mcp__ccd_session__start_session"
+SPAWN_TOOLS = (SPAWN_TOOL, START_TOOL)
+# What `start_session` answers when a session started, or when it is waiting as a card: each kind
+# by its whole first line, so an id is taken only from the answer of its own kind. The title is
+# matched greedily, so the id is the one after it, whatever ids the title itself spells.
+STARTED_RE = re.compile(
+    r'^Started session ".*" \(session_id: (local_[0-9a-f-]{36})(?:, name: [^()\n]*)?\)', re.M)
+PROPOSED_RE = re.compile(r'^Proposed ".*" \(task_id: (task_[0-9a-f]{8})\)', re.M)
 PENDING_GRACE = 600.0
 # The footer carries this so a re-spawn of the same prompt is recognised by the chip it
 # names, not by prose that merely looks like a handoff block.
 CHIP_TOKEN_RE = re.compile(r"<!-- chip:([0-9a-f]{8}) -->")
+# The slug the spawn hook passes as `branch_name`; the app adds the user's prefix and a suffix.
+CHIP_BRANCH_RE = re.compile(r"(?:^|[/-])chip-([0-9a-f]{8})(?=$|[-_/])")
+# A session's first message, where a spawned session's handoff block sits, is near the top of
+# its transcript; the Stop hook reads no further than this.
+TRANSCRIPT_HEAD_BYTES = 256 * 1024
 # The session ids the session-management tools address. Anything else — a transcript id, a
 # typo, a paraphrase — must never reach `archive_session`, so the shape is checked, not just
 # the prefix.
 CCD_SESSION_RE = re.compile(
     r"^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 NOTIFY_TOOL = "mcp__ccd_session_mgmt__send_message"
+# The same delivery through the messaging tool, which names the session in `to`.
+PEER_NOTIFY_TOOL = "SendMessage"
 # The kinds are `code_work_gate_stop.TERMINAL_RE`'s, deliberately copied rather than imported:
 # each hook family here stays importable on its own. This one only asks whether the turn looks
 # like a closing one, so it stays a loose search where the gate's is a strict parse: it takes a
@@ -337,6 +358,162 @@ def records_for_parent(session_id):
     return records_from_index(BY_PARENT, session_id)
 
 
+def chip_of_branch(branch):
+    """The chip id a branch is named after, or None."""
+    match = CHIP_BRANCH_RE.search(branch or "")
+    return match.group(1) if match else None
+
+
+def head_branch(cwd):
+    """The branch checked out in the working tree that holds `cwd`, or None.
+
+    Read from the tree's own files rather than by starting git: the Stop hook asks this in every
+    session, and two small reads cost nothing beside a process.
+    """
+    path = os.path.abspath(cwd or os.getcwd())
+    while True:
+        dot_git = os.path.join(path, ".git")
+        if os.path.isdir(dot_git):
+            git_dir = dot_git
+            break
+        if os.path.isfile(dot_git):
+            try:
+                with open(dot_git, encoding="utf-8") as handle:
+                    pointer = handle.readline().strip()
+            except OSError:
+                return None
+            if not pointer.startswith("gitdir:"):
+                return None
+            git_dir = os.path.join(path, pointer[len("gitdir:"):].strip())
+            break
+        above = os.path.dirname(path)
+        if above == path:
+            return None
+        path = above
+    try:
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as handle:
+            head = handle.readline().strip()
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    return head[len(prefix):] if head.startswith(prefix) else None
+
+
+def chip_of_transcript(path):
+    """The chip whose handoff block ends a session's first message, or None.
+
+    A spawned session's first message is its task, and the block the spawn hook appended to it
+    ends with the chip's token. Only that message counts: a later one quoting a block is talk
+    about a chip, not the task of one.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            budget = TRANSCRIPT_HEAD_BYTES
+            while budget > 0:
+                line = handle.readline(budget)
+                if not line:
+                    return None
+                budget -= len(line)
+                content = first_message_text(line)
+                if content is not None:
+                    tokens = CHIP_TOKEN_RE.findall(content)
+                    return tokens[-1] if tokens else None
+    except OSError:
+        return None
+    return None
+
+
+def first_message_text(line):
+    """The text of a transcript line that is a user's message, or None for any other line."""
+    if '"user"' not in line:
+        return None
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        # A line cut off at the read budget; nothing past it is the first message.
+        return None
+    message = entry.get("message") if entry.get("type") == "user" else None
+    if not isinstance(message, dict) or entry.get("isMeta"):
+        return None
+    content = message.get("content")
+    if isinstance(content, list):
+        content = " ".join(block.get("text") or "" for block in content
+                           if isinstance(block, dict) and block.get("type") == "text")
+    return content if isinstance(content, str) and content.strip() else None
+
+
+def child_record(payload):
+    """(card, proven) for the chip this session works for, or (None, False).
+
+    A chip that cut its own worktree is found by the directory, and a child the app gave a
+    worktree (`start_session`) by its branch, named after the chip when the spawn hook could name
+    it: both are where only the child works. Failing those, the handoff block its first message
+    ends with points at the chip, but proves the session its child only when the registry pairs
+    it with the child the app named — a session can quote a block too.
+    """
+    cwd = payload.get("cwd") or os.getcwd()
+    record = record_for_tree(cwd)
+    if record:
+        return record, True
+    session = payload.get("session_id")
+    chip_id = chip_of_branch(head_branch(cwd))
+    record = read_json(record_path(chip_id)) if chip_id else None
+    if record and child_standing(record, session) is not None:
+        return record, True
+    chip_id = chip_of_transcript(payload.get("transcript_path"))
+    record = read_json(record_path(chip_id)) if chip_id else None
+    standing = child_standing(record, session) if record else None
+    return (record, standing) if standing is not None else (None, False)
+
+
+def child_standing(record, session):
+    """True when the ids prove this session the child the app named, False when they prove
+    nothing, None when they rule it out.
+
+    The session that opened the chip is never its child — it can sit on the chip's branch or
+    quote the block — and once the app named the child, a session the registry pairs with
+    another `local_…` id is not it: a fork of the child inherits its first message, block and
+    all.
+    """
+    own = ccd_for_transcript(session) if session else None
+    if session and (session == record.get("parent_hook_session")
+                    or (own and own == record.get("parent_session_id"))):
+        return None
+    expected = record.get("child_session_id")
+    if expected and own:
+        return True if own == expected else None
+    return False
+
+
+def locate_child_tree(record, cwd):
+    """(worktree, branch) the app cut for this chip's child, or None.
+
+    The branch named after the chip is the child's wherever it is checked out. A child whose
+    branch could not be named — a proposal the user started, a fork — is the tree `finish` runs
+    in, as long as that is a worktree of the same repository and neither the parent's own
+    checkout nor on the parent's branch: either would hand the parent its own work back.
+    """
+    repo_root = record.get("repo_root")
+    if not repo_root:
+        return None
+    def childs(path, branch):
+        return not same_path(path, repo_root) and not (
+            branch and branch == record.get("parent_branch"))
+
+    trees = worktrees_of(repo_root)
+    named = [(path, branch) for path, branch in trees
+             if chip_of_branch(branch) == record["chip_id"] and childs(path, branch)]
+    if named:
+        return next((row for row in named if under(cwd, row[0])), named[0])
+    ok, top, _ = git(cwd, "rev-parse", "--show-toplevel", timeout=10)
+    if not ok:
+        return None
+    return next(((path, branch) for path, branch in trees
+                 if same_path(top, path) and childs(path, branch)), None)
+
+
 def worktrees_of(repo_root):
     """[(path, branch)] for every worktree of this repository; branch is None when detached."""
     ok, out, _ = git(repo_root, "worktree", "list", "--porcelain")
@@ -350,6 +527,11 @@ def worktrees_of(repo_root):
         elif line.startswith("branch refs/heads/") and found:
             found[-1][1] = line[len("branch refs/heads/"):].strip()
     return [(os.path.realpath(pth), branch) for pth, branch in found if pth]
+
+
+def same_path(one, other):
+    """Whether two spellings name the same directory, as the filesystem resolves them."""
+    return under(one, other) and under(other, one)
 
 
 def under(path, root):
@@ -531,8 +713,13 @@ def cmd_open(args):
     return 0
 
 
-def create_chip(title, cwd, session, operational, transcript=None, tool_use_id=None):
-    """Register a chip and, for code work, cut its worktree. Raises ChipError."""
+def create_chip(title, cwd, session, operational, transcript=None, tool_use_id=None,
+                cut_worktree=True):
+    """Register a chip and, for code work, cut its worktree. Raises ChipError.
+
+    `start_session` cuts the child's worktree itself, so `cut_worktree=False` records only where
+    the child branches from and the slug its branch is named after; `finish` finds the tree.
+    """
     cwd = os.path.abspath(cwd or os.getcwd())
     transcript = transcript or hook_session_id()
     # The parent almost never knows its own `local_…` id, and asking for it was one more thing
@@ -574,26 +761,29 @@ def create_chip(title, cwd, session, operational, transcript=None, tool_use_id=N
         _, branch, _ = git(repo_root, "rev-parse", "--abbrev-ref", "HEAD", timeout=10)
         parent_branch = None if branch in ("", "HEAD") else branch
         slug = slugify(title)
-        chip_branch = "chip/{}-{}".format(slug, chip_id)
-        worktree = os.path.join(
-            TREE_ROOT, "{}-{}-{}".format(os.path.basename(repo_root), slug, chip_id))
-        os.makedirs(TREE_ROOT, exist_ok=True)
-        ok, _, err = git(repo_root, "worktree", "add", "-b", chip_branch, worktree,
-                         parent_branch or head, timeout=20)
-        if not ok:
-            raise ChipError("не удалось создать worktree {}\n{}".format(worktree, err))
-        record.update({
-            "repo_root": repo_root, "parent_branch": parent_branch, "worktree": worktree,
-            "chip_branch": chip_branch, "base_sha": head,
-        })
+        record.update({"repo_root": repo_root, "parent_branch": parent_branch,
+                       "base_sha": head, "worktree": None, "chip_branch": None})
+        if cut_worktree:
+            chip_branch = "chip/{}-{}".format(slug, chip_id)
+            worktree = os.path.join(
+                TREE_ROOT, "{}-{}-{}".format(os.path.basename(repo_root), slug, chip_id))
+            os.makedirs(TREE_ROOT, exist_ok=True)
+            ok, _, err = git(repo_root, "worktree", "add", "-b", chip_branch, worktree,
+                             parent_branch or head, timeout=20)
+            if not ok:
+                raise ChipError("не удалось создать worktree {}\n{}".format(worktree, err))
+            record.update({"worktree": worktree, "chip_branch": chip_branch})
+        else:
+            # The id leads, so whatever the app trims off the end of the slug, it stays.
+            record["branch_slug"] = "chip-{}-{}".format(chip_id, slug)
     with chip_lock() as held:
         if not held:
             discard_chip(record)
             raise ChipError("карточки чипов заняты другой операцией — чип не заведён")
         try:
             save_record(record)
-            if not operational:
-                index_write(BY_TREE, hc.tree_key(worktree), chip_id)
+            if record.get("worktree"):
+                index_write(BY_TREE, hc.tree_key(record["worktree"]), chip_id)
             if tool_use_id:
                 index_write(BY_SPAWN, tool_use_id, chip_id)
             for key in (session, transcript):
@@ -636,7 +826,7 @@ def finish_command(record):
 def handoff_footer(record):
     lines = ["<!-- chip:{} -->".format(record["chip_id"]),
              "## Возврат работы родителю", ""]
-    if record["mode"] == "code":
+    if record["mode"] == "code" and record.get("worktree"):
         lines += [
             "Ты работаешь в отдельном worktree на ветке `{}`, отведённой от `{}`.".format(
                 record["chip_branch"], record.get("parent_branch") or record["base_sha"][:12]),
@@ -646,6 +836,19 @@ def handoff_footer(record):
             "",
             "1. Закоммить всё в этом worktree.",
             "2. Выполни:",
+        ]
+    elif record["mode"] == "code":
+        lines += [
+            "Ты работаешь в своём worktree, отдельном от дерева родителя: его создало "
+            "приложение.",
+            "Родительская сессия ждёт результат. Приложение может сообщить ей, что твой ход "
+            "закончился, но перескажет только начало последнего сообщения — как забрать "
+            "работу, она узнает лишь из твоего отчёта.",
+            "",
+            "Закончив работу и пройдя `development-verification`:",
+            "",
+            "1. Закоммить всё в своём worktree.",
+            "2. Выполни из него:",
         ]
     else:
         lines += [
@@ -790,6 +993,13 @@ def cmd_finish(args):
         record["status"] = "handed-off"
         record["outcome"] = "reported"
         return publish_report(record)
+
+    if not record.get("worktree"):
+        located = locate_child_tree(record, cwd)
+        if not located:
+            return fail("не найден worktree чипа {}: запусти finish из своего worktree — того, "
+                        "где закоммичена работа".format(record["chip_id"]))
+        record["worktree"], record["chip_branch"] = located
 
     base, base_commit = base_ref(record)
     sources = work_sources(record, base_commit)
@@ -999,6 +1209,11 @@ def publish_report(record):
             return fail("чип {} уже принят родителем — отчёт не записан"
                         .format(record["chip_id"]))
         save_record(record)
+        # A worktree `finish` found rather than cut is indexed now, so the hooks that look a chip
+        # up by its directory find this one too.
+        tree = record.get("worktree")
+        if tree and record["chip_id"] not in index_read(BY_TREE, hc.tree_key(tree)):
+            index_write(BY_TREE, hc.tree_key(tree), record["chip_id"])
     print(notification(record))
     return 0
 
@@ -1063,12 +1278,8 @@ def cmd_status(args):
     # Always the cards themselves, never the index: the index carries only what is still
     # pending, so reading it here would make `--all` mean different things with and without
     # `--session`. This runs by hand, not in a hook, so a small directory listing is free.
-    records = []
-    if os.path.isdir(CHIP_DIR):
-        records = [read_json(os.path.join(CHIP_DIR, name))
-                   for name in sorted(os.listdir(CHIP_DIR)) if name.endswith(".json")]
-    rows = [r for r in records if r and r.get("chip_id")
-            and (args.all or r["status"] != "accepted")
+    rows = [r for r in all_cards()
+            if (args.all or r["status"] != "accepted")
             and (not args.session or args.session in (r.get("parent_session_id"),
                                                       r.get("parent_hook_session")))]
     if not rows:
@@ -1085,41 +1296,57 @@ def hook_stop():
     payload = hc.read_payload()
     if payload is None:
         return 0
-    cwd = payload.get("cwd") or os.getcwd()
-    closing = bool(GATE_RECEIPT.search(payload.get("last_assistant_message") or ""))
-    if child_reminder(cwd, closing):
-        return 0
-    parent_reminder(payload.get("session_id"))
+    notes = []
+    if GATE_RECEIPT.search(payload.get("last_assistant_message") or ""):
+        record, proven = child_record(payload)
+        if proven and child_reminder(record):
+            return 0
+        owed = handoff_due(record) if record and not proven else None
+        if owed:
+            # A block in the first message only points at the chip; blocking on that alone would
+            # hold a session that merely quotes one, so it is said, not enforced.
+            notes.append("Если это сессия чипа «{}» — её первое сообщение кончается его блоком "
+                         "возврата, — работа не передана.\n{}".format(record.get("title"), owed))
+    owed_parent = parent_note(payload.get("session_id"))
+    if owed_parent:
+        notes.append(owed_parent)
+    if notes:
+        print(json.dumps({"systemMessage": "\n\n".join(notes)}, ensure_ascii=False))
     return 0
 
 
-def child_reminder(cwd, closing):
-    """Block a chip session that is closing out work without having handed it back."""
-    record = record_for_tree(cwd)
-    if not record or not closing or record.get("blocks", 0) >= MAX_BLOCKS:
-        return False
+def handoff_due(record):
+    """What the chip's child still owes before closing out, as the instruction, or None."""
     # A chip the parent has already ruled on is finished with its child, whether or not a
     # message was ever delivered; nagging it then asks for something nobody is waiting for.
     if record["status"] in ("accepted", "rework", "pending"):
-        return False
+        return None
     # An attempt is enough once the report is written. A parent that runs unattended cannot be
     # messaged at all, so demanding a delivered notification would hold such a chip hostage to
     # something it can never achieve — the card is the delivery in that case.
     if record["status"] != "open" and (record.get("notified")
                                        or record.get("delivery_attempted")):
-        return False
-
+        return None
     where = " с session_id {}".format(record["parent_session_id"]) if record.get(
         "parent_session_id") else ""
     if record["status"] == "open":
-        reason = ("Это worktree чипа «{}». Работа закрывается, но родительская сессия её не "
-                  "получит.\nЗакоммить всё и выполни:\n  {}\nЗатем отправь напечатанный текст "
-                  "в родительскую сессию через {}{}.").format(
-                      record.get("title"), finish_command(record), NOTIFY_TOOL, where)
-    else:
-        reason = ("Чип «{}» подготовлен к передаче, но родительская сессия не уведомлена.\n"
-                  "Отправь итог через {}{}.").format(record.get("title"), NOTIFY_TOOL, where)
+        first = ("Закоммить всё и выполни" if record.get("mode") == "code"
+                 else "Проверь эффект по самой системе и выполни")
+        return ("Это сессия чипа «{}». Работа закрывается, но родительская сессия её не "
+                "получит.\n{}:\n  {}\nЗатем отправь напечатанный текст "
+                "в родительскую сессию через {}{}.").format(
+                    record.get("title"), first, finish_command(record), NOTIFY_TOOL, where)
+    return ("Чип «{}» подготовлен к передаче, но родительская сессия не уведомлена.\n"
+            "Отправь итог через {}{}.").format(record.get("title"), NOTIFY_TOOL, where)
 
+
+def child_reminder(record):
+    """Block a chip session that is closing out work without having handed it back."""
+    if not record or record.get("blocks", 0) >= MAX_BLOCKS:
+        return False
+    reason = handoff_due(record)
+    if not reason:
+        return False
     with chip_lock() as held:
         # Without the lock the count is written from a copy read before the parent may have
         # closed the chip, and the verdict is lost. A block skipped costs one reminder.
@@ -1137,15 +1364,15 @@ def child_reminder(cwd, closing):
     return True
 
 
-def parent_reminder(session_id):
-    """Tell the parent a chip is reported and still unverified. Never blocks.
+def parent_note(session_id):
+    """What the parent is told about chips reported and still unverified, or None. Never blocks.
 
     Deliberately repeats until the chip is closed: a report the parent never acted on is
     exactly the state this exists to surface, and a nudge that fires once is a nudge that gets
     scrolled past.
     """
     if not session_id:
-        return
+        return None
     seen, pending = set(), []
     # Both ids of the session, because a resumed parent keeps its `local_…` id while its
     # transcript id changes: keyed only by the transcript, it would never hear about the chips
@@ -1162,14 +1389,12 @@ def parent_reminder(session_id):
             if record.get("status") == "handed-off":
                 pending.append(record)
     if not pending:
-        return
+        return None
     listed = ", ".join("{} «{}»".format(r["chip_id"], r.get("title")) for r in pending)
-    print(json.dumps({"systemMessage": (
-        "Чипы отчитались и ждут приёмки: {}. Проверь результат сам и закрой каждый — "
-        "chip_handoff.py close --chip <id> --accept | --rework \"...\"; "
-        "прошедший проверку чип влей (если ещё не влит), прими и заархивируй его сессию, "
-        "не спрашивая пользователя; после --rework отправь ей правки."
-        .format(listed))}, ensure_ascii=False))
+    return ("Чипы отчитались и ждут приёмки: {}. Проверь результат сам и закрой каждый — "
+            "chip_handoff.py close --chip <id> --accept | --rework \"...\"; "
+            "прошедший проверку чип влей (если ещё не влит), прими и заархивируй его сессию, "
+            "не спрашивая пользователя; после --rework отправь ей правки.".format(listed))
 
 
 def spawn_mode(cwd):
@@ -1325,8 +1550,49 @@ def chip_cwd(worktree, parent_cwd, repo_root):
     return target
 
 
+def starts_a_chip(spawn):
+    """Whether a `start_session` call starts a child that can hand work back here.
+
+    An offer's first call carries only a title — its brief follows with `proposal_id` once the
+    user picks a new session, and that call registers the chip. A proposal already registered
+    when it was offered starts with its id alone and nothing new. A cloud session, an SSH host,
+    a preset or another repository's clone runs where this machine's branches never see it.
+    """
+    if not isinstance(spawn.get("prompt"), str) or not spawn["prompt"].strip():
+        return False
+    if spawn.get("target") in ("cloud", "ssh"):
+        return False
+    if any(spawn.get(key) for key in ("host", "preset", "repository", "environment")):
+        return False
+    proposal = spawn.get("proposal_id")
+    return not (proposal and any(card.get("proposal_task_id") == proposal for card in all_cards()))
+
+
+def start_shape(spawn, parent_cwd):
+    """(shapes, own_tree) for a `start_session` call that starts a chip.
+
+    A fresh session is shaped here: given a worktree of its own unless the caller asked to share
+    the checkout, cut from the parent's branch and named after the chip. A fork or a proposal's
+    start takes no such options; it gets its own worktree exactly when the parent works in one,
+    which is the app's own rule for both.
+    """
+    if (spawn.get("context") or "fresh") == "fresh" and not spawn.get("proposal_id"):
+        own_tree = spawn.get("use_worktree") is not False
+        return own_tree, own_tree
+    return False, hc.linked_worktree(parent_cwd)
+
+
+def all_cards():
+    if not os.path.isdir(CHIP_DIR):
+        return []
+    return [card for card in (read_json(os.path.join(CHIP_DIR, name))
+                              for name in sorted(os.listdir(CHIP_DIR)) if name.endswith(".json"))
+            if card and card.get("chip_id")]
+
+
 def hook_spawn():
-    """Register the chip `spawn_task` is about to create, and hand it its way back.
+    """Register the chip `spawn_task` or `start_session` is about to create, and hand it its way
+    back.
 
     Everything else here assumed somebody ran `open` first. Nobody did: across every transcript
     on this machine `spawn_task` was called hundreds of times and `open` once. A procedure the
@@ -1335,15 +1601,20 @@ def hook_spawn():
 
     The chip is cut here and stays `pending` until the spawn actually lands, and the tool input
     is rewritten to carry the handoff block and, for code work, the chip worktree as the child
-    directory. The permission decision is left alone: this hook exists to add a route home, not
-    to approve delegating. Fail-open in every branch — a chip that spawns without a card is the
-    old behaviour, while a hook that raises would stop the user delegating at all.
+    directory — or, for `start_session`, a worktree of the child's own, cut from the parent's
+    branch and named after the chip, which the app makes. The permission decision is left alone:
+    this hook exists to add a route home, not to approve delegating. Fail-open in every branch —
+    a chip that spawns without a card is the old behaviour, while a hook that raises would stop
+    the user delegating at all.
     """
     payload = hc.read_payload()
-    if payload is None or payload.get("tool_name") != SPAWN_TOOL:
+    if payload is None or payload.get("tool_name") not in SPAWN_TOOLS:
         return 0
     spawn = payload.get("tool_input")
     if not isinstance(spawn, dict):
+        return 0
+    starting = payload["tool_name"] == START_TOOL
+    if starting and not starts_a_chip(spawn):
         return 0
     if already_registered(spawn.get("prompt") or "", payload.get("tool_use_id")):
         return 0
@@ -1360,10 +1631,15 @@ def hook_spawn():
         asked_cwd = None
     parent_cwd = os.path.abspath(asked_cwd or payload.get("cwd") or os.getcwd())
     operational, repo_root = spawn_mode(parent_cwd)
+    # Whether this call may shape the child's worktree, and whether the child gets one at all;
+    # a child sharing the parent's checkout has nothing to merge and reports instead.
+    shapes, child_has_tree = start_shape(spawn, parent_cwd) if starting else (False, True)
+    operational = operational or not child_has_tree
     try:
         record = create_chip(spawn.get("title") or "Чип", parent_cwd, None, operational,
                              transcript=payload.get("session_id") or hook_session_id(),
-                             tool_use_id=payload.get("tool_use_id"))
+                             tool_use_id=payload.get("tool_use_id"),
+                             cut_worktree=not starting)
     except Exception:
         return 0
 
@@ -1371,7 +1647,13 @@ def hook_spawn():
     updated["prompt"] = (without_stale_handoff(spawn.get("prompt") or "") + "\n\n"
                          + handoff_footer(record))
     if record["mode"] == "code":
-        updated["cwd"] = chip_cwd(record["worktree"], parent_cwd, repo_root)
+        if not starting:
+            updated["cwd"] = chip_cwd(record["worktree"], parent_cwd, repo_root)
+        elif shapes:
+            updated["use_worktree"] = True
+            updated["branch_name"] = spawn.get("branch_name") or record["branch_slug"]
+            if not spawn.get("source_branch") and record.get("parent_branch"):
+                updated["source_branch"] = record["parent_branch"]
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": updated,
@@ -1382,10 +1664,14 @@ def hook_spawn():
 def hook_spawned(failed=False):
     """Finalize or discard the chip once the spawn itself has landed."""
     payload = hc.read_payload()
-    if payload is None or payload.get("tool_name") != SPAWN_TOOL:
+    if payload is None or payload.get("tool_name") not in SPAWN_TOOLS:
         return 0
     record = record_for_spawn(payload.get("tool_use_id"))
-    if not record or record.get("status") != "pending":
+    if not record:
+        if not failed:
+            bind_started_proposal(payload)
+        return 0
+    if record.get("status") != "pending":
         return 0
     with chip_lock() as held:
         if not held:
@@ -1396,6 +1682,14 @@ def hook_spawned(failed=False):
         if failed:
             discard_chip(fresh)
             return 0
+        # `start_session` names the child it started, or the card waiting for the user; an
+        # answer worded otherwise binds nothing and leaves the chip as `spawn_task` would.
+        answer = answer_text(payload)
+        started, proposed = answered_id(STARTED_RE, answer), answered_id(PROPOSED_RE, answer)
+        if started and not fresh.get("child_session_id"):
+            fresh["child_session_id"] = started
+        if proposed:
+            fresh["proposal_task_id"] = proposed
         fresh["status"] = "open"
         try:
             save_record(fresh)
@@ -1405,13 +1699,57 @@ def hook_spawned(failed=False):
     return 0
 
 
+def answer_text(payload):
+    """What the tool answered, as text, whatever shape the payload carries it in."""
+    answer = payload.get("tool_response")
+    if isinstance(answer, dict):
+        answer = answer.get("content", answer)
+    if isinstance(answer, list):
+        texts = [block.get("text") for block in answer if isinstance(block, dict)]
+        if texts and all(isinstance(text, str) for text in texts):
+            return "\n".join(texts)
+    return answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+
+
+def answered_id(pattern, answer):
+    """The id an answer of this kind gives in its own metadata, or None for another kind."""
+    found = pattern.search(answer)
+    return found.group(1) if found else None
+
+
+def bind_started_proposal(payload):
+    """Record the child a proposal's own start produced, on the card that proposal registered.
+
+    A proposal is registered when it is offered; starting it later is a call of its own, with
+    the proposal's id and no brief, so nothing else ties the session it started to the chip.
+    """
+    proposal = (payload.get("tool_input") or {}).get("proposal_id")
+    if payload.get("tool_name") != START_TOOL or not proposal:
+        return
+    started = answered_id(STARTED_RE, answer_text(payload))
+    if not started:
+        return
+    with chip_lock() as held:
+        if not held:
+            return
+        for card in all_cards():
+            if card.get("proposal_task_id") == proposal and not card.get("child_session_id"):
+                card["child_session_id"] = started
+                try:
+                    save_record(card)
+                except Exception:
+                    pass
+
+
 def hook_notified(failed=False):
     payload = hc.read_payload()
-    if payload is None or payload.get("tool_name") != NOTIFY_TOOL:
+    if payload is None or payload.get("tool_name") not in (NOTIFY_TOOL, PEER_NOTIFY_TOOL):
         return 0
-    target = (payload.get("tool_input") or {}).get("session_id")
+    sent = payload.get("tool_input") or {}
+    target = sent.get("session_id") or sent.get("to")
     sender = payload.get("session_id")
-    record = record_for_tree(payload.get("cwd") or os.getcwd())
+    record, proven = child_record(payload)
+    record = record if proven else None
     if record and record.get("parent_session_id") and target != record["parent_session_id"]:
         return 0
     if not record:

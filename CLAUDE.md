@@ -38,8 +38,8 @@ reliability, root-cause resolution, minimal complete changes, and the user's tim
 - One writer per file or tightly coupled scope. Review lanes are read-only, never delegate,
   and never open their own gate.
 - Follow-up work the task turns up is never dropped as "not mine". Inside the task's scope
-  (`development-verification` §4) it goes to a subagent; outside the scope it goes to a
-  `spawn_task` chip through `chip-handoff`. The parent verifies a subagent's or a chip's result
+  (`development-verification` §4) it goes to a subagent; outside the scope it goes to a chip
+  through `chip-handoff`. The parent verifies a subagent's or a chip's result
   itself before relying on it or closing it.
 - Prefer at most three subagents at once; more only when each extra lane has its own
   independent result. A subagent opens subagents only for helper lanes and its own gate lanes,

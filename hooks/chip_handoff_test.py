@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 import hygiene_common as hc
-from chip_handoff import safe_key
+from chip_handoff import CHIP_TOKEN_RE, head_branch, safe_key
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
@@ -1496,6 +1496,356 @@ def test_the_same_call_registered_twice_is_left_alone(root):
     check("and no second chip is cut", len(mine) == 1, [c["chip_id"] for c in mine])
 
 
+START_TOOL = "mcp__ccd_session__start_session"
+CHILD = "local_0c0ffee0-1111-4222-8333-444455556666"
+
+
+def start(cwd, tool_input, session="transcript-start", tool_use_id="toolu_start", answer=None):
+    """`start_session` through the spawn hook, then its answer through the landing hook."""
+    payload = {"cwd": cwd, "session_id": session, "tool_use_id": tool_use_id,
+               "tool_name": START_TOOL, "tool_input": tool_input}
+    code, out = hook("hook-spawn", payload)
+    if answer is not None:
+        hook("hook-spawned", dict(payload, tool_response=[{"type": "text", "text": answer}]))
+    return code, (json.loads(out) if out else None)
+
+
+def started(title="Разобрать падение", child=CHILD):
+    return ('Started session "{}" (session_id: {}, name: fix). It runs on its own; you get a '
+            "note here when its turn ends.".format(title, child))
+
+
+def brief(**extra):
+    return {"initiation": "user_asked", "title": "Разобрать падение", "prompt": "Почини тест.",
+            "background": "Контекст задачи.", **extra}
+
+
+def app_worktree(repo, branch, base="main"):
+    """A worktree the way the app cuts one for a started session: inside the repository."""
+    tree = os.path.join(repo, ".claude", "worktrees", branch.replace("/", "-"))
+    git(repo, "worktree", "add", "-q", "-b", branch, tree, base)
+    git(tree, "config", "user.email", "test@example.invalid")
+    git(tree, "config", "user.name", "Chip Test")
+    return tree
+
+
+def card_of(out):
+    return CHIP_TOKEN_RE.search(out["hookSpecificOutput"]["updatedInput"]["prompt"]).group(1)
+
+
+def test_start_session_registers_a_chip_and_shapes_the_child(root):
+    repo = make_repo(root, "start-repo")
+    code, out = start(repo, brief(), session="transcript-start-repo", answer=started())
+    if not check("start_session gets a chip", code == 0 and out, out):
+        return
+    updated = out["hookSpecificOutput"]["updatedInput"]
+    chip_id = card_of(out)
+    check("the child is told how to report", "## Возврат работы родителю" in updated["prompt"])
+    check("the brief survives", "Почини тест." in updated["prompt"]
+          and updated.get("background") == "Контекст задачи.")
+    check("the child gets a worktree of its own", updated.get("use_worktree") is True, updated)
+    check("its branch is named after the chip",
+          str(updated.get("branch_name", "")).startswith("chip-" + chip_id), updated)
+    check("it is cut from the parent's branch", updated.get("source_branch") == "main", updated)
+    check("no directory is forced on it", "cwd" not in updated, updated)
+    card = record_of(chip_id)
+    trees = os.path.join(chips_dir(), "trees")
+    check("no worktree is cut by the hook", card.get("worktree") is None
+          and not any(chip_id in name for name in
+                      (os.listdir(trees) if os.path.isdir(trees) else ())), card)
+    check("the landed start opens the chip", card["status"] == "open", card["status"])
+    check("the started child is recorded", card.get("child_session_id") == CHILD, card)
+
+
+def test_start_session_keeps_the_callers_own_choices(root):
+    repo = make_repo(root, "start-choices-repo")
+    git(repo, "branch", "release")
+    _, out = start(repo, brief(branch_name="my-slug", source_branch="release"),
+                   session="transcript-start-choices", tool_use_id="toolu_choices")
+    updated = out["hookSpecificOutput"]["updatedInput"]
+    check("the caller's branch name is kept", updated.get("branch_name") == "my-slug", updated)
+    check("the caller's source branch is kept", updated.get("source_branch") == "release",
+          updated)
+    _, shared = start(repo, brief(use_worktree=False), session="transcript-start-choices",
+                      tool_use_id="toolu_shared")
+    updated = shared["hookSpecificOutput"]["updatedInput"]
+    check("a shared checkout stays shared", updated.get("use_worktree") is False
+          and "branch_name" not in updated and "source_branch" not in updated, updated)
+    check("and its chip reports instead of merging",
+          record_of(card_of(shared))["mode"] == "operational")
+
+
+def test_start_session_calls_that_start_no_chip(root):
+    repo = make_repo(root, "start-none-repo")
+    before = len(cards())
+    for number, (label, tool_input) in enumerate((
+            ("an offer's first call", {"initiation": "offer", "title": "Сделать отдельно"}),
+            ("a cloud session", brief(target="cloud")),
+            ("an SSH host", brief(target="ssh", host="vm")),
+            ("another repository's clone", brief(target="cloud", repository="o/r")),
+            ("a preset", brief(preset="work")))):
+        code, out = start(repo, tool_input, tool_use_id="toolu_none_{}".format(number))
+        check("{} is left alone".format(label), code == 0 and out is None, out)
+    check("and no card is written", len(cards()) == before)
+
+
+def test_a_proposal_is_bound_and_not_registered_twice(root):
+    repo = make_repo(root, "start-proposal-repo")
+    answer = ('Proposed "Разобрать падение" (task_id: task_1a2b3c4d). The user sees a card and '
+              "nothing runs until they start it.")
+    _, out = start(repo, brief(initiation="own_initiative"), session="transcript-proposal",
+                   tool_use_id="toolu_proposal", answer=answer)
+    chip_id = card_of(out)
+    check("the waiting card is recorded", record_of(chip_id).get("proposal_task_id")
+          == "task_1a2b3c4d", record_of(chip_id))
+    code, again = start(repo, {"proposal_id": "task_1a2b3c4d"}, session="transcript-proposal",
+                        tool_use_id="toolu_proposal_start", answer=started())
+    check("starting it by id cuts nothing new", code == 0 and again is None, again)
+    check("but the session it started is recorded on the proposal's card",
+          record_of(chip_id).get("child_session_id") == CHILD, record_of(chip_id))
+    code, again = start(repo, {"proposal_id": "task_1a2b3c4d", "prompt": "Ещё раз."},
+                        session="transcript-proposal", tool_use_id="toolu_proposal_brief")
+    check("nor does a brief sent with its id", code == 0 and again is None, again)
+
+
+def test_an_offer_started_with_its_brief_is_a_chip(root):
+    repo = make_repo(root, "start-offer-repo")
+    _, out = start(repo, {"proposal_id": "task_0ffe0ffe", "prompt": "Почини тест.",
+                          "background": "Контекст."},
+                   session="transcript-offer", tool_use_id="toolu_offer")
+    if not check("the brief registers the chip", out is not None):
+        return
+    updated = out["hookSpecificOutput"]["updatedInput"]
+    check("only the brief is changed — the app refuses other keys with proposal_id",
+          set(updated) == {"proposal_id", "prompt", "background"}, sorted(updated))
+    check("a plain checkout's offer shares it and reports",
+          record_of(card_of(out))["mode"] == "operational")
+
+
+def test_a_fork_from_a_worktree_session_is_a_code_chip(root):
+    repo = make_repo(root, "start-fork-repo")
+    parent_tree = app_worktree(repo, "in/parent-work")
+    _, out = start(parent_tree, {"initiation": "user_asked", "title": "Форк",
+                                 "prompt": "Продолжи.", "context": "fork"},
+                   session="transcript-fork", tool_use_id="toolu_fork")
+    updated = out["hookSpecificOutput"]["updatedInput"]
+    check("a fork takes no worktree options", "use_worktree" not in updated
+          and "branch_name" not in updated, updated)
+    card = record_of(card_of(out))
+    check("but from a worktree session it gets its own and merges back",
+          card["mode"] == "code" and card.get("parent_branch") == "in/parent-work", card)
+
+
+def test_a_started_child_finishes_from_the_worktree_the_app_cut(root):
+    repo = make_repo(root, "start-finish-repo")
+    _, out = start(repo, brief(), session="transcript-start-finish",
+                   tool_use_id="toolu_start_finish", answer=started())
+    chip_id = card_of(out)
+    branch = "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"] + "-4f2a1c"
+    tree = app_worktree(repo, branch)
+    commit_work(tree)
+    code, report, err = cli(tree, "finish", "--chip", chip_id, "--message", "починил")
+    if not check("finish runs from the app's worktree", code == 0, err):
+        return
+    card = record_of(chip_id)
+    check("it records the tree it found", os.path.realpath(card.get("worktree") or "")
+          == os.path.realpath(tree), card.get("worktree"))
+    check("and the branch the app named", card.get("chip_branch") == branch, card)
+    check("the parent's busy branch is left alone", card["outcome"] == "branch-busy",
+          card["outcome"])
+    check("the parent is told how to take it", "git merge --no-ff {}".format(branch) in report,
+          report)
+    check("the started child stays the one to archive", card.get("child_session_id") == CHILD)
+    index = os.path.join(chips_dir(), "by-tree", hc.tree_key(card["worktree"]))
+    check("the found tree is indexed", os.path.exists(index)
+          and chip_id in open(index, encoding="utf-8").read())
+
+
+def test_finish_never_takes_the_parents_checkout_for_the_child(root):
+    repo = make_repo(root, "start-own-tree-repo")
+    _, out = start(repo, brief(branch_name="named-by-caller"),
+                   session="transcript-own-tree", tool_use_id="toolu_own_tree")
+    chip_id = card_of(out)
+    code, _, err = cli(repo, "finish", "--chip", chip_id, "--message", "x")
+    check("the parent's own tree is refused", code != 0 and "не найден worktree" in err, err)
+    git(repo, "switch", "-q", "-c", "parent-moved-on")
+    code, _, err = cli(repo, "finish", "--chip", chip_id, "--message", "x")
+    check("even after the parent's checkout moved to another branch", code != 0
+          and "не найден worktree" in err, err)
+    on_parent_branch = os.path.join(repo, ".claude", "worktrees", "on-main")
+    git(repo, "worktree", "add", "-q", on_parent_branch, "main")
+    code, _, err = cli(on_parent_branch, "finish", "--chip", chip_id, "--message", "x")
+    check("a tree on the parent's branch is refused too", code != 0
+          and "не найден worktree" in err, err)
+    other = app_worktree(repo, "in/named-by-caller-123abc")
+    commit_work(other)
+    code, _, err = cli(other, "finish", "--chip", chip_id, "--message", "x")
+    check("the tree finish runs in is taken when the branch carries no chip id",
+          code == 0 and record_of(chip_id).get("chip_branch") == "in/named-by-caller-123abc",
+          err)
+
+
+def write_transcript(root, name, *messages):
+    path = os.path.join(root, name + ".jsonl")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "summary", "summary": "x"}) + "\n")
+        for text in messages:
+            handle.write(json.dumps({"type": "user",
+                                     "message": {"role": "user", "content": text}}) + "\n")
+    return path
+
+
+def test_a_started_child_is_held_to_the_handoff(root):
+    repo = make_repo(root, "start-stop-repo")
+    _, out = start(repo, brief(), session="transcript-start-stop", tool_use_id="toolu_stop",
+                   answer=started())
+    chip_id = card_of(out)
+    named = app_worktree(repo, "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"]
+                         + "-aaaaaa")
+    code, blocked = stop(named, "Готово.\n\n" + RECEIPT, session_id="transcript-child")
+    check("found by its branch, a closing child is blocked",
+          code == 0 and '"block"' in blocked and chip_id in blocked, blocked)
+
+    named_child = CHILD.replace("0c", "0d")
+    write_session_registry("transcript-held-child", named_child)
+    _, out2 = start(repo, brief(branch_name="callers-own"), session="transcript-start-stop",
+                    tool_use_id="toolu_stop_2", answer=started(child=named_child))
+    unnamed = app_worktree(repo, "in/callers-own-bbbbbb")
+    prompt = out2["hookSpecificOutput"]["updatedInput"]["prompt"]
+    first = write_transcript(root, "child-first", prompt, "ещё сообщение")
+    code, blocked = hook("hook-stop", {"cwd": unnamed, "transcript_path": first,
+                                       "session_id": "transcript-held-child",
+                                       "last_assistant_message": "Готово.\n\n" + RECEIPT})
+    check("found by its first message and proven by the registry, it is blocked too",
+          code == 0 and '"block"' in blocked and card_of(out2) in blocked, blocked)
+    code, told = hook("hook-stop", {"cwd": unnamed, "transcript_path": first,
+                                    "session_id": "transcript-nobody-knows",
+                                    "last_assistant_message": "Готово.\n\n" + RECEIPT})
+    check("unproven, a block in the first message is only told, never enforced",
+          code == 0 and '"block"' not in told and "systemMessage" in told
+          and card_of(out2) in told, told)
+    later = write_transcript(root, "child-later", "Обычная задача.", prompt)
+    code, quiet = hook("hook-stop", {"cwd": unnamed, "transcript_path": later,
+                                     "last_assistant_message": "Готово.\n\n" + RECEIPT})
+    check("a block quoted after the first message binds nothing", code == 0 and quiet == "",
+          quiet)
+
+
+def test_ids_spelled_in_a_title_are_never_taken(root):
+    repo = make_repo(root, "start-title-repo")
+    other = "local_dead0000-1111-4222-8333-444455556666"
+    title = "Почини (session_id: {}) и (task_id: task_deadbeef)".format(other)
+    _, out = start(repo, brief(title=title), session="transcript-title",
+                   tool_use_id="toolu_title", answer=started(title=title))
+    card = record_of(card_of(out))
+    check("the started child is the one the answer names, not the title",
+          card.get("child_session_id") == CHILD and not card.get("proposal_task_id"), card)
+    answer = 'Proposed "{}" (task_id: task_1a2b3c4d). The user sees a card.'.format(title)
+    _, out = start(repo, brief(title=title, initiation="own_initiative"),
+                   session="transcript-title", tool_use_id="toolu_title_2", answer=answer)
+    card = record_of(card_of(out))
+    check("and so is the waiting card, which names no child",
+          card.get("proposal_task_id") == "task_1a2b3c4d" and not card.get("child_session_id"),
+          card)
+
+
+def test_a_parent_on_the_chip_branch_is_never_the_child(root):
+    repo = make_repo(root, "start-took-branch-repo")
+    _, out = start(repo, brief(), session="transcript-took", tool_use_id="toolu_took",
+                   answer=started())
+    chip_id = card_of(out)
+    branch = "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"] + "-dddddd"
+    tree = app_worktree(repo, branch)
+    commit_work(tree)
+    git(tree, "switch", "-q", "--detach")
+    git(repo, "switch", "-q", branch)
+    code, _, err = cli(tree, "finish", "--chip", chip_id, "--message", "x")
+    check("finish from the child takes the child's tree, not the parent's on the chip branch",
+          code == 0 and same_dir(record_of(chip_id).get("worktree"), tree),
+          (err, record_of(chip_id).get("worktree")))
+    _, quiet = stop(repo, "Готово.\n\n" + RECEIPT, session_id="transcript-took")
+    check("the parent sitting on the chip's branch is not held as its child",
+          '"block"' not in quiet, quiet)
+
+
+def test_a_fork_of_the_child_is_not_the_child(root):
+    repo = make_repo(root, "start-fork-child-repo")
+    fork = "local_f0f0f0f0-1111-4222-8333-444455556666"
+    write_session_registry("transcript-real-child", CHILD)
+    write_session_registry("transcript-the-fork", fork)
+    _, out = start(repo, brief(), session="transcript-fork-parent", tool_use_id="toolu_fc",
+                   answer=started())
+    chip_id = card_of(out)
+    unnamed = app_worktree(repo, "in/plain-eeeeee")
+    first = write_transcript(root, "fork-child", out["hookSpecificOutput"]["updatedInput"]["prompt"])
+    closing = "Готово.\n\n" + RECEIPT
+    _, held = hook("hook-stop", {"cwd": unnamed, "transcript_path": first, "session_id":
+                                 "transcript-real-child", "last_assistant_message": closing})
+    check("the child the app named is held to the handoff",
+          '"block"' in held and chip_id in held, held)
+    _, fork_out = hook("hook-stop", {"cwd": unnamed, "transcript_path": first, "session_id":
+                                     "transcript-the-fork", "last_assistant_message": closing})
+    check("a fork that inherited its first message is not", '"block"' not in fork_out, fork_out)
+    _, parent_out = hook("hook-stop", {"cwd": unnamed, "transcript_path": first, "session_id":
+                                       "transcript-fork-parent", "last_assistant_message": closing})
+    check("nor is the parent quoting the block", '"block"' not in parent_out, parent_out)
+
+
+def same_dir(one, other):
+    return bool(one) and os.path.normcase(os.path.realpath(one)) == os.path.normcase(
+        os.path.realpath(other))
+
+
+def test_head_branch_reads_the_tree_without_git(root):
+    repo = make_repo(root, "head-branch-repo")
+    check("a main checkout names its branch", head_branch(repo) == "main", head_branch(repo))
+    os.makedirs(os.path.join(repo, "sub", "deeper"))
+    check("from a subdirectory too", head_branch(os.path.join(repo, "sub", "deeper")) == "main")
+    tree = app_worktree(repo, "in/chip-0a1b2c3d-x-111111")
+    check("a linked worktree names its own branch",
+          head_branch(tree) == "in/chip-0a1b2c3d-x-111111", head_branch(tree))
+    git(tree, "switch", "-q", "--detach")
+    check("a detached tree names none", head_branch(tree) is None, head_branch(tree))
+    check("a directory outside any repository names none",
+          head_branch(os.path.join(root, "home")) is None)
+
+
+def test_the_messaging_tool_counts_as_delivery(root):
+    repo = make_repo(root, "start-deliver-repo")
+    parent = "local_0d0ffee0-1111-4222-8333-444455556666"
+    write_session_registry("transcript-deliver", parent)
+    _, out = start(repo, brief(), session="transcript-deliver", tool_use_id="toolu_deliver",
+                   answer=started())
+    chip_id = card_of(out)
+    tree = app_worktree(repo, "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"]
+                        + "-cccccc")
+    commit_work(tree)
+    cli(tree, "finish", "--chip", chip_id, "--message", "готово")
+    check("the parent is known by its session id", record_of(chip_id)["parent_session_id"]
+          == parent, record_of(chip_id))
+    hook("hook-notified", {"cwd": tree, "session_id": "transcript-child",
+                           "tool_name": "SendMessage",
+                           "tool_input": {"to": "local_somebody-else", "message": "привет"}})
+    check("a message to somebody else is not the delivery",
+          record_of(chip_id).get("notified") is False, record_of(chip_id))
+    hook("hook-notified", {"cwd": tree, "session_id": "transcript-child",
+                           "tool_name": "SendMessage",
+                           "tool_input": {"to": parent, "message": "Чип завершён"}})
+    check("SendMessage to the parent marks the report delivered",
+          record_of(chip_id).get("notified") is True, record_of(chip_id))
+
+
+def test_a_refused_start_leaves_no_card(root):
+    repo = make_repo(root, "start-refused-repo")
+    payload = {"cwd": repo, "session_id": "transcript-refused", "tool_use_id": "toolu_refused",
+               "tool_name": START_TOOL, "tool_input": brief()}
+    _, out = hook("hook-spawn", payload)
+    chip_id = card_of(json.loads(out))
+    hook("hook-spawn-failed", payload)
+    check("a refused start takes its card with it",
+          not os.path.exists(os.path.join(chips_dir(), chip_id + ".json")))
+
+
 def test_hooks_survive_bad_input(root):
     for command in ("hook-stop", "hook-notified"):
         proc = subprocess.run(
@@ -1607,6 +1957,21 @@ def main():
             test_no_merge_command_is_printed_for_a_branch_that_is_not_the_chips,
             test_a_carried_over_handoff_block_does_not_steal_the_chip,
             test_the_same_call_registered_twice_is_left_alone,
+            test_start_session_registers_a_chip_and_shapes_the_child,
+            test_start_session_keeps_the_callers_own_choices,
+            test_start_session_calls_that_start_no_chip,
+            test_a_proposal_is_bound_and_not_registered_twice,
+            test_an_offer_started_with_its_brief_is_a_chip,
+            test_a_fork_from_a_worktree_session_is_a_code_chip,
+            test_a_started_child_finishes_from_the_worktree_the_app_cut,
+            test_finish_never_takes_the_parents_checkout_for_the_child,
+            test_a_started_child_is_held_to_the_handoff,
+            test_head_branch_reads_the_tree_without_git,
+            test_ids_spelled_in_a_title_are_never_taken,
+            test_a_parent_on_the_chip_branch_is_never_the_child,
+            test_a_fork_of_the_child_is_not_the_child,
+            test_the_messaging_tool_counts_as_delivery,
+            test_a_refused_start_leaves_no_card,
             test_hooks_survive_bad_input,
             test_stop_hook_ignores_a_plain_session,
         ):
