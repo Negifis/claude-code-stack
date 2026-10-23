@@ -441,8 +441,8 @@ a new one — the block says when this candidate's evidence starts counting and 
 it replaced, and this one needs its own pass; nor an approval another session gave.
 
 Order: check the three facts once — the receipt is the last line and well-formed, the last
-lasting edit precedes the verdict, the lanes ran in a shape the hook reads (the simplify lanes in
-the foreground; a review lane in the foreground or the background) — and fix what is yours. If
+lasting edit precedes the verdict, the lanes ran in a shape the hook reads (each lane returned
+in the foreground or its background run's completion notification arrived) — and fix what is yours. If
 the block still stands, do not re-run lanes, do not poll, do not argue with the hook: file the
 report and finish honestly.
 
