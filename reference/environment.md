@@ -52,8 +52,9 @@ lives in a hook.
 
 `BASH_MAX_TIMEOUT_MS=7200000` is the ceiling of a foreground Bash or PowerShell call, raised from
 ten minutes so that a subagent can run a Codex round in the foreground: `/adversarial-review`
-names the round's `timeout` (up to 7000 s) and the subagent adds a 100 s margin. Above two hours the variable would also lift the background-command limit in
-unattended sessions; `test_gate.py` keeps it between the launch templates' caps and that bound.
+names the round's `timeout` (up to 7000 s) and the subagent adds a 100 s margin. Above two hours
+the variable would also lift the background-command limit in unattended sessions; `test_gate.py`
+requires the longest template `timeout` plus 100 s ≤ the variable ≤ two hours.
 
 ## Plugins
 
@@ -233,29 +234,39 @@ is kept separately as `child_hook_session` and is never offered as an archive ta
 returns `updatedInput` carrying the handoff block. For `spawn_task` it also cuts the chip's
 worktree and sends the child there as its `cwd`. For `start_session` — the desktop app's way to
 start a sibling session, in a worktree the app cuts itself (verified in app 2.42304, 2026-10-22)
-— it cuts nothing: a fresh start gets `use_worktree: true`, `source_branch` (the parent's
-branch) and `branch_name: chip-<id>-<slug>` where the caller did not set them; an offer's brief
-sent with `proposal_id` and a fork take only the block, the app refusing other keys there; an
-offer's title-only first call, a cloud session, an SSH host, a preset and another repository get
-no chip. `hook-spawned` records the child's `local_…` id or the card's `task_id` from the
-answer. `finish` finds the child's tree by the branch named after the chip, else as the tree it
-runs in (never the parent's checkout or branch), and indexes it under `by-tree`. The Stop hook
-finds a child by its worktree, its branch, or the handoff block its transcript's first user
-message ends with (the first 256 KB). It blocks only on proof — the worktree, the branch, or the
-registry pairing the session with the `local_…` id the app named for the child — and only
-mentions an unproven block in a first message; by the branch or the first message it never takes
-the session that opened the chip, nor one the registry pairs with another id (a fork inherits
-the child's first message). The chip's worktree is proof by itself, so a parent that works
-inside it is taken for the child. Delivery is recorded only for a proven child. The ids come
-from the answer's whole first line of its own kind (`Started session "…" (session_id: …)`,
-`Proposed "…" (task_id: …)`), the title matched greedily, so a title spelling an id binds
-nothing. `hook-spawn` picks code mode whenever the parent's directory is a repository and the
-child gets a worktree of its own: cut by the hook for `spawn_task`, by the app for
-`start_session`. Both ids of a session are resolved through the app's own registry
-(`%APPDATA%/Claude/claude-code-sessions/**/local_<id>.json`, which pairs `sessionId` with
-`cliSessionId`), cached in `state/session-map.json` for five minutes; that is also what lets a
-resumed parent — new transcript id, same `local_…` id — still be reminded about chips it opened
-earlier.
+— it cuts nothing. A fresh start gets `use_worktree: true`, `source_branch` (the parent's branch)
+and `branch_name: chip-<id>-<slug>` where the caller did not set them; one that set
+`use_worktree: false` shares the parent's checkout and makes an operational chip. An offer's
+brief sent with `proposal_id` and a fork take only the block, the app refusing other keys there.
+An offer's title-only first call, a cloud session, an SSH host, a preset and another repository
+get no chip. `hook-spawn` picks code mode whenever the parent's directory is a repository with a
+commit to branch from and the child gets a worktree of its own: cut by the hook for `spawn_task`,
+by the app for `start_session`. `hook-spawned` records the child's `local_…` id or the card's
+`task_id` from the answer's whole first line of its own kind (`Started session "…" (session_id:
+…)`, `Proposed "…" (task_id: …)`), the title matched greedily, so a title spelling an id binds
+nothing.
+
+`finish` finds the child's tree by the branch named after the chip, else as the tree it runs in
+(never the parent's checkout or branch), and indexes it under `by-tree`. The card's `repo_root`
+is the parent's tree at spawn time, which archiving the parent removes, often before the child
+reports; so `finish` and `discard_chip` ask git about the repository in its common directory:
+`git_common_dir` recorded at spawn, and nothing else if that directory is gone. A card without it
+asks the parent's tree while that stands; once it is gone too, `finish` refuses, since whatever
+stands at the chip's path would vouch for itself (`repository`). `finish` also refuses a chip
+tree that is not a worktree of that repository. With the parent's tree gone, `finish` does not
+merge (outcome `parent-gone` for work on the chip branch), keeps the bundle and points the report
+at the first standing working tree.
+
+The Stop hook finds a child by its worktree, its branch, or the handoff block its transcript's
+first user message ends with (the first 256 KB). It blocks only on proof — the worktree, the
+branch, or the registry pairing the session with the `local_…` id the app named for the child —
+and only mentions an unproven block in a first message; it never takes the session that opened
+the chip, nor one the registry pairs with another id (a fork inherits the child's first message).
+Delivery is recorded only for a proven child. Both ids of a session are resolved through the
+app's own registry (`%APPDATA%/Claude/claude-code-sessions/**/local_<id>.json`, which pairs
+`sessionId` with `cliSessionId`), cached in `state/session-map.json` for five minutes; that is
+also what lets a resumed parent — new transcript id, same `local_…` id — still be reminded about
+chips it opened earlier.
 
 Chips use no `WorktreeCreate` hook. In the app one would create the worktree of every desktop
 session in every repository, and the app has no fallback when it fails: 2.42304 answers

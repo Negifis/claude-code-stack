@@ -14,9 +14,9 @@ code that fits the repository. Not fewer lines for their own sake, and not a cer
   an existing helper that would shrink it, or control flow, types, errors, resources or hot-path
   work that got harder to reason about.
 - The user asks to simplify or refactor.
-- `development-verification` requires it: a STANDARD persistent candidate needs one foreground
+- `development-verification` requires it: a STANDARD persistent candidate needs one completed
   `simplify-reviewer` result unless it is a small edit (`development-verification` §3), a HIGH
-  one a foreground result from each of the three lenses, an XHIGH one from each lens's `-xhigh`
+  one a completed result from each of the three lenses, an XHIGH one from each lens's `-xhigh`
   profile. LOW work never requires it.
 
 Skip it for routine LOW work, small obvious fixes, generated output and docs churn.

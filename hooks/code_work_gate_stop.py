@@ -7,7 +7,7 @@ the candidate produced — a lasting artifact, or an effect on a live system:
 
 * development-verification was actually invoked;
 * an operational candidate ends with a receipt naming its pre-execution check and its effect;
-* a STANDARD candidate has one foreground simplify-reviewer result, a HIGH candidate one from
+* a STANDARD candidate has one completed simplify-reviewer result, a HIGH candidate one from
   each of the three simplify lenses, an XHIGH candidate one from each lens's XHIGH profile;
 * HIGH completion has an adversarial APPROVED result — from either review engine — newer than
   the final edit, and XHIGH completion has one from an XHIGH lane: the native XHIGH reviewer, or
@@ -49,22 +49,47 @@ MAX_BACKGROUND_WAITS = 8
 # else may follow, so a review that opens with these words is still a review, and a result
 # that nearly matches costs the regex one pass, not a search.
 ACK_TAIL = (
-    r"(?: To check interim output, use Read on that file path\.)?"
+    # How the harness ends "You will be notified when it completes", word for word as each release
+    # words it: a full stop, then 2.1.286's stop-after-30m note and the interim-output hint; or,
+    # from 2.1.308, a dash and the advice not to poll.
+    r"(?:\.(?: If it is still running after \d+m in the background, it will be stopped and you "
+    r"will be notified\.)?(?: To check interim output, use Read on that file path\.)?"
+    r"| — do not poll that file or sleep while waiting\. Read the file only if the user asks "
+    r"for progress, or if you need a line it prints before you can go on, such as a server's "
+    r"ready line or port\.)"
     r"(?:[ \t]*\r?\nSession cwd remains [^\r\n]*?; directory changes made by the "
     r"backgrounded command do not apply to subsequent commands\.)*[ \t\r\n]*$"
 )
 DETACHED_ACK_RE = re.compile(
     r"^\s*Command running in background with ID: ?([A-Za-z0-9_-]+)\. "
-    r"Output is being written to: [^\n]+?\.output\. You will be notified when it completes\."
+    r"Output is being written to: [^\n]+?\.output\. You will be notified when it completes"
     + ACK_TAIL
 )
 MOVED_ACK_RE = re.compile(
     r"^\s*Command did not complete within its \d+s timeout and was moved to the background "
     r"\(ID: ?([A-Za-z0-9_-]+)\)\. Output is being written to: [^\n]+?\.output\. "
-    r"You will be notified when it completes\." + ACK_TAIL
+    r"You will be notified when it completes" + ACK_TAIL
 )
 AGENT_BG_RE = re.compile(
     r"^\s*Async agent launched successfully\.[^\n]*\n?agentId: ([A-Za-z0-9_-]+)"
+)
+# The whole answer Claude Code (2.1.281 to 2.1.308 at least) gives an Agent call it launched in the
+# background. A call that asked for the foreground counts as launched only on this exact envelope:
+# that call's own result could open with the first lines above and pass for a launch, its verdict
+# skipped and another task's notification read as its own (report dbfb92b2, round 1).
+AGENT_BG_ENVELOPE_RE = re.compile(
+    r"^Async agent launched successfully\. \(This tool result is internal metadata — never quote or "
+    r"paste any part of it, including the agentId below, into a user-facing reply\.\)\n"
+    r"agentId: ([A-Za-z0-9_-]+) \(internal ID - do not mention to user\. Use SendMessage with to: "
+    r"'\1', summary: '<5-10 word recap>' to continue this agent\.\)\n"
+    r"The agent is working in the background\. You will be notified automatically when it completes\. "
+    r"You know nothing about its results until that notification arrives — do not report, assume, or "
+    r"predict them; continue other work or respond to the user in the meantime\.\n"
+    r"Do not duplicate this agent's work — avoid working with the same files or topics it is using\.\n"
+    r"output_file: [^\n]+\n"
+    r"Do NOT Read or tail this file via the shell tool — it is the full subagent JSONL transcript and "
+    r"reading it will overflow your context\. If the user asks for progress, say the agent is still "
+    r"running; you'll get a completion notification\.\s*\Z"
 )
 # The Workflow tool's answer: every script runs in the background until its task notification, and
 # the summary line names it. Read only as the result of a Workflow call, so no other text can
@@ -922,6 +947,37 @@ def judge_background_agents(evidence, launches, notices_by_task):
                     status=last_status, reason=reason)
 
 
+def file_simplify(evidence, subtype, at, failed, agent=""):
+    """File one simplify lane's outcome at `at`. The pass cap is per subagent: its own pass judged
+    its work, not a repeat of the parent's."""
+    if failed:
+        evidence["simplify_failures"].setdefault(subtype, []).append(at)
+        return
+    evidence["simplify_successes"].setdefault(subtype, []).append(at)
+    passes = evidence["simplify_passes"].setdefault(subtype, {})
+    passes[agent] = passes.get(agent, 0) + 1
+
+
+def judge_background_simplify(evidence, launches, notices_by_task):
+    """File each simplify lane that ran in the background once its notifications are read.
+
+    A completed notification with any non-empty result — the lane's report, or the harness's
+    pointer to the hand-back that delivered it — is the lane's result, filed at the lane's launch
+    stamp, the same stamp a foreground result takes. A lane whose last notification is a kill, a
+    failure or a stop is a failed lane, even after an earlier report; one with no completed report
+    yet files nothing.
+    """
+    for task_id, notices in notices_by_task.items():
+        call = launches[task_id]
+        notices = sorted(notices, key=lambda item: item[0])
+        if any(status == "completed" and result.strip() for _, status, result in notices):
+            file_simplify(evidence, call["subtype"], call["started"], False, call.get("stream", ""))
+        # A lane resumed after its report and then killed, failed or stopped ends failed, the way
+        # a later failed foreground call outranks an earlier result (dbfb92b2, round 1).
+        if notices[-1][1] != "completed":
+            file_simplify(evidence, call["subtype"], notices[-1][0], True)
+
+
 # The tools a first-layer subagent's gate lanes are called through, as its transcript spells them.
 NESTED_TOOL_TOKENS = tuple('"{}"'.format(name)
                            for name in (*cwg.SHELL_TOOLS, "Agent", "Task", "SendMessage"))
@@ -971,7 +1027,8 @@ def agent_lane_call(payload, stamp):
         # Claude Code 2.1.198+ defaults subagents to background. Require an explicit false so an
         # upgrade cannot turn a verdict-bearing call into an async launch that looks complete in
         # the transcript. The opposite polarity of `shell_call` is deliberate: the two tools carry
-        # opposite defaults, and unifying them would blind one lane.
+        # opposite defaults, and unifying them would blind one lane. This is what the call asked
+        # for; whether it ran in the background is what the harness's acknowledgement says.
         "foreground": payload.get("run_in_background") is False,
         "started": stamp,
         "label": str(payload.get("description") or subtype)[:80],
@@ -1056,6 +1113,10 @@ def transcript_evidence(path, since, skill_since=None):
     # agent that stops to wait for its own background suite notifies without a verdict first.
     background_agents = {}
     agent_notices = {}
+    # Simplify lanes the harness ran in the background, and their notifications as
+    # `(stamp, status, result)`: judged after the scan as well (report dbfb92b2).
+    simplify_agents = {}
+    simplify_notices = {}
     # Review agents by the id the harness gave them — a background launch's acknowledgement
     # names it, and so does a foreground result's trailer — so that a SendMessage resuming one
     # is a review round (report 7435cfb4). Rounds are keyed by that SendMessage call, whose id the
@@ -1134,15 +1195,8 @@ def transcript_evidence(path, since, skill_since=None):
                 file_unbound(at, why)
             return
         if call["kind"] == "simplify":
-            subtype = call["subtype"]
-            if failed:
-                evidence["simplify_failures"].setdefault(subtype, []).append(at)
-            elif text.strip():
-                evidence["simplify_successes"].setdefault(subtype, []).append(at)
-                # The pass cap is per subagent: its own pass judged its work, not a repeat of the
-                # parent's.
-                passes = evidence["simplify_passes"].setdefault(subtype, {})
-                passes[agent] = passes.get(agent, 0) + 1
+            if failed or text.strip():
+                file_simplify(evidence, call["subtype"], at, failed, agent)
             return
         if failed:
             evidence["review_failures"].append(at)
@@ -1249,6 +1303,13 @@ def transcript_evidence(path, since, skill_since=None):
                     call = launched.pop(block.get("tool_use_id"), None)
                     if call is None:
                         continue
+                    if call["kind"] != "external" and AGENT_BG_ENVELOPE_RE.match(text):
+                        # An agent launched into the background whatever its call asked (see the
+                        # COMPAT note in the session's own scan): the acknowledgement is no result,
+                        # and the lane's notifications are judged in the subagent's scope, not here.
+                        if call["kind"] == "review":
+                            unjudged(agent, stamp, "a subagent's review lane was launched in the background")
+                        continue
                     if call["kind"] == "external" and background_ack(text, True):
                         if call["marked"]:
                             unjudged(agent, stamp, "a subagent's review call moved to the background")
@@ -1300,8 +1361,13 @@ def transcript_evidence(path, since, skill_since=None):
                         else:
                             waiting.pop(match)[2](report)
                         continue
-                peer = isinstance(entry.get("origin"), dict) and entry["origin"].get("kind") == "peer"
-                if "task-notification" in raw and entry.get("type") in NOTIFICATION_RECORDS and not peer:
+                origin = entry.get("origin") if isinstance(entry.get("origin"), dict) else {}
+                peer = origin.get("kind") == "peer"
+                # A user record is a delivery only when the harness wrote it for the notification;
+                # a message the user typed can quote one, real task id and all (dbfb92b2, round 1).
+                typed = entry.get("type") == "user" and origin.get("kind") != "task-notification"
+                if ("task-notification" in raw and entry.get("type") in NOTIFICATION_RECORDS
+                        and not peer and not typed):
                     # Only the harness's own notification record is handled here; a tool
                     # result that merely mentions the word is ordinary evidence below, and a
                     # peer's message quoting one is that peer's text.
@@ -1316,17 +1382,27 @@ def transcript_evidence(path, since, skill_since=None):
                             delivery = entry.get("type") in ("user", "attachment")
                             lane = review_lane(task_id, calls_named, resume_rounds, open_rounds,
                                                background_agents)
+                            is_simplify = lane is None and task_id in simplify_agents
                             # A native review agent's verdict lives in its delivery record — the
                             # absorbed command (`attachment`) or the idle turn (`user`) — not in
                             # the queue bookkeeping. Marking such an agent done on a lone enqueue
                             # (the turn ended between the enqueue and the attachment) would drop
                             # it from in-flight without its verdict ever being read, letting an
                             # earlier approval stand for a lane that had moved on. So a native
-                            # lane is done only when its delivery record is seen; every other
-                            # task (a Codex launch, judged from its rollout) is done on any
-                            # notification, as before.
-                            if lane is None or delivery:
+                            # lane is done only when its delivery record is seen, and so is a
+                            # background simplify lane, whose report is read from that record;
+                            # every other task (a Codex launch, judged from its rollout) is done
+                            # on any notification, as before.
+                            if (lane is None and not is_simplify) or delivery:
                                 evidence["background_done"][task_id] = (stamp, status)
+                            if is_simplify and not stamp + 1 < since and delivery:
+                                # The lane's result is the notification's: its report, or the
+                                # harness's pointer to the hand-back that delivered it.
+                                result = ""
+                                if status == "completed":
+                                    found = NOTIFICATION_RESULT_RE.search(notice)
+                                    result = html.unescape(found.group(1)) if found else ""
+                                simplify_notices.setdefault(task_id, []).append((stamp, status, result))
                             if lane is not None and not stamp + 1 < since and delivery:
                                 # One notice per physical delivery: the absorbed command
                                 # (`attachment`) or the idle turn (`user`). The enqueue and the
@@ -1431,6 +1507,9 @@ def transcript_evidence(path, since, skill_since=None):
                                     agent_notices.setdefault(lane, []).append(
                                         (stamp, "stopped", None)
                                     )
+                                elif stopped in simplify_agents:
+                                    simplify_notices.setdefault(stopped, []).append(
+                                        (stamp, "stopped", ""))
                                 call = background_calls.pop(stopped, None)
                                 if call:
                                     # A review lane stopped by hand is failed lane activity,
@@ -1533,8 +1612,14 @@ def transcript_evidence(path, since, skill_since=None):
                             if call and call.get("marked"):
                                 background_calls[task_id] = call
                             continue
-                    if call is None or (call["kind"] != "external" and not call["foreground"]):
-                        launched = AGENT_BG_RE.match(text)
+                    # COMPAT: the acknowledgement, not the call's own flag, says that an agent ran in
+                    # the background. Claude Code 2.1.308 launches one asynchronously even when the
+                    # call asked for the foreground (report dbfb92b2), and that answer is never a
+                    # review or simplify lane's result: the lane is judged at its notification. A call
+                    # that asked for the foreground is held to the whole envelope.
+                    if call is None or call["kind"] != "external":
+                        declared = call is not None and call["foreground"]
+                        launched = (AGENT_BG_ENVELOPE_RE if declared else AGENT_BG_RE).match(text)
                         if launched:
                             evidence["background"][launched.group(1)] = {
                                 "started": stamp, "kind": "agent",
@@ -1545,6 +1630,8 @@ def transcript_evidence(path, since, skill_since=None):
                                 review_agents[launched.group(1)] = call
                                 if not call.get("prior"):
                                     background_agents[launched.group(1)] = call
+                            elif call and call["kind"] == "simplify":
+                                simplify_agents[launched.group(1)] = call
                             continue
                     if call is None:
                         continue
@@ -1570,6 +1657,7 @@ def transcript_evidence(path, since, skill_since=None):
             for _, _, finish, pointer in waiting:
                 finish(pointer)
         judge_background_agents(evidence, dict(background_agents, **resume_rounds), agent_notices)
+        judge_background_simplify(evidence, simplify_agents, simplify_notices)
     except Exception:
         # Everything after the failure is unread, so what was collected is a prefix, not the
         # record: an approval early in the cycle would otherwise outlive the REVISE that
@@ -2626,7 +2714,7 @@ def simplify_block(risk, missing, state):
     }.get(risk, "one {} result or the complete trio ({})".format(SIMPLIFY_LANE, lenses))
     failed = [lane for lane in missing if state.get(lane) in ("failed", "exhausted")]
     return (
-        "simplify lenses have no foreground result: a {} candidate needs {} for this candidate "
+        "simplify lenses have no completed result: a {} candidate needs {} for this candidate "
         "(missing: {}){}"
     ).format(
         risk, needed, ", ".join(missing),
@@ -3121,7 +3209,8 @@ def reminder(reason, block_number, operational, session_id="", repeated=False, t
         contract = (
             "Satisfy the observable evidence contract. development-verification must have been "
             "invoked once in this session, plus honest candidate-bound checks. Simplify evidence "
-            "is a foreground lane result for this candidate: a STANDARD candidate needs one "
+            "is a completed lane result for this candidate — returned in the foreground, or a "
+            "background lane's completion notification: a STANDARD candidate needs one "
             "{lane} result unless it is {small}, a HIGH candidate one result from each of the "
             "three lenses "
             "({lenses}), launched together. The lane results are the evidence, in whatever order "

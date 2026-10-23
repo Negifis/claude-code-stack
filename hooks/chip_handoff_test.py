@@ -339,6 +339,22 @@ def test_stop_hook_blocks_an_unsent_report(root):
     check("block asks for the message", "не уведомлена" in out, out)
 
 
+def test_the_parent_checking_in_the_chip_tree_is_never_the_child(root):
+    """The parent steps into the chip's tree to check a report that is written but not yet sent."""
+    repo = make_repo(root, "parent-in-tree-repo")
+    chip_id, worktree = open_chip(repo)
+    commit_work(worktree)
+    cli(worktree, "finish", "--message", "готово")
+    _, parent = stop(worktree, "Проверил.\n\n" + RECEIPT,
+                     session_id="transcript-parent-in-tree-repo")
+    check("the parent closing out in the chip's tree is not held as its child",
+          '"block"' not in parent, parent)
+    check("it is reminded to accept the chip instead", chip_id in parent, parent)
+    _, child = stop(worktree, "Готово.\n\n" + RECEIPT, session_id="transcript-tree-child")
+    check("the child in that tree still is", '"block"' in child and "не уведомлена" in child,
+          child)
+
+
 def test_stop_hook_accepts_a_completed_handoff(root):
     repo = make_repo(root, "handed-repo")
     chip_id, worktree = open_chip(repo)
@@ -1685,6 +1701,202 @@ def test_finish_never_takes_the_parents_checkout_for_the_child(root):
           err)
 
 
+def offered_from(out, tree):
+    """Whether the report tells the parent to take the work from `tree`."""
+    return "из {}:".format(os.path.normcase(os.path.realpath(tree))) in os.path.normcase(out)
+
+
+def test_a_chip_finishes_after_its_parents_tree_is_removed(root):
+    """The parent worked in a worktree of its own, and archiving it took the tree away before
+    the child reported."""
+    repo = make_repo(root, "parent-gone-repo")
+    parent_tree = app_worktree(repo, "in/parent-gone")
+    chip_id, worktree = open_chip(parent_tree)
+    commit_work(worktree, message="work of an orphaned chip")
+    git(repo, "worktree", "remove", "--force", parent_tree)
+    before = git(repo, "rev-parse", "in/parent-gone").stdout.strip()
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    if not check("finish still runs", code == 0, out + err):
+        return
+    record = record_of(chip_id)
+    check("the commit is counted", record.get("commits") == 1, record.get("commits"))
+    check("nothing is merged into the branch of a session that is gone",
+          record["outcome"] == "parent-gone"
+          and git(repo, "rev-parse", "in/parent-gone").stdout.strip() == before,
+          record["outcome"])
+    check("the commits are kept in a bundle",
+          record.get("bundle") and os.path.exists(record["bundle"]), record)
+    check("the report says how to take them",
+          "git merge --no-ff {}".format(record["chip_branch"]) in out, out)
+    check("from a tree that still exists", offered_from(out, repo), out)
+
+
+def test_nested_work_is_found_after_the_parents_tree_is_removed(root):
+    """Without the repository a worktree the child cut inside the chip's looks like uncommitted
+    work, and finish refused."""
+    repo = make_repo(root, "parent-gone-nested-repo")
+    parent_tree = app_worktree(repo, "in/parent-gone-nested")
+    chip_id, worktree = open_chip(parent_tree)
+    inner = os.path.join(worktree, ".claude", "worktrees", "inner")
+    git(worktree, "worktree", "add", "-q", "-b", "in/nested-after-parent", inner)
+    git(inner, "config", "user.email", "test@example.invalid")
+    git(inner, "config", "user.name", "Chip Test")
+    commit_work(inner, name="real.txt", message="nested work")
+    git(repo, "worktree", "remove", "--force", parent_tree)
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("finish runs beside a nested worktree", code == 0, out + err)
+    check("and delivers the nested branch",
+          record_of(chip_id).get("work_branch") == "in/nested-after-parent",
+          record_of(chip_id).get("work_branch"))
+    git(repo, "worktree", "remove", "--force", inner)
+
+
+def edit_card(chip_id, **fields):
+    """Rewrite fields of a chip's card as an older version or a moved repository leaves it;
+    None drops the field."""
+    path = os.path.join(chips_dir(), chip_id + ".json")
+    with open(path, encoding="utf-8") as handle:
+        card = json.load(handle)
+    for key, value in fields.items():
+        if value is None:
+            card.pop(key, None)
+        else:
+            card[key] = value
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(card, handle, ensure_ascii=False)
+
+
+def clone_onto_chip_path(root, name, remove_parent, separate_git_dir=False):
+    """A chip whose tree was removed and whose path another clone of the repository took over,
+    on the chip's branch and with a commit of its own."""
+    repo = make_repo(root, name)
+    parent_tree = app_worktree(repo, "in/" + name)
+    chip_id, worktree = open_chip(parent_tree)
+    if remove_parent:
+        git(repo, "worktree", "remove", "--force", parent_tree)
+    git(repo, "worktree", "remove", "--force", worktree)
+    outside = ["--separate-git-dir", os.path.join(root, name + "-git")] if separate_git_dir else []
+    git(root, "clone", "-q", *outside, repo, worktree)
+    git(worktree, "switch", "-q", record_of(chip_id)["chip_branch"])
+    git(worktree, "config", "user.email", "test@example.invalid")
+    git(worktree, "config", "user.name", "Chip Test")
+    commit_work(worktree, name="foreign.txt", message="work of another repository")
+    return chip_id, worktree
+
+
+def test_a_clone_on_the_chip_trees_path_is_never_delivered(root):
+    """Another repository that took over the chip's path shares its base and branch names."""
+    for label, name, remove_parent, separate, fields, said in (
+            ("against the recorded repository", "clone-on-chip-path", False, False, {},
+             "не является рабочим деревом"),
+            ("once the recorded repository has moved", "clone-after-move", True, False,
+             {"git_common_dir": os.path.join(root, "clone-after-move-moved", ".git")},
+             "не найден репозиторий"),
+            ("on an older card that never recorded it", "clone-older-card", True, False,
+             {"git_common_dir": None}, "не найден репозиторий"),
+            ("with its git directory outside the tree, on an older card", "clone-outside-git",
+             True, True, {"git_common_dir": None}, "не найден репозиторий")):
+        chip_id, worktree = clone_onto_chip_path(root, name, remove_parent, separate)
+        edit_card(chip_id, **fields)
+        code, out, err = cli(worktree, "finish", "--message", "готово")
+        check("finish refuses the clone {}".format(label), code == 2 and said in err,
+              (out + err)[:300])
+        check("and publishes nothing {}".format(label), record_of(chip_id)["status"] == "open",
+              record_of(chip_id)["status"])
+
+
+def test_an_older_card_needs_its_repository_once_its_parent_is_gone(root):
+    """A card opened before the common directory was recorded has only the parent's tree to say
+    which repository its chip belongs to."""
+    repo = make_repo(root, "older-card-parent-gone-repo")
+    parent_tree = app_worktree(repo, "in/older-card-parent-gone")
+    chip_id, worktree = open_chip(parent_tree)
+    common = record_of(chip_id)["git_common_dir"]
+    edit_card(chip_id, git_common_dir=None)
+    commit_work(worktree, message="work on an older card")
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("while the parent's tree stands, an older card finishes as before",
+          code == 0 and record_of(chip_id)["outcome"] == "branch-busy", (out + err)[:300])
+    git(repo, "worktree", "remove", "--force", parent_tree)
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("once it is gone, finish refuses and says how to record the repository",
+          code == 2 and "git_common_dir" in err, (out + err)[:300])
+    edit_card(chip_id, git_common_dir=common)
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    check("and with the repository recorded it finishes", code == 0
+          and record_of(chip_id)["outcome"] == "parent-gone", (out + err)[:300])
+
+
+def test_a_worktree_listing_git_refuses_stops_the_report(root):
+    """An empty listing would read as a repository with no trees, so git's failure is reported."""
+    repo = make_repo(root, "unlistable-repo")
+    _, out = start(repo, brief(), session="transcript-unlistable",
+                   tool_use_id="toolu_unlistable", answer=started())
+    chip_id = card_of(out)
+    tree = app_worktree(repo, "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"]
+                        + "-5c0ffe")
+    commit_work(tree)
+    not_a_repository = os.path.join(root, "unlistable-not-a-git-dir")
+    os.makedirs(not_a_repository)
+    edit_card(chip_id, git_common_dir=not_a_repository)
+    code, _, err = cli(tree, "finish", "--chip", chip_id, "--message", "x")
+    check("finish stops on git's own failure", code == 2 and "git worktree list" in err,
+          err[:200])
+    check("nothing was published", record_of(chip_id)["status"] == "open",
+          record_of(chip_id)["status"])
+
+
+def test_a_bare_repositorys_report_points_at_a_working_tree(root):
+    """The first entry of a bare repository's worktree list is the repository itself, and a
+    directory left where a tree was is listed too."""
+    source = make_repo(root, "bare-source-repo")
+    bare = os.path.join(root, "parent-gone-bare.git")
+    git(root, "clone", "-q", "--bare", source, bare)
+    parent_tree = os.path.join(root, "bare-parent-tree")
+    git(bare, "worktree", "add", "-q", "-b", "in/bare-parent", parent_tree, "main")
+    _, worktree = open_chip(parent_tree)
+    commit_work(worktree, message="work beside a bare repository")
+    # Deleted by hand and an empty directory made in its place: git still lists it, ahead of
+    # the chip's tree.
+    shutil.rmtree(parent_tree)
+    os.makedirs(parent_tree)
+    code, out, err = cli(worktree, "finish", "--message", "готово")
+    if not check("finish runs", code == 0, out + err):
+        return
+    check("the report names a working tree, not the bare repository or the empty directory",
+          offered_from(out, worktree) and not offered_from(out, bare)
+          and not offered_from(out, parent_tree), out)
+
+
+def test_a_started_child_finishes_after_its_parents_tree_is_removed(root):
+    """A `start_session` child has no tree on its card until `finish` finds one, and finding it
+    takes the repository the parent's tree used to answer for."""
+    repo = make_repo(root, "start-parent-gone-repo")
+    parent_tree = app_worktree(repo, "in/start-parent-gone")
+    _, out = start(parent_tree, brief(), session="transcript-start-parent-gone",
+                   tool_use_id="toolu_start_parent_gone", answer=started())
+    chip_id = card_of(out)
+    branch = "in/" + out["hookSpecificOutput"]["updatedInput"]["branch_name"] + "-9e1d2c"
+    tree = app_worktree(repo, branch, base="in/start-parent-gone")
+    commit_work(tree)
+    before = git(repo, "rev-parse", "in/start-parent-gone").stdout.strip()
+    # Deleted by hand, so git still lists it, with the parent's branch checked out there.
+    shutil.rmtree(parent_tree)
+    code, report, err = cli(tree, "finish", "--chip", chip_id, "--message", "починил")
+    if not check("finish still runs", code == 0, report + err):
+        return
+    card = record_of(chip_id)
+    check("it finds the tree the app cut", os.path.realpath(card.get("worktree") or "")
+          == os.path.realpath(tree), card.get("worktree"))
+    check("a stale registration does not make the gone parent's branch look busy",
+          card["outcome"] == "parent-gone", card["outcome"])
+    check("the parent's branch is untouched",
+          git(repo, "rev-parse", "in/start-parent-gone").stdout.strip() == before)
+    check("the commits are kept in a bundle",
+          card.get("bundle") and os.path.exists(card["bundle"]), card)
+    check("the report points at a tree that still exists", offered_from(report, repo), report)
+
+
 def write_transcript(root, name, *messages):
     path = os.path.join(root, name + ".jsonl")
     with open(path, "w", encoding="utf-8") as handle:
@@ -1887,6 +2099,7 @@ def main():
             test_stop_hook_blocks_a_closing_chip,
             test_stop_hook_reads_a_backticked_receipt,
             test_stop_hook_blocks_an_unsent_report,
+            test_the_parent_checking_in_the_chip_tree_is_never_the_child,
             test_stop_hook_accepts_a_completed_handoff,
             test_parent_is_reminded_until_the_chip_is_closed,
             test_parent_is_reminded_without_any_delivery,
@@ -1965,6 +2178,13 @@ def main():
             test_a_fork_from_a_worktree_session_is_a_code_chip,
             test_a_started_child_finishes_from_the_worktree_the_app_cut,
             test_finish_never_takes_the_parents_checkout_for_the_child,
+            test_a_chip_finishes_after_its_parents_tree_is_removed,
+            test_nested_work_is_found_after_the_parents_tree_is_removed,
+            test_a_clone_on_the_chip_trees_path_is_never_delivered,
+            test_an_older_card_needs_its_repository_once_its_parent_is_gone,
+            test_a_worktree_listing_git_refuses_stops_the_report,
+            test_a_bare_repositorys_report_points_at_a_working_tree,
+            test_a_started_child_finishes_after_its_parents_tree_is_removed,
             test_a_started_child_is_held_to_the_handoff,
             test_head_branch_reads_the_tree_without_git,
             test_ids_spelled_in_a_title_are_never_taken,

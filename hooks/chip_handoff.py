@@ -9,10 +9,12 @@ This binds the two ends. `open` records who spawned the chip and, for work that 
 cuts a worktree and a branch off the parent's HEAD so neither session edits the other's tree.
 `finish` merges into the parent branch when that branch is checked out nowhere, and when it is
 not — the ordinary case, because the parent is sitting on it — leaves the branch and a bundle
-and says exactly how to pull them in. Operational work has nothing to pull and reports its
-effect instead. Either way `finish` prints the message the child sends to the parent, and
-`close` records the parent's verdict once the parent has checked the result: accepted, and the
-child session can be archived, or sent back with what is missing.
+and says exactly how to pull them in. It does not merge either when the parent's own tree is
+gone, as archiving the parent removes it: nobody would check that merge, so the report names
+the first working tree of the repository that still stands. Operational work has nothing to
+pull and reports its effect instead. Either way `finish` prints the message the child sends to
+the parent, and `close` records the parent's verdict once the parent has checked the result:
+accepted, and the child session can be archived, or sent back with what is missing.
 
 `start_session`, which replaces `spawn_task` in the desktop app, starts the child itself in a
 worktree the app cuts, so for it the spawn hook cuts nothing: it names the child's branch after
@@ -449,15 +451,16 @@ def child_record(payload):
 
     A chip that cut its own worktree is found by the directory, and a child the app gave a
     worktree (`start_session`) by its branch, named after the chip when the spawn hook could name
-    it: both are where only the child works. Failing those, the handoff block its first message
-    ends with points at the chip, but proves the session its child only when the registry pairs
-    it with the child the app named — a session can quote a block too.
+    it: both are where only the child works, short of the parent stepping in to check the result,
+    which `child_standing` rules out on either path. Failing those, the handoff block its first
+    message ends with points at the chip, but proves the session its child only when the
+    registry pairs it with the child the app named — a session can quote a block too.
     """
     cwd = payload.get("cwd") or os.getcwd()
-    record = record_for_tree(cwd)
-    if record:
-        return record, True
     session = payload.get("session_id")
+    record = record_for_tree(cwd)
+    if record and child_standing(record, session) is not None:
+        return record, True
     chip_id = chip_of_branch(head_branch(cwd))
     record = read_json(record_path(chip_id)) if chip_id else None
     if record and child_standing(record, session) is not None:
@@ -487,7 +490,7 @@ def child_standing(record, session):
     return False
 
 
-def locate_child_tree(record, cwd):
+def locate_child_tree(record, cwd, repo):
     """(worktree, branch) the app cut for this chip's child, or None.
 
     The branch named after the chip is the child's wherever it is checked out. A child whose
@@ -502,7 +505,7 @@ def locate_child_tree(record, cwd):
         return not same_path(path, repo_root) and not (
             branch and branch == record.get("parent_branch"))
 
-    trees = worktrees_of(repo_root)
+    trees = worktrees_of(repo)
     named = [(path, branch) for path, branch in trees
              if chip_of_branch(branch) == record["chip_id"] and childs(path, branch)]
     if named:
@@ -514,11 +517,57 @@ def locate_child_tree(record, cwd):
                  if same_path(top, path) and childs(path, branch)), None)
 
 
-def worktrees_of(repo_root):
-    """[(path, branch)] for every worktree of this repository; branch is None when detached."""
-    ok, out, _ = git(repo_root, "worktree", "list", "--porcelain")
+def common_dir(tree):
+    """The git common directory of the working tree whose top level is `tree`, or None when no
+    working tree stands there.
+
+    Only the tree's own top level answers: a directory left behind after its worktree was
+    removed would otherwise answer for whatever checkout encloses it.
+    """
+    if not tree:
+        return None
+    ok, out, _ = git(tree, "rev-parse", "--path-format=absolute", "--show-toplevel",
+                     "--git-common-dir", timeout=10)
+    lines = out.splitlines()
+    if not ok or len(lines) != 2 or not same_path(lines[0], tree):
+        return None
+    return os.path.abspath(lines[1])
+
+
+def stands_in(tree, repo):
+    """Whether a working tree of the repository whose common directory is `repo` stands at
+    `tree` — not a bare repository, an empty directory left where a tree was, or a clone."""
+    found = common_dir(tree)
+    return bool(found and same_path(found, repo))
+
+
+def repository(record):
+    """The chip repository's git common directory, where questions about the repository as a
+    whole are asked, or None.
+
+    `repo_root` is the parent's working tree as it was when the chip was cut, and archiving the
+    parent's session removes that tree — often before the child reports, and git cannot run in
+    a directory that is gone. Every worktree of a repository shares one common directory, so the
+    question goes there: the one recorded when the chip was cut, which names the repository
+    whatever stands at the chip's path now, and nothing else once it has moved. A card written
+    before it was recorded has only the parent's tree to say which repository the chip's tree
+    must belong to; once that is gone too, nothing does — whatever stands at the chip's path
+    would vouch for itself — so there is no answer.
+    """
+    recorded = record.get("git_common_dir")
+    if recorded:
+        return recorded if os.path.isdir(recorded) else None
+    return common_dir(record.get("repo_root"))
+
+
+def worktrees_of(repo):
+    """[(path, branch)] for every worktree of this repository, the main one first; branch is
+    None when detached. Raises ChipError when git cannot list them: an empty list would read as
+    a repository with no chip trees, and finish would then take a nested worktree for
+    uncommitted work."""
+    ok, out, err = git(repo, "worktree", "list", "--porcelain")
     if not ok:
-        return []
+        raise ChipError("git worktree list не отработал в {}\n{}".format(repo, err))
     found, path = [], None
     for line in out.splitlines():
         if line.startswith("worktree "):
@@ -576,22 +625,22 @@ def dirty_outside(tree, nested):
     return "\n".join(kept), ""
 
 
-def chip_trees(record):
+def chip_trees(record, repo):
     """Every worktree the chip owns: its own and anything cut inside it.
 
     Distinct from `work_sources`, which ranks only the trees that carry work. Cleanliness is
     judged across all of them, and each of them has to be invisible to the others — a worktree
     nested in another shows up there as an untracked directory.
     """
-    chip_tree, repo_root = record.get("worktree"), record.get("repo_root")
-    if not chip_tree or not repo_root:
+    chip_tree = record.get("worktree")
+    if not chip_tree:
         return []
-    found = [path for path, _ in worktrees_of(repo_root)
+    found = [path for path, _ in worktrees_of(repo)
              if under(path, chip_tree) and os.path.isdir(path)]
     return found or [chip_tree]
 
 
-def work_sources(record, parent_tip=None):
+def work_sources(record, repo, parent_tip=None):
     """[(worktree, branch, commits)] carrying this chip's work, most commits first.
 
     The chip worktree is where the child starts, and it does not always stay on the chip
@@ -606,9 +655,8 @@ def work_sources(record, parent_tip=None):
     so a directory that merely happens to sit there cannot pass its own history off as the
     chip's work.
     """
-    chip_tree, repo_root = record.get("worktree"), record.get("repo_root")
-    origin = record.get("base_sha")
-    if not chip_tree or not repo_root or not origin:
+    chip_tree, origin = record.get("worktree"), record.get("base_sha")
+    if not chip_tree or not origin:
         return []
     # Counted against the chip's own base and the parent's tip, and nothing else: subtracting
     # every ref in the repository turned a delivery the child had merely pushed, backed up or
@@ -620,7 +668,7 @@ def work_sources(record, parent_tip=None):
     chip_branch = record.get("chip_branch")
 
     found, seen = [], set()
-    for path, branch in worktrees_of(repo_root):
+    for path, branch in worktrees_of(repo):
         # Everything under the chip's directory was cut there by this chip's child, so nothing
         # is dropped: a tree is ranked, never silenced. Only the ranking decides what the
         # parent is told to take.
@@ -695,9 +743,9 @@ def derived_from(path, chip_head, origin, own_tree):
     return ok
 
 
-def checked_out_branches(repo_root):
+def checked_out_branches(repo):
     """Branch -> worktree that holds it. A branch checked out anywhere cannot be merged into."""
-    return {branch: path for path, branch in worktrees_of(repo_root) if branch}
+    return {branch: path for path, branch in worktrees_of(repo) if branch}
 
 
 class ChipError(Exception):
@@ -750,19 +798,28 @@ def create_chip(title, cwd, session, operational, transcript=None, tool_use_id=N
     }
 
     if not operational:
-        ok, repo_root, err = git(cwd, "rev-parse", "--show-toplevel", timeout=10)
+        ok, out, err = git(cwd, "rev-parse", "--path-format=absolute", "--show-toplevel",
+                           "--git-common-dir", timeout=10)
         if not ok:
             raise ChipError("не git-репозиторий: {}\nдля работы без кода добавь --operational\n{}"
                         .format(cwd, err))
-        repo_root = os.path.abspath(repo_root)
+        lines = out.splitlines()
+        if len(lines) != 2:
+            # A git older than 2.31 echoes the option it does not know as a third line.
+            raise ChipError("git rev-parse в {} ответил не двумя путями (нужен git 2.31+):\n{}"
+                            .format(cwd, out))
+        # The parent's tree can be gone by the time the child reports; the common directory is
+        # what then still finds the repository (`repository`).
+        repo_root, git_common_dir = (os.path.abspath(line) for line in lines)
         ok, head, err = git(repo_root, "rev-parse", "--verify", "HEAD", timeout=10)
         if not ok:
             raise ChipError("в репозитории нет коммитов, не от чего ветвиться\n{}".format(err))
         _, branch, _ = git(repo_root, "rev-parse", "--abbrev-ref", "HEAD", timeout=10)
         parent_branch = None if branch in ("", "HEAD") else branch
         slug = slugify(title)
-        record.update({"repo_root": repo_root, "parent_branch": parent_branch,
-                       "base_sha": head, "worktree": None, "chip_branch": None})
+        record.update({"repo_root": repo_root, "git_common_dir": git_common_dir,
+                       "parent_branch": parent_branch, "base_sha": head, "worktree": None,
+                       "chip_branch": None})
         if cut_worktree:
             chip_branch = "chip/{}-{}".format(slug, chip_id)
             worktree = os.path.join(
@@ -897,18 +954,18 @@ def work_branch(record):
     return record.get("chip_branch")
 
 
-def base_ref(record):
+def base_ref(record, repo):
     """(name to merge into, commit it points at) — the parent branch while it still exists,
     else the commit the chip was cut from."""
     parent = record.get("parent_branch")
     if parent:
-        ok, sha, _ = git(record["repo_root"], "rev-parse", "--verify", "refs/heads/" + parent)
+        ok, sha, _ = git(repo, "rev-parse", "--verify", "refs/heads/" + parent)
         if ok:
             return parent, sha
     return record["base_sha"], record["base_sha"]
 
 
-def try_merge(record, base):
+def try_merge(record, base, repo):
     """Merge the chip branch into the parent branch, in a worktree of its own.
 
     Never touches the parent's own checkout: a branch checked out anywhere is left alone, and
@@ -929,16 +986,16 @@ def try_merge(record, base):
     # ordinary. Merging then drags the commit the chip was cut at, which no longer belongs to
     # that history, and duplicates whatever was published in its place. Only the parent knows
     # how its own work should be carried over, so this stops and says so.
-    still_there, _, _ = git(record["repo_root"], "merge-base", "--is-ancestor",
-                            record["base_sha"], parent, timeout=20)
+    still_there, _, _ = git(repo, "merge-base", "--is-ancestor", record["base_sha"], parent,
+                            timeout=20)
     if not still_there:
         return "base-rewritten", None, []
-    held = checked_out_branches(record["repo_root"])
+    held = checked_out_branches(repo)
     if parent in held:
         return "branch-busy", held[parent], []
 
     tmp = os.path.join(CHIP_DIR, "merge-" + record["chip_id"])
-    ok, _, err = git(record["repo_root"], "worktree", "add", tmp, parent)
+    ok, _, err = git(repo, "worktree", "add", tmp, parent)
     if not ok:
         return "merge-unavailable", err, []
     try:
@@ -953,7 +1010,7 @@ def try_merge(record, base):
         # A fresh checkout, but `--force` would still walk into any link in it; one that will
         # not go leaves the tree for a look rather than risking its target.
         if not hc.unlink_directory_links(tmp)[1]:
-            git(record["repo_root"], "worktree", "remove", "--force", tmp)
+            git(repo, "worktree", "remove", "--force", tmp)
         else:
             print("could not unlink every link in {}, left for a look".format(tmp), file=sys.stderr)
 
@@ -993,19 +1050,49 @@ def cmd_finish(args):
         record["status"] = "handed-off"
         record["outcome"] = "reported"
         return publish_report(record)
+    try:
+        return finish_code(record, cwd)
+    except ChipError as exc:
+        return fail(str(exc))
 
+
+def finish_code(record, cwd):
+    """`finish` for a chip that hands back code. Raises ChipError when git cannot list the
+    repository's worktrees."""
+    repo = repository(record)
+    if not repo:
+        return fail("не найден репозиторий чипа {}: нет ни каталога git, записанного при "
+                    "запуске ({}), ни дерева родителя ({}). Дерево на месте чипа за свой "
+                    "репозиторий само не ручается; если оно настоящее, впиши его общий каталог "
+                    "git в поле git_common_dir карточки {}".format(
+                        record["chip_id"], record.get("git_common_dir") or "не записан",
+                        record.get("repo_root") or "не записано",
+                        record_path(record["chip_id"])))
     if not record.get("worktree"):
-        located = locate_child_tree(record, cwd)
+        located = locate_child_tree(record, cwd, repo)
         if not located:
             return fail("не найден worktree чипа {}: запусти finish из своего worktree — того, "
                         "где закоммичена работа".format(record["chip_id"]))
         record["worktree"], record["chip_branch"] = located
+    # Whatever stands at the chip's path has to be a worktree of the chip's repository: a clone
+    # put there after the tree was removed carries the same base and branch names, and its
+    # commits would otherwise be handed back as the chip's.
+    if not stands_in(record["worktree"], repo):
+        return fail("дерево чипа {} не является рабочим деревом его репозитория {} — "
+                    "отчёт не отправлен".format(record["worktree"], repo))
+    # The parent's tree is gone when its session was archived. Its branch would then be checked
+    # out nowhere and take a merge, which nobody would ever check, so the report points at the
+    # first working tree of the repository that stands — the main one, unless the repository is
+    # bare — and the work stays on its branch and in the bundle.
+    parent_stands = stands_in(record.get("repo_root"), repo)
+    record["repo_tree"] = record["repo_root"] if parent_stands else next(
+        (path for path, _ in worktrees_of(repo) if stands_in(path, repo)), record["worktree"])
 
-    base, base_commit = base_ref(record)
-    sources = work_sources(record, base_commit)
+    base, base_commit = base_ref(record, repo)
+    sources = work_sources(record, repo, base_commit)
     # Every tree the chip owns has to be clean, not just the one that wins: uncommitted edits
     # left in another of them would be dropped from the handoff without a word.
-    trees = chip_trees(record) or [record.get("worktree") or cwd]
+    trees = chip_trees(record, repo) or [record.get("worktree") or cwd]
     for path in trees:
         dirty, err = dirty_outside(path, trees)
         if dirty is None:
@@ -1058,8 +1145,10 @@ def cmd_finish(args):
         outcome, detail, conflicts = "no-work-branch", None, []
     elif work_branch(record) != record.get("chip_branch"):
         outcome, detail, conflicts = "found-elsewhere", None, []
+    elif not parent_stands:
+        outcome, detail, conflicts = "parent-gone", None, []
     else:
-        outcome, detail, conflicts = try_merge(record, base)
+        outcome, detail, conflicts = try_merge(record, base, repo)
     record["outcome"] = outcome
     record["outcome_detail"] = detail
     record["conflicts"] = conflicts
@@ -1118,7 +1207,7 @@ def notification(record):
         if others:
             lines += ["", "Но в деревьях чипа есть коммиты:", ""] + others
             lines += ["Готовой команды нет: принадлежность этих коммитов по истории не "
-                      "определяется, посмотри сам, из {}.".format(record["repo_root"]), ""]
+                      "определяется, посмотри сам, из {}.".format(record["repo_tree"]), ""]
         else:
             lines.append("Забирать нечего.")
         return "\n".join(lines + parent_actions(record))
@@ -1149,7 +1238,7 @@ def notification(record):
             "Влито в `{}` (коммит {}).".format(record["parent_branch"],
                                                (record.get("outcome_detail") or "")[:12]),
             "Чтобы увидеть: `git switch {}` в {}.".format(record["parent_branch"],
-                                                          record["repo_root"]),
+                                                          record["repo_tree"]),
         ]
         return "\n".join(lines + parent_actions(record))
 
@@ -1169,12 +1258,15 @@ def notification(record):
                           "у родителя) — мержить нечего",
         "merge-unavailable": "не удалось подготовить временное дерево для мержа: {}".format(
             record.get("outcome_detail")),
+        "parent-gone": "рабочего дерева родителя {} больше нет — его сессию, видимо, "
+                       "заархивировали, и влитое в её ветку никто бы не проверил; реши сам, "
+                       "куда влить работу".format(record.get("repo_root")),
     }
     lines.append("Автомерж не выполнен: {}.".format(reasons.get(outcome, outcome)))
     if not foreign:
         lines += [
             "",
-            "Забрать так — из {}:".format(record["repo_root"]),
+            "Забрать так — из {}:".format(record["repo_tree"]),
             "",
             "```bash",
             "git merge --no-ff {}".format(branch),
@@ -1462,23 +1554,25 @@ def discard_chip(record):
     working between any check and this call keeps everything, and the bookkeeping stays with it
     rather than being deleted out from under a directory that survived.
     """
-    repo_root, worktree = record.get("repo_root"), record.get("worktree")
-    if worktree and repo_root:
+    worktree = record.get("worktree")
+    if worktree:
         # Git removes a clean tree's ignored files along with it and, on Windows, walks into a
         # junction among them (hygiene_common.unlink_directory_links). The links go first, and
         # only out of a tree git is about to remove: one holding work keeps them.
         ok, status, _ = git(worktree, "status", "--porcelain", timeout=15)
-        if not ok or status.strip() or hc.unlink_directory_links(worktree)[1]:
+        if not ok or status.strip():
             return False
-        ok, _, _ = git(repo_root, "worktree", "remove", worktree, timeout=15)
+        repo = repository(record)
+        if not repo or hc.unlink_directory_links(worktree)[1]:
+            return False
+        ok, _, _ = git(repo, "worktree", "remove", worktree, timeout=15)
         if not ok:
             return False
         branch, base = record.get("chip_branch"), record.get("base_sha")
         if branch and base:
-            ok, tip, _ = git(repo_root, "rev-parse", "--verify", "refs/heads/" + branch,
-                             timeout=10)
+            ok, tip, _ = git(repo, "rev-parse", "--verify", "refs/heads/" + branch, timeout=10)
             if ok and tip == base:
-                git(repo_root, "branch", "-D", branch, timeout=10)
+                git(repo, "branch", "-D", branch, timeout=10)
         index_remove(BY_TREE, hc.tree_key(worktree), record["chip_id"])
     for key in (record.get("parent_session_id"), record.get("parent_hook_session")):
         if key:

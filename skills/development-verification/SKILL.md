@@ -178,14 +178,17 @@ Simplification applies to lasting artifacts only and never to operational work. 
 required for STANDARD, HIGH and XHIGH and optional for LOW (a local pass for a concrete readability,
 reuse, control-flow, type/error, resource, or efficiency concern).
 
-- **STANDARD** — exactly one foreground `simplify-reviewer` lane (`run_in_background: false`)
-  covering reuse, quality and efficiency in one report; none for a small edit (section 3).
-- **HIGH** — the three lenses as separate foreground lanes, launched together in one message:
+- **STANDARD** — exactly one `simplify-reviewer` lane covering reuse, quality and efficiency in
+  one report; none for a small edit (section 3). A lane counts once it has reported: its returned
+  result, or its completion notification when the harness ran it in the background (Claude Code
+  2.1.308 does this even for `run_in_background: false`), so wait for that notification. The
+  same holds for each lens below.
+- **HIGH** — the three lenses as separate lanes, launched together in one message:
   `simplify-reuse-reviewer`, `simplify-quality-reviewer` and `simplify-efficiency-reviewer`,
   each on the same bounded scope. All three results are required; a lone `simplify-reviewer`
   does not satisfy HIGH, and the complete trio satisfies STANDARD.
-- **XHIGH** — the same three lenses from their XHIGH profiles, launched together in the
-  foreground: `simplify-reuse-reviewer-xhigh`, `simplify-quality-reviewer-xhigh` and
+- **XHIGH** — the same three lenses from their XHIGH profiles, launched together:
+  `simplify-reuse-reviewer-xhigh`, `simplify-quality-reviewer-xhigh` and
   `simplify-efficiency-reviewer-xhigh`, Opus 5.5 at max effort. An XHIGH run stands in for its
   HIGH lens; a HIGH lens never satisfies XHIGH.
 - Follow the `simplify` skill for the packet. Apply only accepted behavior-preserving findings
