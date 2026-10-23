@@ -16,7 +16,7 @@ template — it is a stack in daily use on Windows and on a Linux execution VM, 
 
 | Directory | What it holds |
 |---|---|
-| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2590 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
+| `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2699 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
 | `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
 | `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, an `Explore` profile on Haiku that overrides the built-in one, and a `translator` profile on Haiku for files and string batches |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
@@ -40,11 +40,13 @@ It does **not** perform judgment. It checks a small set of facts that either app
 transcript or don't:
 
 - the `development-verification` skill was invoked once for this session;
-- a standard-risk candidate has one foreground `simplify-reviewer` result — unless it is a
+- a standard-risk candidate has one completed `simplify-reviewer` result — unless it is a
   small edit: at most three changed lines, all made with Edit, which the hook confirms byte for
-  byte against the commit the candidate opened on — and a high-risk one a foreground result from
+  byte against the commit the candidate opened on — and a high-risk one a completed result from
   each of the three lenses (`simplify-reuse-reviewer`, `simplify-quality-reviewer`,
-  `simplify-efficiency-reviewer`);
+  `simplify-efficiency-reviewer`). A result is the one returned in the foreground, or the
+  completion notification of a lane the harness ran in the background, whatever
+  `run_in_background` said;
 - for a high-risk candidate, an independent adversarial review produced a verdict, and that
   verdict is *newer* than the last change to a lasting artifact;
 - an XHIGH candidate — a level the `verified` receipt declares, never one a path sets — has
@@ -58,11 +60,12 @@ transcript or don't:
 Two review engines are accepted: external **Codex** (default) and the bundled native
 `adversarial-reviewer` subagent (fallback). One lane per round, never both.
 
-A subagent can take its own scope through the gate before handing it back: the lanes it
-launches itself, in the foreground, count for the parent's candidate, each verdict filed at the
-lane's launch, so an edit made while the lane ran expires it. Nesting is kept for that and for
-helper lanes: `subagent_nesting_guard.py`, a `PreToolUse` hook, refuses any other `Agent` call
-made inside a subagent.
+A subagent can take its own scope through the gate before handing it back: the lanes it launches
+itself, in the foreground, count for the parent's candidate, each verdict filed at the lane's
+launch, so an edit made while the lane ran expires it. A lane its harness ran in the background
+lends the parent nothing: its notification reaches only the subagent. Nesting is kept for that
+and for helper lanes: `subagent_nesting_guard.py`, a `PreToolUse` hook, refuses any other
+`Agent` call made inside a subagent.
 
 The Codex lane is verified against the Codex CLI's own rollout logs, not against the text of
 the command that was typed. The log is read with a binary search over an append-only,

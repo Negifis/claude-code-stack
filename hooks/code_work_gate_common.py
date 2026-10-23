@@ -432,8 +432,8 @@ def receipt_requirements(floor, small=False):
         return "affected checks; as {} it owes no {} lane".format(SMALL_EDIT_RULE, SIMPLIFY_LANE)
     return {
         "LOW": "the relevant deterministic check",
-        "STANDARD": "affected checks and one foreground {} result".format(SIMPLIFY_LANE),
-        "HIGH": "affected checks, a foreground result from each simplify lens ({}) and one "
+        "STANDARD": "affected checks and one completed {} result".format(SIMPLIFY_LANE),
+        "HIGH": "affected checks, a completed result from each simplify lens ({}) and one "
                 "adversarial APPROVED newer than the last edit to a lasting artifact".format(
                     ", ".join(SIMPLIFY_LENSES)),
     }.get(floor, "affected checks")

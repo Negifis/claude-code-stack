@@ -73,8 +73,11 @@ After the work is done and `development-verification` has closed it:
 
    For code it merges into the parent branch when that branch is checked out nowhere, and
    otherwise leaves it alone — merging into a branch a live session holds would move the ref
-   out from under that session's index. When it does not merge, it writes a bundle of the
-   chip's commits as a second route. For operational work it prints the report.
+   out from under that session's index. It leaves it alone too when the parent's own tree is
+   gone, as archiving the parent removes it: nobody would check that merge, so the report
+   names the first working tree of the repository that still stands. When it does not merge,
+   it writes a bundle of the chip's commits as a second route. For operational work it prints
+   the report.
 
 3. Send the printed message to the parent with `mcp__ccd_session_mgmt__send_message` (or
    `SendMessage` with `to`) and the `session_id` from the handoff block. This is the step the
@@ -162,15 +165,14 @@ knows the session for a chip's by its worktree, by a branch named after the chip
 handoff block its first message ends with. It blocks only on proof: the chip's worktree, a
 branch named after the chip, or the app's registry pairing the session with the child it
 started. A block in the first message without that proof — a session can quote one — is only
-mentioned, never enforced. By the branch or the first message it never takes the session that
-opened the chip, nor one the registry pairs with another id than the child; the chip's own
-worktree is proof by itself, so verify a chip from your own tree (`git -C`), not from inside the
-chip's; a fork, whose first message is its parent's, is told apart only by `finish`. An ordinary
-turn is never interrupted, and a chip that has reported and tried to deliver is released even
-when delivery was impossible. `PostToolUse` and `PostToolUseFailure` hooks on `send_message` and
-`SendMessage` record the attempt, and delivery when it succeeded. In the parent — and only in
-the session that actually opened the chip — the same Stop hook lists the chips waiting for
-acceptance and repeats, without ever blocking, until each is closed.
+mentioned, never enforced. It never takes the session that opened the chip, nor one the
+registry pairs with another id than the child; a fork, whose first message is its parent's, is
+told apart only by `finish`. An ordinary turn is never interrupted, and a chip that has
+reported and tried to deliver is released even when delivery was impossible. `PostToolUse` and
+`PostToolUseFailure` hooks on `send_message` and `SendMessage` record the attempt, and delivery
+when it succeeded. In the parent — and only in the session that actually opened the chip — the
+same Stop hook lists the chips waiting for acceptance and repeats, without ever blocking, until
+each is closed.
 
 ## What this deliberately does not do
 
