@@ -1631,8 +1631,10 @@ def chip_cwd(worktree, parent_cwd, repo_root):
     """
     if not repo_root:
         return worktree
+    # git prints the root resolved, so a directory reached through a link (macOS' /var, /tmp)
+    # is resolved too before it is placed inside it.
     try:
-        inside = os.path.relpath(parent_cwd, repo_root)
+        inside = os.path.relpath(os.path.realpath(parent_cwd), os.path.realpath(repo_root))
     except ValueError:
         return worktree
     target = os.path.normpath(os.path.join(worktree, inside))

@@ -2147,13 +2147,14 @@ def status_blocker(call, tree, paths, unresolved):
         # name, so one spelled below `tree` with a short name matches nothing git lists; and
         # `check-ignore` matches them against the patterns case-insensitively only while the
         # repository ignores case, so any other setting leaves the answer unknown. Elsewhere the
-        # paths keep their case.
-        if cwg.CASE_FOLDED_PATHS:
+        # paths keep their case. A case-insensitive macOS volume lowers them too, but has no short names.
+        if os.name == "nt":
             short = [path for path in paths
                      if any(SHORT_NAME_RE.fullmatch(part) for part in path[len(tree) + 1:].split("/"))]
             if short:
                 return "a lasting path is spelled with a Windows short name, which git never prints ({})".format(
                     cwg.basename(short[0]))
+        if cwg.CASE_FOLDED_PATHS:
             ignorecase = call(["config", "--type=bool", "core.ignorecase"], 1.0)
             if not ignorecase or ignorecase[0] != 0 or ignorecase[1].strip() != "true":
                 return "the repository does not ignore case, so its ignore rules cannot be checked"
@@ -2641,10 +2642,10 @@ def small_edit_blocker(entry):
         return "a lasting file lies outside {}".format(root)
     # The names the commit holds, spelled as the disk spells them where marker paths fold case. A
     # link on the way leads to bytes the commit does not hold under that name.
-    real_root = os.path.realpath(root)
+    real_root = cwg.disk_spelling(root)
     files = {}
     for path in paths:
-        real = os.path.realpath(path)
+        real = cwg.disk_spelling(path)
         if cwg.normalize_path(real) != path or not real.startswith(real_root + os.sep):
             return "a lasting file is reached through a link"
         files[real[len(real_root) + 1:].replace(os.sep, "/")] = real

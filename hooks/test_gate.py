@@ -5701,6 +5701,11 @@ for path in (
     native("C:/Users/in/AppData/Local/Temp/claude/proj/sid/scratchpad/probe.py"),
     "/tmp/wipe.sh",
     native("C:/tmp/sid/scratchpad/push.py"),
+    "/private/tmp/wipe.sh",
+    "/private/var/tmp/wipe.sh",
+    "/private/tmp/claude-501/proj/sid/scratchpad/probe.py",
+    "/var/folders/5f/dbl801gd/T/probe.py",
+    "/private/var/folders/5f/dbl801gd/T/claude/fix_r1.py",
 ):
     check("ephemeral matcher agrees with the gate: {}".format(path), cwg.is_ephemeral(path), path)
 
@@ -5711,6 +5716,9 @@ for path in (
     native("C:/repo/.claude/plans/rollout.md"),
     native("C:/repo/.claude/state/registry.json"),
     "C:/backup/appdata/local/temp/keep.py",
+    "/private/tmp/charon-whatsnew/backend/src/app.ts",
+    "/var/folders/5f/dbl801gd/C/keep.py",
+    "/Users/dev/private/tmp/keep.py",
 ):
     check("ephemeral matcher does not overreach: {}".format(path), not cwg.is_ephemeral(path), path)
 
@@ -8371,7 +8379,7 @@ with tempfile.TemporaryDirectory(prefix="cwg_restoration_isolation_") as base:
     tree, _ = isolation("short")
     for alias in ("longso~1.py", "foo~ba~1.py", "a~b~c~~1.py", "xtargz~1.bac"):
         blocker = isolation_blocker(opening, cwg.normalize_path(os.path.join(tree, "src", alias)))
-        if cwg.CASE_FOLDED_PATHS:
+        if os.name == "nt":
             check("a lasting path spelled with the Windows short name {} keeps it open".format(alias),
                   "spelled with a Windows short name" in blocker and blocker.endswith("({})".format(alias)),
                   blocker)
@@ -10531,8 +10539,9 @@ with tempfile.TemporaryDirectory(prefix="cwg_case_pair_") as repo:
           before_commit is not None and marker_hook.content_fingerprint([cwg.normalize_path(lower)]) == before_commit,
           before_commit)
 
-check("only the platform's own separator becomes a slash, and only Windows lowers a path",
-      cwg.normalize_path("Src\\A.py") == ("src/a.py" if cwg.CASE_FOLDED_PATHS else "Src\\A.py"),
+check("only the platform's own separator becomes a slash, and only a case-insensitive file system lowers a path",
+      cwg.normalize_path("Src\\A.py") == ("src/a.py" if os.name == "nt" else
+                                           "src\\a.py" if cwg.CASE_FOLDED_PATHS else "Src\\A.py"),
       cwg.normalize_path("Src\\A.py"))
 # Where case and a backslash are part of a name, `A.py` and `a.py` are two files with an index
 # entry each, and `x\y.py` is one file: a change staged to `A.py` is its own divergence and moves

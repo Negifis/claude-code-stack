@@ -27,13 +27,31 @@ RISK_ORDER = {"LOW": 0, "STANDARD": 1, "HIGH": 2, "XHIGH": 3}
 # before the command runs, not after the effect is already irreversible.
 WORK_PERSISTENT = "PERSISTENT"
 WORK_OPERATIONAL = "OPERATIONAL"
-# Windows names a file without regard to case, so there every path the gate compares is lowered.
-# Elsewhere case is part of the name: `SKILL.md` and `skill.md` are two files, and a lowered path
-# opens neither, so a candidate's fingerprint would read a changed file as missing. There a path
-# keeps its case, and a pattern naming a place — a temp root, a configuration home, the hooks'
-# own scripts — matches it exactly. A file's kind (a test, a secret, a Makefile) is read in any
-# case everywhere.
-CASE_FOLDED_PATHS = os.name == "nt"
+def _case_folded_file_system():
+    """Whether the file system holding the user's files names them without regard to case.
+
+    Windows always does. macOS does on its default volumes, where `Src/App.py` and `src/app.py`
+    are one file that git lists by its index spelling, so a marker path kept in the edit's case
+    matched nothing git printed and a changed file read as restored. A case-sensitive volume
+    opts out, so off Windows the home directory is asked once: spelled in the other case, it
+    names itself only where case is ignored.
+    """
+    if os.name == "nt":
+        return True
+    home = os.path.expanduser("~")
+    other = home.swapcase()
+    try:
+        return other != home and os.path.samefile(home, other)
+    except OSError:
+        return False
+
+
+# Where the file system ignores case, every path the gate compares is lowered. Elsewhere case is
+# part of the name: `SKILL.md` and `skill.md` are two files, and a lowered path opens neither, so
+# a candidate's fingerprint would read a changed file as missing. There a path keeps its case,
+# and a pattern naming a place — a temp root, a configuration home, the hooks' own scripts —
+# matches it exactly. A file's kind (a test, a secret, a Makefile) is read in any case everywhere.
+CASE_FOLDED_PATHS = _case_folded_file_system()
 PLACE_IGNORECASE = re.IGNORECASE if CASE_FOLDED_PATHS else 0
 TEST_PATH_RE = re.compile(
     r"(^|/)(tests?|specs?|fixtures?)(/|$)|"
@@ -80,15 +98,18 @@ AGENT_EXECUTABLE_PATH_RE = re.compile(
 # source work. Only a scratchpad segment, a file directly in the temp root, or the harness's own
 # scratch tree qualifies.
 # A temp directory at the root of a drive, where agents keep throwaway helpers next to real clones.
-DRIVE_TEMP_ROOT = r"(?:^(?:[a-z]:)?/(?:tmp|temp)/|^/var/tmp/)"
+# On macOS `/tmp` and `/var/tmp` are links into `/private`, and a resolved path names the target.
+DRIVE_TEMP_ROOT = r"(?:^(?:[a-z]:)?/(?:tmp|temp)/|^(?:/private)?/var/tmp/|^/private/tmp/)"
+# The per-user temp directories: Windows' AppData one and the `$TMPDIR` macOS hands each user.
 TEMP_ROOT = (
     r"(?:" + DRIVE_TEMP_ROOT + r"|"
-    r"(?:^|/)(?:users|home)/[^/]+/appdata/local/temp/)"
+    r"(?:^|/)(?:users|home)/[^/]+/appdata/local/temp/|"
+    r"^(?:/private)?/var/folders/[^/]+/[^/]+/T/)"
 )
 # The harness's scratch tree, session scratchpad a level down. Nothing snapshots a temp tree, so
 # a helper graded lasting here makes every write-capable command a barrier (report 7bad3973).
-# Exactly `claude` (on Linux `claude-<uid>`): the mirror at C:/tmp/claude-code-stack is source
-# and stays gated.
+# Exactly `claude` (on Linux and macOS `claude-<uid>`): the mirror at C:/tmp/claude-code-stack is
+# source and stays gated.
 AGENT_SCRATCH = TEMP_ROOT + r"claude(?:-\d+)?/"
 # The agent's own bookkeeping, scoped to the home configuration. A repository that commits
 # .claude/plans or .claude/state is publishing files people read later, so those stay gated.
@@ -147,15 +168,38 @@ def valid_ts(value):
 
 def fold_case(text):
     """A path or file name in the case the gate compares it in: lowered where the file system
-    ignores case (Windows), as it stands elsewhere."""
+    ignores case (Windows, a default macOS volume), as it stands elsewhere."""
     return text.lower() if CASE_FOLDED_PATHS else text
 
 
 def normalize_path(path):
     """Forward-slash form used for every gate path comparison, lowercased where the file system
-    ignores case (Windows). Only the platform's own separator turns into a slash: on POSIX a
-    backslash is part of a name, and `x\\y.py` is one file."""
+    ignores case (Windows, a default macOS volume). Only the platform's own separator turns into a
+    slash: on POSIX a backslash is part of a name, and `x\\y.py` is one file."""
     return fold_case(str(path).replace(os.sep, "/")) if path else ""
+
+
+def disk_spelling(path):
+    """`os.path.realpath(path)` in the case the file system spells each name, which is what git
+    lists and matches pathspecs against. Windows' realpath returns that spelling; macOS' keeps the
+    one it was given, a lowered marker path included, so there the kernel names the open file
+    (`F_GETPATH`). Anything it cannot open keeps realpath's answer."""
+    real = os.path.realpath(path)
+    if os.name == "nt" or not CASE_FOLDED_PATHS:
+        return real
+    import fcntl
+    try:
+        descriptor = os.open(real, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return real
+    try:
+        raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024))
+        return os.fsdecode(raw.split(b"\0", 1)[0]) or real
+    # AttributeError: `F_GETPATH` is macOS-only, and another case-insensitive system lacks it.
+    except (AttributeError, OSError):
+        return real
+    finally:
+        os.close(descriptor)
 
 
 def basename(path):

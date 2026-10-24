@@ -3098,7 +3098,7 @@ def repository_of(directory, roots):
                     and os.path.isdir(folder + "/refs")):
                 return None
             folder = folder.rsplit("/", 1)[0]
-        spelled = os.path.realpath(directory).replace(os.sep, "/").rstrip("/")
+        spelled = cwg.disk_spelling(directory).replace(os.sep, "/").rstrip("/")
         return (root, spelled[len(root) + 1:]) if covers(root, cwg.normalize_path(spelled)) else None
     return None
 
@@ -3123,7 +3123,7 @@ def staged_divergences_by_dir(by_dir, deadline=None):
     `hash-object` computes as `add` would store it, with the same line-ending and filter rules, so
     staging the reviewed bytes never diverges. Output is read NUL-separated, so a name git would
     quote (non-ASCII, a tab) keys like any other, and a name is keyed in the marker's own case
-    (`cwg.fold_case`): lowered on Windows, as it stands where `A.py` and `a.py` are two files.
+    (`cwg.fold_case`): lowered where case is ignored, as it stands where `A.py` and `a.py` are two files.
     """
 
     def ask(where, arguments, cap, text=True):

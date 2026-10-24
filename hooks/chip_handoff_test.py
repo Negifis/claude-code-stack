@@ -753,6 +753,23 @@ def test_an_explicit_subdirectory_is_preserved(root):
     check("which really exists", os.path.isdir(cwd), cwd)
 
 
+def test_a_subdirectory_reached_through_a_link_is_preserved(root):
+    repo = make_repo(root, "linked-monorepo")
+    os.makedirs(os.path.join(repo, "packages", "api"))
+    write(os.path.join(repo, "packages", "api"), "manifest.txt", "api\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "package")
+    link = os.path.join(root, "linked-monorepo-link")
+    make_junction(repo, link)
+    _, out = spawn(link, spawn_cwd=os.path.join(link, "packages", "api"), session="transcript-linked",
+                   tool_use_id="toolu_linked")
+    if not check("the spawn through a link is registered", out is not None):
+        return
+    cwd = out["hookSpecificOutput"]["updatedInput"]["cwd"]
+    check("the child still lands in the package, though git names the repository resolved",
+          cwd.endswith(os.path.join("packages", "api")) and os.path.isdir(cwd), cwd)
+
+
 def test_spawn_outside_a_repository_still_gets_a_way_back(root):
     plain = os.path.join(root, "not-a-repo-spawn")
     os.makedirs(plain)
@@ -2127,6 +2144,7 @@ def main():
             test_a_refused_spawn_holding_work_keeps_its_links,
             test_a_repository_with_no_commits_still_gets_a_way_back,
             test_an_explicit_subdirectory_is_preserved,
+            test_a_subdirectory_reached_through_a_link_is_preserved,
             test_spawn_outside_a_repository_still_gets_a_way_back,
             test_spawn_hook_is_silent_for_other_tools,
             test_a_resumed_parent_still_hears_about_its_chips,
