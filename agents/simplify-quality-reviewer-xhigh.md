@@ -1,7 +1,7 @@
 ---
 name: simplify-quality-reviewer-xhigh
 description: 'XHIGH run of simplify-quality-reviewer: the same read-only lens on Opus 5.5 at max effort.'
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
+tools: Read, Grep, Glob
 model: claude-opus-5-5
 effort: max
 maxTurns: 80

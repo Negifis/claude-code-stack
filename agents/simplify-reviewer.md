@@ -1,7 +1,7 @@
 ---
 name: simplify-reviewer
 description: 'Read-only simplify pass of a STANDARD candidate: reuse, quality and efficiency findings in one report, behavior-preserving, with file:line evidence. HIGH work runs the three lens agents instead; the main agent applies accepted findings.'
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
+tools: Read, Grep, Glob
 model: sonnet
 effort: medium
 maxTurns: 40
@@ -43,9 +43,8 @@ against the exact source.
 
 - Strictly read-only. Never edit, write, run builds, tests or network calls, never spawn or
   wait for other agents.
-- Start from the diff and files named in the packet. Use the graph tools only to find an
-  existing helper or the callers of a changed symbol; bounded text and config scopes need only
-  `Read`/`Grep`.
+- Start from the diff and files named in the packet. Use `Grep` to find an
+  existing helper or the callers of a changed symbol, and `Read` for exact content.
 - Preserve public APIs, data formats, side effects, ordering, timing, error semantics, retries,
   caching semantics and test intent. If a simplification could change an edge case, say so and
   mark it risky instead of presenting it as edit-ready.

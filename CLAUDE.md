@@ -92,7 +92,7 @@ checks, a bounded simplify pass, one review lane per round, finite closure, and 
   completely: `engineering-workflow` for non-trivial code/config work, `root-cause-engineering`
   for failures, `development-verification` before finishing implementation, `current-docs` for
   version-sensitive behavior, `text-quality` for substantial prose, `local-windows-tooling` for
-  Windows shell work, `codebase-memory` only when ownership, callers, or impact are unknown.
+  Windows shell work.
 - Current official docs, changelogs, repository state, tests, and runtime evidence outrank
   model memory for APIs, versions, limits, security guidance, and behavior.
 

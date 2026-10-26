@@ -36,7 +36,7 @@ DENIED = (
     "file state, no edit and no new user input in between, so a repeat cannot return anything new.\n"
     "Do one of these instead:\n"
     "- change the question: another tool, another pattern, a wider or narrower scope, a different "
-    "source (graph tools, tests, logs, docs);\n"
+    "source (jev find, tests, logs, docs);\n"
     "- act on what you already have — edit, run the acceptance check, or answer;\n"
     "- if the artifact really did change, read the thing that changed rather than this again.\n"
     "If nothing can move the task forward, stop and report the concrete blocker and what would "

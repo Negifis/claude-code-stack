@@ -307,36 +307,6 @@ Route shell specifics through the `local-windows-tooling` skill.
 `tools/file-holders.ps1 -Path <file>…` names the processes holding a file open, through the
 Restart Manager API: `handle.exe` is not installed, and `Get-CimInstance` cannot see file handles.
 
-## codebase-memory-mcp indexing
-
-Two builds are installed: 0.10.8 in `~/.local/bin`, which every current MCP registration and
-the git reindex hooks use, and 0.6.0 in `%LOCALAPPDATA%\Programs\codebase-memory-mcp`, still on
-`PATH` after `.local\bin`. A project's index is `~/.cache/codebase-memory-mcp/<project>.db`.
-
-`cli index_repository` exits 1 with `"status":"error"` and the hint "Pipeline failed. Check
-repo_path exists…" whenever another process holds that `.db` open. The hint is misleading, the
-mode makes no difference, the old index stays untouched, and the failed run leaves no log. The
-CLI has no wait, timeout or lock-coordination option. Established on 2026-09-19 on
-one project: the same repository indexed in 9 s under a fresh `--name`, and that fresh index
-failed the same way as soon as a plain file handle was held on its `.db`, with or without
-`FILE_SHARE_DELETE`.
-
-Who holds the file decides what a failure means:
-
-- A 0.10.8 server (a stdio front per session, one shared `--cbm-daemon-internal` daemon) opens a
-  project's `.db` only for the length of a query. A collision with one is transient: retry on
-  the next trigger.
-- A 0.6.0 stdio server keeps every project `.db` it has queried open until its session ends. On
-  2026-09-19, one such server pinned a project's `.db`: its session started before the user
-  removed that project's 0.6.0 override from `~/.claude.json` (a backup of that file still shows it). Every reindex fails until that
-  session ends. The index had not refreshed since 2026-08-29. Killing the process removes the
-  session's codebase-memory tools, so ending or restarting the session is the user's call.
-
-Automation that triggers a reindex treats this failure as "not refreshed, try on the next
-trigger": it is not a hook error and does not warrant a retry loop, since a 0.6.0 holder lasts
-for hours. Before calling it a bug, run `file-holders.ps1` on the `.db`: a failure with no
-holder is a real pipeline fault.
-
 ## GitLab credentials in a Claude Code session
 
 `glab auth login` stores the token in Windows Credential Manager, which a Claude Code

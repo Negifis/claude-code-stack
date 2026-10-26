@@ -42,11 +42,11 @@ protocol in its packet.
 
 2. Identify ownership.
    - Find the source of truth: config, schema, API contract, type definition, lifecycle, state model, build step, migration, dependency boundary, or runtime environment.
-   - Use `codebase-memory-mcp` graph tools to locate it — `search_graph` for the symbol, `trace_path` (direction=both) for callers/callees and the propagation path, `get_architecture` for boundaries, `detect_changes` to map the current diff to affected symbols — before falling back to `Grep`/`Read`.
+   - Locate it with `jev find`, then follow callers, callees and the propagation path with `Grep` on the exact names and `Read` with explicit ranges.
    - Determine where the invariant should be enforced.
 
 3. Search existing patterns.
-   - Look for related code paths, tests, previous fixes, and project conventions — via `codebase-memory-mcp` (`search_graph`, `trace_path`, `get_code_snippet`) first; use `Grep`/`Read` for text/config content or when the graph is unavailable/stale.
+   - Look for related code paths, tests, previous fixes, and project conventions.
 
 4. Form the cause before editing.
    - What invariant was violated?
