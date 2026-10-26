@@ -17,7 +17,7 @@ template — it is a stack in daily use on Windows and on a Linux execution VM, 
 | Directory | What it holds |
 |---|---|
 | `hooks/` | The Code Work Gate and its anomaly inbox, the continuity system, the comment-density guard, chip handoff and session hygiene — plus their regression suites (2699 gate assertions, 86 continuity checks, 49 guard checks, chip and hygiene suites) |
-| `skills/` | 17 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
+| `skills/` | 16 skills for engineering workflow, verification, writing, delegation, memory, chips and task start |
 | `agents/` | The adversarial reviewer, the simplify lanes — `simplify-reviewer` and the three lenses — their `-xhigh` profiles for XHIGH work, an `Explore` profile on Haiku that overrides the built-in one, and a `translator` profile on Haiku for files and string batches |
 | `commands/` | `/adversarial-review`, `/adversarial-review-internal`, `/checkpoint`, `/rebuild` |
 | `tools/` | `worktree-audit.mjs` — parks unsaved work and prunes stale worktrees (the `Setup` maintenance hook); `file-holders.ps1` — names the processes holding a file open (Windows) |
@@ -157,7 +157,6 @@ python hooks/hygiene_hooks_test.py
 | `chip-handoff` | Spawning a chip, finishing inside one, or accepting one that reported back |
 | `task-start` | Starting work on a tracked issue in its own worktree, branch and named session |
 | `current-docs` | Anything version-sensitive about a library, API, framework or CLI |
-| `codebase-memory` | Structural queries — symbols, callers, call chains, change impact |
 | `project-memory` | Before research or diagnosis, recall durable memory; once a root cause, decision, constraint or command is confirmed, record it (needs the NotebookLM bridge, which is not published) |
 | `subagent-delegation` | Deciding whether a bounded lane is worth a subagent |
 | `canonical-state` | A requirement changed, a handover is coming, or the same fix failed twice |
@@ -246,8 +245,6 @@ ones for the stacks you use: leave the others out of the loop and set them to `f
   CLI (`npm install -g @openai/codex`), and the `codex@openai-codex` plugin. Setup is in
   `reference/codex-routing.md`. Without it the native `adversarial-reviewer` subagent takes
   the lane — the gate accepts either.
-- **`codebase-memory` MCP.** The `codebase-memory` skill assumes a graph-index MCP server,
-  Skip the skill if you don't run one.
 
 ---
 

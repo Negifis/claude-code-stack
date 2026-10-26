@@ -1,7 +1,7 @@
 ---
 name: simplify-efficiency-reviewer
 description: 'Read-only efficiency lens of the HIGH simplify pass: redundant loops, repeated parsing/I-O/queries/allocations, needless serialization, missing cleanup and hot-path cost, without premature optimization, with file:line evidence.'
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
+tools: Read, Grep, Glob
 model: sonnet
 effort: medium
 maxTurns: 40
@@ -37,7 +37,7 @@ against the exact source.
 
 - Strictly read-only. Never edit, write, run builds, tests or network calls, never spawn or
   wait for other agents.
-- Start from the diff and files named in the packet; use the graph tools only to find the
+- Start from the diff and files named in the packet; use `Grep` only to find the
   callers that make a path hot.
 - Stay in the efficiency lens. Mention a reuse or quality concern only where it creates an
   efficiency risk or opportunity.

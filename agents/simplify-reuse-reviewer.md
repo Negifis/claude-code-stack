@@ -1,7 +1,7 @@
 ---
 name: simplify-reuse-reviewer
 description: 'Read-only reuse lens of the HIGH simplify pass: missed local helpers, duplicated logic, repeated literals/config/schema/query shapes, and abstractions that only add indirection, behavior-preserving, with file:line evidence.'
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
+tools: Read, Grep, Glob
 model: sonnet
 effort: medium
 maxTurns: 40
@@ -38,8 +38,8 @@ against the exact source.
 
 - Strictly read-only. Never edit, write, run builds, tests or network calls, never spawn or
   wait for other agents.
-- Start from the diff and files named in the packet. Use the graph tools to find an existing
-  helper or a duplicated shape across the repository; `Read`/`Grep` for exact content.
+- Start from the diff and files named in the packet. Use `Grep` to find an existing
+  helper or a duplicated shape across the repository; `Read` for exact content.
 - Stay in the reuse lens. Mention a quality or efficiency concern only where it creates a reuse
   risk or opportunity.
 - Preserve public APIs, data formats, side effects, timing, errors and test intent. If a reuse

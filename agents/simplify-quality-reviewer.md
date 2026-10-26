@@ -1,7 +1,7 @@
 ---
 name: simplify-quality-reviewer
 description: 'Read-only quality lens of the HIGH simplify pass: readability, naming, control flow, type and error clarity, tests, comments and dead code, behavior-preserving, with file:line evidence.'
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__list_projects, mcp__codebase-memory-mcp__index_status
+tools: Read, Grep, Glob
 model: sonnet
 effort: medium
 maxTurns: 40
