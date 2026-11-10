@@ -121,11 +121,11 @@ requirements, integration, verification, and the final answer.
 Before a research or investigation lane, run `nlm-memory recall` on its question and put what
 memory holds in the packet, so the lane starts from it instead of rediscovering it.
 
-A lane that runs on `fable` also needs what Fable 5.1 does not do unprompted, unless its agent
+A lane that runs on `fable` also needs what Fable 5.2 does not do unprompted, unless its agent
 file already says it: that it runs autonomously and states an assumption instead of asking;
 that it requests every independent read or search in one response; and the exact shape of its
 final message, the only thing the parent sees. The reasons and the rest of the list are in
-`~/.claude/reference/model-routing.md` under Claude Fable 5.1.
+`~/.claude/reference/model-routing.md` under Claude Fable 5.2.
 
 A lane that runs on `haiku` (Haiku 5.5) needs, unless its agent file already says it: that it
 works until every part is done and reports a part it could not settle; that a code change is

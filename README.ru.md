@@ -173,10 +173,12 @@ python hooks/hygiene_hooks_test.py
 
 ## Установка
 
-Нужна Claude Code ≥ 2.1.293 — сборка, на которой стек проверен: шаблон привязывает алиас `opus` к
-`claude-opus-5-5`, которому нужна 2.1.280, и `haiku` к `claude-haiku-5-5`, которому нужна
-2.1.293, а `minimumVersion` не даёт обновлению опуститься ниже. Привязка `haiku` задаёт и модель
-фоновой работы Claude Code; на сборке старше удалите `ANTHROPIC_DEFAULT_HAIKU_MODEL` и поставьте
+Нужна Claude Code ≥ 2.1.321 — сборка, на которой стек проверен: шаблон привязывает алиас `opus` к
+`claude-opus-5-5`, которому нужна 2.1.280, `haiku` к `claude-haiku-5-5`, которому нужна 2.1.293,
+и `fable` к `claude-fable-5-2`, которому нужна 2.1.321, а `minimumVersion` не даёт обновлению
+опуститься ниже. На сборке до 2.1.321 задайте `ANTHROPIC_DEFAULT_FABLE_MODEL` значение
+`claude-fable-5-1` и `minimumVersion` 2.1.293. Привязка `haiku` задаёт и модель фоновой работы
+Claude Code; на сборке до 2.1.293 ещё удалите `ANTHROPIC_DEFAULT_HAIKU_MODEL` и поставьте
 `minimumVersion` 2.1.280 — тогда `Explore` и `translator` пойдут на Haiku этой сборки. Ещё нужен
 Python 3.11+, а `tools/worktree-audit.mjs` требует Node 18+.
 
