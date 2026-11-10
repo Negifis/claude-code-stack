@@ -171,12 +171,14 @@ python hooks/hygiene_hooks_test.py
 
 ## Install
 
-Requires Claude Code ≥ 2.1.293, the build the stack was verified on: the template pins the
-`opus` alias to `claude-opus-5-5`, which needs 2.1.280, and `haiku` to `claude-haiku-5-5`, which
-needs 2.1.293, and `minimumVersion` keeps the updater from going below that. The `haiku` pin also
-sets the model of Claude Code's background work; on an older build, delete
-`ANTHROPIC_DEFAULT_HAIKU_MODEL` and set `minimumVersion` to 2.1.280, and `Explore` and
-`translator` then run on that build's default Haiku. Python 3.11+ is needed too, and
+Requires Claude Code ≥ 2.1.321, the build the stack was verified on: the template pins the
+`opus` alias to `claude-opus-5-5`, which needs 2.1.280, `haiku` to `claude-haiku-5-5`, which
+needs 2.1.293, and `fable` to `claude-fable-5-2`, which needs 2.1.321, and `minimumVersion` keeps
+the updater from going below that. On 2.1.293–2.1.320, set `ANTHROPIC_DEFAULT_FABLE_MODEL` to
+`claude-fable-5-1` and `minimumVersion` to 2.1.293. The `haiku` pin also sets the model of Claude
+Code's background work; on a build older than 2.1.293, delete `ANTHROPIC_DEFAULT_HAIKU_MODEL` and
+set `minimumVersion` to 2.1.280, and `Explore` and `translator` then run on that build's default
+Haiku. Python 3.11+ is needed too, and
 `tools/worktree-audit.mjs` needs Node 18+.
 
 ```bash

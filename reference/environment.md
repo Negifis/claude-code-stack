@@ -26,7 +26,7 @@ auto-memory is disabled (`autoMemoryEnabled: false`) — do not read or write it
 
 Agent frontmatter is the source of truth for that agent's default `tools`, `model`, `effort` and
 `maxTurns`. Read `model-routing.md` when a bounded lane needs an explicit override, and its Claude
-Fable 5.1 section before writing the prompt of an agent that runs on `fable`; model routing is
+Fable 5.2 section before writing the prompt of an agent that runs on `fable`; model routing is
 guidance, not a mandatory gate. Do not maintain a second roster here.
 
 Claude Code's documentation (https://code.claude.com/docs/en/sub-agents) says the next delegation

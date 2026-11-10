@@ -33,12 +33,13 @@ own `model`, including the reviewer's.
 
 The aliases are pinned in `settings.json` (`env`, `ANTHROPIC_DEFAULT_OPUS_MODEL` and its
 `SONNET`/`FABLE`/`HAIKU` siblings): `opus` -> `claude-opus-5-5`, `sonnet` -> `claude-sonnet-5-5`,
-`fable` -> `claude-fable-5-1`, `haiku` -> `claude-haiku-5-5`; the `haiku` pin also sets the
+`fable` -> `claude-fable-5-2`, `haiku` -> `claude-haiku-5-5`; the `haiku` pin also sets the
 model of Claude Code's background work. Raise a pin only when every Claude Code that runs here
-accepts the new model — `claude-opus-5-5` needs 2.1.280 and `claude-haiku-5-5` 2.1.293; 2.1.274
-answered `claude-opus-5-5` with 400 on every `opus` lane — and raise `minimumVersion` with
-it: it keeps `claude update` from installing anything older (automatic updates are off in
-`~/.claude.json`), and stands at 2.1.293, the build verified on both machines.
+accepts the new model — `claude-opus-5-5` needs 2.1.280, `claude-haiku-5-5` 2.1.293 and
+`claude-fable-5-2` 2.1.321 (older builds serve it as an unrecognized model, 2.1.293 with a 200K
+window); 2.1.274 answered `claude-opus-5-5` with 400 on every `opus` lane — and raise
+`minimumVersion` with it: it keeps `claude update` from installing anything older (automatic
+updates are off in `~/.claude.json`), and stands at 2.1.321, the build verified on both machines.
 
 Every profile that names an alias follows the pins, plugin agents included: half of the 22
 plugin profiles declare `model: opus`, so one of those launched without `model` runs Opus 5.5 —
@@ -93,25 +94,26 @@ https://platform.claude.com/docs/en/models/haiku-5-5/overview, its announcement
   without a check that exercises it, and skips a web search it needed without today's date. The
   packet for a Haiku lane answers all three (`subagent-delegation`).
 
-## Claude Fable 5.1
+## Claude Fable 5.2
 
 Sources: Anthropic's prompting guide for the model,
-https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5-1,
+https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5-2,
 its what's-new page, the general prompting best practices,
 https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices,
 and Claude Code's model-configuration, subagent and output-style pages.
 
 Parameters:
 
-- 1M context; $10/$50 per MTok, cache reads $0.25. The `fable` alias follows the pin above.
+- 1M context; $8/$40 per MTok, cache reads $0.20. The `fable` alias follows the pin above.
 - Effort `low`, `medium`, `high`, `xhigh`, `max`; the model's own default is `high`. In Claude
   Code a subagent's `effort` frontmatter takes all five and overrides the session; without it
   the lane inherits the session's effort, which `effortLevel` sets to `high` on this machine.
   The model-configuration page lists `low` through `xhigh` for that setting; `max` is set
   interactively with `/effort`.
-- Effort names do not buy the same thinking across models, so calibration done on Fable 5 does
-  not carry over. The guide starts at `high` and notes that `medium` roughly matches Fable 5 at
-  lower cost. At `xhigh` and `max` the model may draft a long deliverable in its thinking before
+- Effort names do not buy the same thinking across models, so calibration done on Fable 5.1 or
+  Opus 5.5 does not carry over; rerun the sweep. The guide starts at `high` (the API default) and
+  notes that at `low` the model scores close to Fable 5.1 at higher effort. At `xhigh` and `max`
+  the model may draft a long deliverable in its thinking before
   writing it, which lengthens the turn, so the guide keeps such requests at `high` unless a gain
   is measured. Move a lane only on a measured difference; the reviewer stays at `high` below
   XHIGH, and `adversarial-reviewer-xhigh` runs at `max` by the user's choice of 2026-09-26, not
